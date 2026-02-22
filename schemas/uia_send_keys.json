@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "uia_send_keys",
+  "description": "Send keystrokes to the target window using pywinauto / SendKeys notation.",
+  "type": "object",
+  "required": ["keys"],
+  "properties": {
+    "api_key": {
+      "type": "string",
+      "description": "API key for authentication."
+    },
+    "keys": {
+      "type": "string",
+      "description": "Key sequence in pywinauto / SendKeys notation."
+    },
+    "target": {
+      "$ref": "target.json",
+      "description": "Optional element to focus before sending keys."
+    }
+  },
+  "additionalProperties": false
+}

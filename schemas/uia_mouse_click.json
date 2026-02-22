@@ -1,0 +1,33 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "uia_mouse_click",
+  "description": "Click at absolute screen coordinates.",
+  "type": "object",
+  "required": ["x", "y"],
+  "properties": {
+    "api_key": {
+      "type": "string",
+      "description": "API key for authentication."
+    },
+    "x": {
+      "type": "integer",
+      "description": "Screen X coordinate."
+    },
+    "y": {
+      "type": "integer",
+      "description": "Screen Y coordinate."
+    },
+    "double": {
+      "type": "boolean",
+      "default": false,
+      "description": "True for double-click."
+    },
+    "button": {
+      "type": "string",
+      "enum": ["left", "right", "middle"],
+      "default": "left",
+      "description": "Mouse button."
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,92 @@
+{
+  "description": "Representative tool calls for Quicken automation via UIA-X",
+  "examples": [
+    {
+      "name": "attach_to_quicken",
+      "tool": "select_window",
+      "input": { "class_name": "QWinFrame", "api_key": "<your-key>" },
+      "output": {
+        "ok": true,
+        "window": {
+          "hwnd": 43521,
+          "hwnd_hex": "0xaa01",
+          "title": "Quicken Classic Premier - finances",
+          "class_name": "QWinFrame",
+          "pid": 1234,
+          "process_name": "qw.exe",
+          "visible": true,
+          "rect": { "left": 0, "top": 0, "right": 1280, "bottom": 800 }
+        }
+      }
+    },
+    {
+      "name": "inspect_root",
+      "tool": "uia_inspect",
+      "input": { "target": {}, "api_key": "<your-key>" },
+      "output": {
+        "ok": true,
+        "element": {
+          "name": "Quicken Classic Premier - finances",
+          "control_type": "Window",
+          "class_name": "QWinFrame",
+          "children": ["..."]
+        }
+      }
+    },
+    {
+      "name": "inspect_register",
+      "tool": "uia_inspect",
+      "input": {
+        "target": { "by": "class_name", "value": "QWClass_TransactionList", "depth": 2 },
+        "api_key": "<your-key>"
+      }
+    },
+    {
+      "name": "invoke_new_transaction",
+      "tool": "uia_invoke",
+      "input": {
+        "target": { "by": "automation_id", "value": "btn_new_txn" },
+        "api_key": "<your-key>"
+      },
+      "output": { "ok": true }
+    },
+    {
+      "name": "set_value_payee",
+      "tool": "uia_set_value",
+      "input": {
+        "target": { "by": "automation_id", "value": "3" },
+        "value": "Amazon",
+        "api_key": "<your-key>"
+      },
+      "output": { "ok": true }
+    },
+    {
+      "name": "send_tab_key",
+      "tool": "uia_send_keys",
+      "input": { "keys": "{TAB}", "api_key": "<your-key>" },
+      "output": { "ok": true }
+    },
+    {
+      "name": "legacy_invoke_account_row",
+      "tool": "uia_legacy_invoke",
+      "input": {
+        "target": { "by": "legacy_name", "value": "Example Bank Checking" },
+        "api_key": "<your-key>"
+      },
+      "output": { "ok": true }
+    },
+    {
+      "name": "error_element_not_found",
+      "tool": "uia_inspect",
+      "input": {
+        "target": { "by": "name", "value": "NonExistent" },
+        "api_key": "<your-key>"
+      },
+      "output": {
+        "ok": false,
+        "error": "No element matched target: {'by': 'name', 'value': 'NonExistent'}",
+        "code": "ELEMENT_NOT_FOUND"
+      }
+    }
+  ]
+}

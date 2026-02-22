@@ -1,0 +1,8 @@
+mcp[cli]>=1.0.0
+pywinauto>=0.6.8
+comtypes>=1.4.0
+pydantic>=2.0.0
+
+# dev / test
+pytest>=8.0.0
+pytest-asyncio>=0.23.0

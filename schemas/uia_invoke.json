@@ -1,0 +1,18 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "uia_invoke",
+  "description": "Invoke (click / activate) a UI Automation element.",
+  "type": "object",
+  "properties": {
+    "api_key": {
+      "type": "string",
+      "description": "API key for authentication."
+    },
+    "target": {
+      "$ref": "target.json",
+      "description": "Element selector."
+    }
+  },
+  "required": ["target"],
+  "additionalProperties": false
+}

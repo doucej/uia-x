@@ -1,0 +1,581 @@
+"""
+Main MCP server entry point – V2: Windows UI Automation substrate.
+
+Generalised beyond any single application.  Use the ``process_list`` and
+``select_window`` tools to choose a target window, then use the UIA tools
+to inspect and interact with it.
+
+Environment variables
+---------------------
+UIA_BACKEND       "real" (default) or "mock"
+UIA_X_AUTH    "apikey" (default) or "none"
+UIA_X_API_KEY Override API key (skip on-disk generation)
+
+Usage:
+    python -m server.server
+    UIA_BACKEND=mock python -m server.server
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from typing import Any
+
+from mcp.server.fastmcp import FastMCP
+
+from server.uia_bridge import get_bridge, UIAError
+from server.auth import require_auth, NoAuthProvider, set_auth_provider, BearerAuthMiddleware
+from server.process_manager import (
+    get_process_manager,
+    WindowInfo,
+)
+
+# ---------------------------------------------------------------------------
+# Server instantiation
+# ---------------------------------------------------------------------------
+
+_transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()  # stdio | sse | streamable-http
+_host = os.environ.get("MCP_HOST", "0.0.0.0")
+_port = int(os.environ.get("MCP_PORT", "8000"))
+
+mcp = FastMCP(
+    "uiax-automation",
+    instructions=(
+        "Windows UI Automation MCP server.  Use process_list and select_window "
+        "to pick an automation target, then use uia_inspect, uia_invoke, "
+        "uia_set_value, uia_send_keys, uia_legacy_invoke, and uia_mouse_click "
+        "to interact with the target application's UI elements."
+    ),
+    host=_host,
+    port=_port,
+)
+
+# ---------------------------------------------------------------------------
+# Bridge (lazy-initialised)
+# ---------------------------------------------------------------------------
+
+_bridge = None
+
+
+def _get_bridge():
+    global _bridge
+    if _bridge is None:
+        backend = os.environ.get("UIA_BACKEND", "real").lower()
+        _bridge = get_bridge(backend)
+    return _bridge
+
+
+# ---------------------------------------------------------------------------
+# Authentication helper
+# ---------------------------------------------------------------------------
+
+
+def _check_auth(api_key: str = "") -> dict[str, Any] | None:
+    """
+    Validate the API key.  Returns an error dict if auth fails, else None.
+    """
+    try:
+        require_auth(api_key)
+        return None
+    except UIAError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
+
+
+# ---------------------------------------------------------------------------
+# Helper: serialise WindowInfo
+# ---------------------------------------------------------------------------
+
+
+def _window_to_dict(w: WindowInfo) -> dict[str, Any]:
+    return {
+        "hwnd": w.hwnd,
+        "hwnd_hex": hex(w.hwnd),
+        "title": w.title,
+        "class_name": w.class_name,
+        "pid": w.pid,
+        "process_name": w.process_name,
+        "visible": w.visible,
+        "rect": w.rect,
+    }
+
+
+# ===================================================================
+# Tool: process_list
+# ===================================================================
+
+
+@mcp.tool(
+    name="process_list",
+    description=(
+        "List running processes and their top-level windows. "
+        "Returns an array of window descriptors. Use this to discover "
+        "available automation targets before calling select_window."
+    ),
+)
+def process_list(
+    api_key: str = "",
+    visible_only: bool = True,
+) -> dict[str, Any]:
+    """
+    Enumerate top-level windows.
+
+    Parameters
+    ----------
+    api_key : str
+        API key for authentication.
+    visible_only : bool
+        If True (default), only return visible windows.
+
+    Returns
+    -------
+    dict
+        ``{"ok": true, "windows": [...]}``
+    """
+    auth_err = _check_auth(api_key)
+    if auth_err:
+        return auth_err
+    try:
+        pm = get_process_manager()
+        windows = pm.list_windows(visible_only=visible_only)
+        return {
+            "ok": True,
+            "windows": [_window_to_dict(w) for w in windows],
+            "count": len(windows),
+        }
+    except UIAError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+
+# ===================================================================
+# Tool: select_window
+# ===================================================================
+
+
+@mcp.tool(
+    name="select_window",
+    description=(
+        "Attach to a specific window as the active automation target. "
+        "Provide at least one criterion: pid, process_name, window_title, "
+        "class_name, or hwnd.  Multiple criteria act as an AND filter. "
+        "The selected window becomes the target for all subsequent UIA calls."
+    ),
+)
+def select_window(
+    api_key: str = "",
+    pid: int | None = None,
+    process_name: str | None = None,
+    window_title: str | None = None,
+    class_name: str | None = None,
+    hwnd: int | None = None,
+) -> dict[str, Any]:
+    """
+    Attach to a process/window.
+
+    Returns
+    -------
+    dict
+        ``{"ok": true, "window": {...}}`` on success.
+    """
+    auth_err = _check_auth(api_key)
+    if auth_err:
+        return auth_err
+    try:
+        pm = get_process_manager()
+        win = pm.attach(
+            pid=pid,
+            process_name=process_name,
+            window_title=window_title,
+            class_name=class_name,
+            hwnd=hwnd,
+        )
+        return {"ok": True, "window": _window_to_dict(win)}
+    except UIAError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+
+# ===================================================================
+# Tool: uia_inspect
+# ===================================================================
+
+
+@mcp.tool(
+    name="uia_inspect",
+    description=(
+        "Inspect the UI Automation element tree of the active target window. "
+        "Returns a JSON snapshot of the matched element and its children. "
+        "Pass an empty target ({}) to get the full window tree."
+    ),
+)
+def uia_inspect(
+    target: dict[str, Any] = {},  # noqa: B006
+    api_key: str = "",
+) -> dict[str, Any]:
+    """
+    Inspect a UI element in the target window.
+
+    Parameters
+    ----------
+    target : dict
+        Selector describing which element to inspect.  Supported keys:
+
+        ``by``    – selector strategy: ``"name"``, ``"automation_id"``,
+                    ``"control_type"``, ``"class_name"``, ``"path"``,
+                    ``"legacy_name"``, ``"legacy_role"``, ``"child_id"``,
+                    ``"hwnd"``
+        ``value`` – value for the chosen strategy
+        ``depth`` – how many levels of children to expand (default 3)
+        ``index`` – zero-based index for multiple matches (default 0)
+
+        Pass an empty dict ``{}`` to return the root window.
+
+    Returns
+    -------
+    dict
+        ``{"ok": true, "element": {...}}`` on success or
+        ``{"ok": false, "error": "...", "code": "..."}`` on failure.
+    """
+    auth_err = _check_auth(api_key)
+    if auth_err:
+        return auth_err
+    try:
+        bridge = _get_bridge()
+        element = bridge.inspect(target)
+        return {"ok": True, "element": element}
+    except UIAError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+
+# ===================================================================
+# Tool: uia_invoke
+# ===================================================================
+
+
+@mcp.tool(
+    name="uia_invoke",
+    description=(
+        "Invoke (click / activate) a UI Automation element in the target window. "
+        "The element must support the Invoke or Toggle pattern."
+    ),
+)
+def uia_invoke(
+    target: dict[str, Any],
+    api_key: str = "",
+) -> dict[str, Any]:
+    """
+    Invoke a UI element (e.g. press a button).
+
+    Parameters
+    ----------
+    target : dict
+        Selector describing which element to invoke.
+    """
+    auth_err = _check_auth(api_key)
+    if auth_err:
+        return auth_err
+    try:
+        bridge = _get_bridge()
+        bridge.invoke(target)
+        return {"ok": True}
+    except UIAError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+
+# ===================================================================
+# Tool: uia_set_value
+# ===================================================================
+
+
+@mcp.tool(
+    name="uia_set_value",
+    description=(
+        "Set the value of a UI Automation element in the target window. "
+        "The element must support the Value pattern (e.g. text fields, "
+        "date pickers, combo boxes)."
+    ),
+)
+def uia_set_value(
+    target: dict[str, Any],
+    value: str,
+    api_key: str = "",
+) -> dict[str, Any]:
+    """
+    Set the value of a UI element.
+
+    Parameters
+    ----------
+    target : dict
+        Selector describing which element to change.
+    value : str
+        New value to assign.
+    """
+    auth_err = _check_auth(api_key)
+    if auth_err:
+        return auth_err
+    try:
+        bridge = _get_bridge()
+        bridge.set_value(target, value)
+        return {"ok": True}
+    except UIAError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+
+# ===================================================================
+# Tool: uia_send_keys  (V1 name: send_keys)
+# ===================================================================
+
+
+@mcp.tool(
+    name="uia_send_keys",
+    description=(
+        "Send keystrokes to the target window (or a specific focused element). "
+        "Uses pywinauto / SendKeys notation: plain text is typed literally; "
+        "special keys use braces e.g. {ENTER}, {TAB}, {ESC}, {F4}; "
+        "modifiers are ^ (Ctrl), + (Shift), % (Alt)."
+    ),
+)
+def uia_send_keys(
+    keys: str,
+    target: dict[str, Any] = {},  # noqa: B006
+    api_key: str = "",
+) -> dict[str, Any]:
+    """
+    Send keystrokes to the target window.
+
+    Parameters
+    ----------
+    keys : str
+        Key sequence in pywinauto / SendKeys notation.
+    target : dict, optional
+        Element selector to focus before sending keys.  Pass ``{}``
+        to send to whatever is currently focused.
+    """
+    auth_err = _check_auth(api_key)
+    if auth_err:
+        return auth_err
+    try:
+        bridge = _get_bridge()
+        bridge.send_keys(keys, target or None)
+        return {"ok": True}
+    except UIAError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+
+# ===================================================================
+# Tool: uia_legacy_invoke
+# ===================================================================
+
+
+@mcp.tool(
+    name="uia_legacy_invoke",
+    description=(
+        "Invoke a UI element via LegacyIAccessiblePattern.DoDefaultAction (MSAA). "
+        "Use this for owner-drawn controls that are invisible to the standard "
+        "UIA InvokePattern.  Supports selectors: by=legacy_name, legacy_role, "
+        "child_id, hwnd — as well as all standard UIA selectors."
+    ),
+)
+def uia_legacy_invoke(
+    target: dict[str, Any],
+    api_key: str = "",
+) -> dict[str, Any]:
+    """
+    Invoke a UI element via LegacyIAccessiblePattern.DoDefaultAction.
+
+    Parameters
+    ----------
+    target : dict
+        Selector.  Supports standard UIA and MSAA selectors.
+    """
+    auth_err = _check_auth(api_key)
+    if auth_err:
+        return auth_err
+    try:
+        bridge = _get_bridge()
+        bridge.legacy_invoke(target)
+        return {"ok": True}
+    except UIAError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+
+# ===================================================================
+# Tool: uia_mouse_click
+# ===================================================================
+
+
+@mcp.tool(
+    name="uia_mouse_click",
+    description=(
+        "Click at absolute screen coordinates. "
+        "Use double=true for double-clicks.  Coordinates come from the 'rect' "
+        "field returned by uia_inspect.  "
+        "button: 'left' (default), 'right', or 'middle'."
+    ),
+)
+def uia_mouse_click(
+    x: int,
+    y: int,
+    double: bool = False,
+    button: str = "left",
+    api_key: str = "",
+) -> dict[str, Any]:
+    """
+    Click at absolute screen coordinates.
+
+    Parameters
+    ----------
+    x, y : int
+        Screen coordinates.
+    double : bool
+        True for double-click.
+    button : str
+        'left', 'right', or 'middle'.
+    """
+    auth_err = _check_auth(api_key)
+    if auth_err:
+        return auth_err
+    try:
+        bridge = _get_bridge()
+        bridge.mouse_click(x, y, double=double, button=button)
+        return {"ok": True}
+    except UIAError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+
+# ===================================================================
+# Tool: send_keys  (standalone keystroke injection)
+# ===================================================================
+
+
+@mcp.tool(
+    name="send_keys",
+    description=(
+        "Inject keystrokes via Windows SendInput API.  This is a lower-level "
+        "alternative to uia_send_keys that doesn't require a UIA target. "
+        "Uses pywinauto / SendKeys notation."
+    ),
+)
+def send_keys_tool(
+    keys: str,
+    api_key: str = "",
+) -> dict[str, Any]:
+    """
+    Send keystrokes via SendInput.
+
+    Parameters
+    ----------
+    keys : str
+        Key sequence in pywinauto / SendKeys notation.
+    """
+    auth_err = _check_auth(api_key)
+    if auth_err:
+        return auth_err
+    try:
+        bridge = _get_bridge()
+        bridge.send_keys(keys)
+        return {"ok": True}
+    except UIAError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+
+# ===================================================================
+# Tool: mouse_click  (standalone mouse click)
+# ===================================================================
+
+
+@mcp.tool(
+    name="mouse_click",
+    description=(
+        "Click at absolute screen coordinates via Windows SendInput API. "
+        "This is a lower-level alternative to uia_mouse_click. "
+        "button: 'left' (default), 'right', or 'middle'."
+    ),
+)
+def mouse_click_tool(
+    x: int,
+    y: int,
+    double: bool = False,
+    button: str = "left",
+    api_key: str = "",
+) -> dict[str, Any]:
+    """
+    Click at absolute screen coordinates.
+    """
+    auth_err = _check_auth(api_key)
+    if auth_err:
+        return auth_err
+    try:
+        bridge = _get_bridge()
+        bridge.mouse_click(x, y, double=double, button=button)
+        return {"ok": True}
+    except UIAError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    backend = os.environ.get("UIA_BACKEND", "real").lower()
+    auth_mode = os.environ.get("UIA_X_AUTH", "apikey").lower()
+    transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()
+    host = os.environ.get("MCP_HOST", "0.0.0.0")
+    port = int(os.environ.get("MCP_PORT", "8000"))
+    print(
+        f"[uiax] starting server "
+        f"(backend={backend}, auth={auth_mode}, transport={transport}"
+        + (f", http://{host}:{port}" if transport != "stdio" else "")
+        + ")",
+        file=sys.stderr,
+    )
+
+    if transport == "stdio":
+        # stdio mode — no HTTP, no Bearer middleware needed
+        mcp.run(transport="stdio")
+    else:
+        # HTTP modes (sse / streamable-http) — wrap with Bearer auth
+        import anyio
+
+        async def _run_http() -> None:
+            import uvicorn
+
+            if transport == "sse":
+                starlette_app = mcp.sse_app()
+            else:
+                starlette_app = mcp.streamable_http_app()
+
+            # Wrap with Bearer auth middleware so clients can authenticate
+            # via  Authorization: Bearer <api-key>  HTTP header.
+            app = BearerAuthMiddleware(starlette_app)
+
+            config = uvicorn.Config(app, host=host, port=port, log_level="info")
+            server = uvicorn.Server(config)
+            await server.serve()
+
+        anyio.run(_run_http)
+
+
+if __name__ == "__main__":
+    main()

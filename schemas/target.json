@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://uia-x/schemas/target.json",
+  "title": "Target",
+  "description": "Selector that identifies a UI Automation element within the active target window.",
+  "type": "object",
+  "properties": {
+    "by": {
+      "type": "string",
+      "enum": [
+        "name",
+        "automation_id",
+        "control_type",
+        "class_name",
+        "path",
+        "legacy_name",
+        "legacy_role",
+        "child_id",
+        "hwnd"
+      ],
+      "description": "Selector strategy."
+    },
+    "value": {
+      "type": "string",
+      "description": "Value for the chosen strategy."
+    },
+    "index": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0,
+      "description": "Zero-based index when multiple elements match."
+    },
+    "depth": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10,
+      "default": 3,
+      "description": "How many levels of children to expand in the inspect response."
+    }
+  },
+  "additionalProperties": false
+}

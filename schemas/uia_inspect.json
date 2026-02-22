@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "uia_inspect",
+  "description": "Inspect the UI Automation element tree of the active target window.",
+  "type": "object",
+  "properties": {
+    "api_key": {
+      "type": "string",
+      "description": "API key for authentication."
+    },
+    "target": {
+      "$ref": "target.json",
+      "description": "Element selector. Pass an empty object {} to get the full window tree."
+    }
+  },
+  "required": [],
+  "additionalProperties": false,
+  "examples": [
+    { "target": {} },
+    { "target": { "by": "name", "value": "Save", "depth": 2 } },
+    { "target": { "by": "automation_id", "value": "textEditor" } }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "mouse_click",
+  "description": "Click at absolute screen coordinates via SendInput (lower-level).",
+  "type": "object",
+  "required": ["x", "y"],
+  "properties": {
+    "api_key": {
+      "type": "string",
+      "description": "API key for authentication."
+    },
+    "x": {
+      "type": "integer",
+      "description": "Screen X coordinate."
+    },
+    "y": {
+      "type": "integer",
+      "description": "Screen Y coordinate."
+    },
+    "double": {
+      "type": "boolean",
+      "default": false,
+      "description": "True for double-click."
+    },
+    "button": {
+      "type": "string",
+      "enum": ["left", "right", "middle"],
+      "default": "left",
+      "description": "Mouse button."
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "uia_set_value",
+  "description": "Set the value of a UI Automation element (text fields, date pickers, combo boxes).",
+  "type": "object",
+  "properties": {
+    "api_key": {
+      "type": "string",
+      "description": "API key for authentication."
+    },
+    "target": {
+      "$ref": "target.json",
+      "description": "Element selector."
+    },
+    "value": {
+      "type": "string",
+      "description": "New value to assign."
+    }
+  },
+  "required": ["target", "value"],
+  "additionalProperties": false
+}

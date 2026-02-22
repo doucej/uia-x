@@ -1,0 +1,40 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "select_window",
+  "description": "Attach to a specific window as the active automation target. Provide at least one criterion.",
+  "type": "object",
+  "properties": {
+    "api_key": {
+      "type": "string",
+      "description": "API key for authentication."
+    },
+    "pid": {
+      "type": "integer",
+      "description": "Process ID."
+    },
+    "process_name": {
+      "type": "string",
+      "description": "Process executable name (e.g. 'notepad.exe')."
+    },
+    "window_title": {
+      "type": "string",
+      "description": "Substring match against window title."
+    },
+    "class_name": {
+      "type": "string",
+      "description": "Win32 window class name."
+    },
+    "hwnd": {
+      "type": "integer",
+      "description": "Window handle (integer)."
+    }
+  },
+  "required": [],
+  "additionalProperties": false,
+  "examples": [
+    { "process_name": "notepad.exe" },
+    { "window_title": "Quicken", "class_name": "QWinFrame" },
+    { "pid": 1234 },
+    { "hwnd": 65537 }
+  ]
+}

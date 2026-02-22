@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "uia-x"
+version = "2.0.0"
+description = "MCP server for Windows UI Automation – a reusable substrate for automating any Windows desktop application"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [
+    { name = "Joe Doucette" },
+]
+keywords = ["mcp", "ui-automation", "windows", "uia", "msaa", "accessibility", "uia-x"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Desktop Environment",
+]
+dependencies = [
+    "mcp[cli]>=1.0.0",
+    "pywinauto>=0.6.8",
+    "comtypes>=1.4.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[project.scripts]
+uiax-server = "server.server:main"
+
+[project.urls]
+Homepage = "https://github.com/doucej/uia-x"
+Repository = "https://github.com/doucej/uia-x"
+Issues = "https://github.com/doucej/uia-x/issues"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["server", "mock_uia"]

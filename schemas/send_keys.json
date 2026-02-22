@@ -1,0 +1,18 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "send_keys",
+  "description": "Inject keystrokes via Windows SendInput (lower-level, no UIA target required).",
+  "type": "object",
+  "required": ["keys"],
+  "properties": {
+    "api_key": {
+      "type": "string",
+      "description": "API key for authentication."
+    },
+    "keys": {
+      "type": "string",
+      "description": "Key sequence in pywinauto / SendKeys notation."
+    }
+  },
+  "additionalProperties": false
+}
