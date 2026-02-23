@@ -5,20 +5,22 @@ build-backend = "hatchling.build"
 [project]
 name = "uia-x"
 version = "2.0.0"
-description = "MCP server for Windows UI Automation – a reusable substrate for automating any Windows desktop application"
+description = "Cross-platform MCP server for desktop UI Automation – Windows (UIA/MSAA) and Linux (AT-SPI2)"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
 authors = [
     { name = "Joe Doucette" },
 ]
-keywords = ["mcp", "ui-automation", "windows", "uia", "msaa", "accessibility", "uia-x"]
+keywords = ["mcp", "ui-automation", "windows", "linux", "uia", "msaa", "at-spi", "accessibility", "uia-x"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Win32 (MS Windows)",
+    "Environment :: X11 Applications",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -28,12 +30,18 @@ classifiers = [
 ]
 dependencies = [
     "mcp[cli]>=1.0.0",
-    "pywinauto>=0.6.8",
-    "comtypes>=1.4.0",
     "pydantic>=2.0.0",
 ]
 
 [project.optional-dependencies]
+windows = [
+    "pywinauto>=0.6.8",
+    "comtypes>=1.4.0",
+]
+linux = [
+    # python3-pyatspi and python3-dbus are typically system packages
+    # installed via apt: python3-pyatspi gir1.2-atspi-2.0 python3-gi
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
@@ -52,4 +60,4 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["server", "mock_uia"]
+packages = ["server", "mock_uia", "uiax"]

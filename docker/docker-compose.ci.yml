@@ -1,0 +1,56 @@
+# ---------------------------------------------------------------------------
+# UIA-X  Docker Compose – Linux CI
+# ---------------------------------------------------------------------------
+# Usage:
+#   docker compose -f docker/docker-compose.ci.yml run unit-tests
+#   docker compose -f docker/docker-compose.ci.yml run integration-tests
+#   docker compose -f docker/docker-compose.ci.yml run all-tests
+#   docker compose -f docker/docker-compose.ci.yml up --abort-on-container-exit
+# ---------------------------------------------------------------------------
+
+services:
+  # -------------------------------------------------------------------------
+  # Unit tests — no display needed, fast
+  # -------------------------------------------------------------------------
+  unit-tests:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: >
+      python3 -m pytest
+        tests/test_linux_backend.py
+        tests/test_tools.py
+        tests/test_auth.py
+        tests/test_input.py
+        tests/test_process.py
+        -v --tb=short
+
+  # -------------------------------------------------------------------------
+  # Integration tests — Xvfb + AT-SPI2 + gnome-calculator
+  # -------------------------------------------------------------------------
+  integration-tests:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      - UIAX_RUN_INTEGRATION=1
+      - UIAX_TEST_APP=gnome-calculator
+    command: >
+      ./tests/run_headless.sh
+        python3 -m pytest
+        tests/test_linux_integration_docker.py -v --tb=short
+
+  # -------------------------------------------------------------------------
+  # All tests in one shot
+  # -------------------------------------------------------------------------
+  all-tests:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      - UIAX_RUN_INTEGRATION=1
+      - UIAX_TEST_APP=gnome-calculator
+    command: >
+      ./tests/run_headless.sh
+        python3 -m pytest tests/ -v --tb=short
+        --ignore=tests/test_linux_integration.py
