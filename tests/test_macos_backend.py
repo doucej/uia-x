@@ -735,7 +735,8 @@ class TestMacOSProcessManager:
     def test_list_windows_returns_list(self):
         from uiax.backends.macos.bridge import MacOSProcessManager
 
-        with patch("uiax.backends.macos.bridge.list_all_windows", return_value=[]):
+        with patch("uiax.backends.macos.bridge.require_axapi"), \
+             patch("uiax.backends.macos.bridge.list_all_windows", return_value=[]):
             pm = MacOSProcessManager()
             result = pm.list_windows()
             assert result == []
@@ -758,7 +759,8 @@ class TestMacOSProcessManager:
             "_app_pid": 100,
         }]
 
-        with patch("uiax.backends.macos.bridge.list_all_windows", return_value=window_list):
+        with patch("uiax.backends.macos.bridge.require_axapi"), \
+             patch("uiax.backends.macos.bridge.list_all_windows", return_value=window_list):
             pm = MacOSProcessManager()
             result = pm.attach(window_title="Calculator")
             assert result["title"] == "Calculator"
@@ -776,7 +778,8 @@ class TestMacOSProcessManager:
         from server.uia_bridge import ProcessNotFoundError
         from uiax.backends.macos.bridge import MacOSProcessManager
 
-        with patch("uiax.backends.macos.bridge.list_all_windows", return_value=[]):
+        with patch("uiax.backends.macos.bridge.require_axapi"), \
+             patch("uiax.backends.macos.bridge.list_all_windows", return_value=[]):
             pm = MacOSProcessManager()
             with pytest.raises(ProcessNotFoundError, match="No window matched"):
                 pm.attach(window_title="NoSuchApp")
@@ -809,7 +812,8 @@ class TestMacOSProcessManager:
             "_app_pid": 100,
         }]
 
-        with patch("uiax.backends.macos.bridge.list_all_windows", return_value=window_list):
+        with patch("uiax.backends.macos.bridge.require_axapi"), \
+             patch("uiax.backends.macos.bridge.list_all_windows", return_value=window_list):
             pm = MacOSProcessManager()
             result = pm.attach(bundle_id="com.apple.calculator")
             assert result["bundle_id"] == "com.apple.calculator"
