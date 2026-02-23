@@ -9,6 +9,9 @@ pydantic>=2.0.0
 # apt install python3-pyatspi gir1.2-atspi-2.0 python3-gi at-spi2-core
 # Optional: xdotool (fallback for keystroke injection)
 
+# macOS-only (install on macOS)
+# pip install pyobjc-framework-ApplicationServices pyobjc-framework-Quartz pyobjc-framework-Cocoa
+
 # dev / test
 pytest>=8.0.0
 pytest-asyncio>=0.23.0

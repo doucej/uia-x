@@ -5,10 +5,10 @@ through UI Automation.  Point any MCP client (Claude Desktop, VS Code Copilot,
 opencode, custom agents) at UIA-X and it can see, click, type, and navigate
 any windowed app — just like a human operator.
 
-> **Today:** Windows (UIA / MSAA via pywinauto) and Linux (AT-SPI2 via pyatspi).
-> **Planned:** macOS (Accessibility API) backend.
-> The bridge abstraction is already in place — new platforms plug in without
-> changing the tool surface.
+> **Today:** Windows (UIA / MSAA via pywinauto), Linux (AT-SPI2 via pyatspi),
+> and macOS (AXAPI via PyObjC).
+> The bridge abstraction is in place — all three platforms share an identical
+> MCP tool surface.
 
 ---
 
@@ -53,7 +53,7 @@ key as a Bearer token header or as the `api_key` parameter on each tool call.
 | `MCP_PORT` | `8000` | Listen port (HTTP modes) |
 | `UIA_X_AUTH` | `apikey` | Auth mode: `apikey` or `none` |
 | `UIA_X_API_KEY` | *(auto)* | Override API key (skip on-disk generation) |
-| `UIA_BACKEND` | `real` | Backend: `real` (auto-detect), `linux` (AT-SPI2), or `mock` (tests) |
+| `UIA_BACKEND` | `real` | Backend: `real` (auto-detect), `linux` (AT-SPI2), `macos` (AXAPI), or `mock` (tests) |
 
 ---
 
@@ -222,8 +222,8 @@ directly — no header needed.
 │  │       Platform Bridge        │   │
 │  │  ┌────────┬────────┬──────┐  │   │
 │  │  │Windows │ Linux  │macOS │  │   │
-│  │  │UIA/MSAA│AT-SPI/Q│A11y  │  │   │
-│  │  │(today) │(future)│(fut.)│  │   │
+│  │  │UIA/MSAA│AT-SPI2 │AXAPI │  │   │
+│  │  │        │pyatspi │PyObjC│  │   │
 │  │  └────────┴────────┴──────┘  │   │
 │  └──────────────────────────────┘   │
 │  ┌──────────────────────────────┐   │
@@ -253,6 +253,9 @@ directly — no header needed.
 | `uiax/backends/linux/bridge.py` | LinuxBridge – AT-SPI2 UIABridge implementation |
 | `uiax/backends/linux/atspi_backend.py` | Node model, tree traversal, element search |
 | `uiax/backends/linux/util.py` | AT-SPI2 utility functions, keystroke synthesis |
+| `uiax/backends/macos/bridge.py` | MacOSBridge – AXAPI UIABridge implementation |
+| `uiax/backends/macos/axapi_backend.py` | Node model, tree traversal, element search |
+| `uiax/backends/macos/util.py` | AXAPI utility functions, Quartz keystroke synthesis |
 
 ---
 
@@ -269,11 +272,16 @@ uia-x/
 │   └── auth.py                ← API key authentication layer
 ├── uiax/
 │   └── backends/
-│       └── linux/
+│       ├── linux/
+│       │   ├── __init__.py        ← Public API exports
+│       │   ├── atspi_backend.py   ← Node model, tree traversal, search
+│       │   ├── bridge.py          ← LinuxBridge (UIABridge impl) + LinuxProcessManager
+│       │   └── util.py            ← AT-SPI2 helpers, keystroke synthesis
+│       └── macos/
 │           ├── __init__.py        ← Public API exports
-│           ├── atspi_backend.py   ← Node model, tree traversal, search
-│           ├── bridge.py          ← LinuxBridge (UIABridge impl) + LinuxProcessManager
-│           └── util.py            ← AT-SPI2 helpers, keystroke synthesis
+│           ├── axapi_backend.py   ← Node model, tree traversal, search
+│           ├── bridge.py          ← MacOSBridge (UIABridge impl) + MacOSProcessManager
+│           └── util.py            ← AXAPI helpers, Quartz keystroke synthesis
 ├── mock_uia/
 │   └── tree.py                ← MockElement, MockTree, fixture factories
 ├── tests/
@@ -284,6 +292,8 @@ uia-x/
 │   ├── test_msaa.py           ← MSAA / LegacyIAccessible tests
 │   ├── test_linux_backend.py   ← Linux backend unit tests (mock AT-SPI)
 │   ├── test_linux_integration.py ← Linux integration tests (live AT-SPI)
+│   ├── test_macos_backend.py   ← macOS backend unit tests (mock AXAPI)
+│   ├── test_macos_integration.py ← macOS integration tests (live AXAPI + Calculator.app)
 │   └── run_headless.sh        ← Headless test harness (Xvfb + D-Bus)
 ├── schemas/                   ← JSON Schema for every tool
 ├── examples/
@@ -305,11 +315,69 @@ uia-x/
 - **Python 3.11+**
 - **Windows** – pywinauto, comtypes (for the Windows UIA backend)
 - **Linux** – python3-pyatspi, at-spi2-core, gir1.2-atspi-2.0 (for the Linux AT-SPI2 backend)
-- A **desktop session** (physical, RDP, or virtual X11/Wayland) – accessibility APIs require an active desktop
+- **macOS** – PyObjC (pyobjc-framework-ApplicationServices, pyobjc-framework-Quartz, pyobjc-framework-Cocoa) for the macOS AXAPI backend
+- A **desktop session** (physical, RDP, VNC, or virtual X11/Wayland) – accessibility APIs require an active desktop
 
-> macOS (Accessibility API) backend is on the roadmap.  The abstract bridge
-> in `server/uia_bridge.py` makes adding new platforms a matter of
-> implementing a single class — no tool API changes needed.
+> The abstract bridge in `server/uia_bridge.py` makes platform backends
+> interchangeable — the MCP tool surface stays identical on Windows, Linux, and macOS.
+
+### macOS accessibility permissions (TCC)
+
+macOS requires an explicit **one-time** accessibility permission grant before
+any process can read or interact with UI elements.  This is enforced by the
+Transparency, Consent, and Control (TCC) framework and applies equally to
+every macOS accessibility tool (Hammerspoon, BetterTouchTool, Keyboard
+Maestro, etc.).
+
+**Quick setup (interactive desktop):**
+
+1. Open **System Settings → Privacy & Security → Accessibility**.
+2. Click **+** and add your Python interpreter (e.g. `/usr/bin/python3`,
+   your conda `python.app`, or **Terminal.app** / **iTerm2**).
+3. Toggle the entry **on**.  That's it — the grant persists across reboots.
+
+**What gets the permission:**
+
+TCC grants trust to the *binary that calls the accessibility API*, not to
+individual scripts.  So you grant permission to `python3` (or `Terminal.app`
+which wraps your shell), and every Python script you run from that binary is
+covered.  You never need to sign or whitelist individual `.py` files.
+
+**Unsigned Python interpreters:**
+
+Conda and Homebrew install unsigned Python binaries.  TCC identifies
+processes by code signature, so unsigned binaries can behave inconsistently
+— the permission may appear to be granted but not actually take effect,
+especially in edge cases like SSH sessions.  If you hit this:
+
+- **Prefer the system Python** (`/usr/bin/python3`) or a properly signed
+  Python distribution when possible.
+- **Conda** ships a `python.app` bundle (`$CONDA_PREFIX/python.app`) that
+  has a bundle identifier (`com.continuum.python`).  Add *that* to
+  Accessibility rather than the bare `bin/python3`.
+- As a last resort, ad-hoc sign the binary:
+  `codesign -s - -f /path/to/python3` (this creates a stable identity for
+  TCC but is not a substitute for real code signing in production).
+
+**SSH / remote sessions:**
+
+SSH connections run in a different macOS security audit session from the
+logged-in GUI.  Even if Python is trusted in TCC, an SSH-spawned process
+won't inherit that trust.  Workarounds:
+
+| Approach | How |
+|----------|-----|
+| **`open` command** | `open /path/to/python.app --args script.py` — launches in the GUI session |
+| **LaunchAgent** | Create a `~/Library/LaunchAgents/*.plist` that runs the server — automatically runs in the user's GUI context |
+| **Screen Sharing / VNC** | Connect via VNC and run from a Terminal window in the GUI session |
+| **`launchctl asuser`** | `sudo launchctl asuser $(id -u) /path/to/python3 script.py` — runs under the GUI user's audit session |
+
+**Enterprise (MDM) deployment:**
+
+For fleet deployment without manual user interaction, push a
+[Privacy Preferences Policy Control (PPPC) profile](https://developer.apple.com/documentation/devicemanagement/privacypreferencespolicycontrol)
+that pre-grants `kTCCServiceAccessibility` to your signed Python binary.
+This requires the binary to be properly code-signed (not ad-hoc).
 
 ---
 
@@ -503,10 +571,7 @@ container and expose port 5900 so you can connect a VNC viewer.
 more secure — there's no way to exfiltrate screen content outside the
 container.
 
-### macOS — secondary user session (planned)
-
-> **Note:** macOS Accessibility API support is on the roadmap but not yet
-> implemented.
+### macOS — secondary user session
 
 macOS doesn't support Docker containers with native GUI access (Darwin
 containers are experimental and limited).  Instead:
@@ -514,11 +579,16 @@ containers are experimental and limited).  Instead:
 1. **Create a dedicated macOS user account** with minimal permissions.
 2. **Fast User Switch** to that account (`System Settings → Users & Groups →
    Login Options → Show fast user switching menu`).
-3. Open only the target application in that session.
-4. Run UIA-X there.  Your primary session remains untouched.
+3. Grant accessibility permission to Python in the new user's session
+   (see [macOS accessibility permissions](#macos-accessibility-permissions-tcc) above).
+4. Open only the target application in that session.
+5. Run UIA-X there.  Your primary session remains untouched.
 
 Alternatively, use a **macOS VM** (supported on Apple Silicon via the
 Virtualization framework, or via UTM/Parallels) and run UIA-X inside the VM.
+
+> **Note:** Each macOS user account has its own TCC database.  You must grant
+> accessibility permission separately in each user session where UIA-X will run.
 
 ### Summary
 
@@ -526,7 +596,7 @@ Virtualization framework, or via UTM/Parallels) and run UIA-X inside the VM.
 |----------|----------------------|---------------|--------|
 | Windows  | RDP session (restricted user) | RDP viewer / `tscon` keep-alive | **Available now** |
 | Linux    | Docker + Xvfb | VNC into container (optional) | **Available now** |
-| macOS    | Secondary user / macOS VM | Fast User Switch / VNC | Planned |
+| macOS    | Secondary user / macOS VM | Fast User Switch / VNC | **Available now** |
 
 ---
 
@@ -734,6 +804,37 @@ tests/test_input.py              – Keystroke & mouse input
 tests/test_msaa.py               – MSAA / LegacyIAccessible fallback
 tests/test_linux_backend.py      – Linux AT-SPI2 backend unit tests
 tests/test_linux_integration.py  – Linux integration tests (requires AT-SPI2)
+tests/test_macos_backend.py      – macOS AXAPI backend unit tests
+tests/test_macos_integration.py  – macOS integration tests (requires AXAPI + Calculator.app)
+```
+
+### Running macOS integration tests
+
+macOS integration tests require a live GUI session, accessibility permissions,
+and Calculator.app:
+
+```bash
+# Grant accessibility permission to Python first (manual, one-time):
+#   System Settings → Privacy & Security → Accessibility → add Python / Terminal
+#   (see "macOS accessibility permissions" section above for details)
+
+# Run from the GUI session (preferred — TCC trust is automatic):
+UIAX_RUN_MACOS_INTEGRATION=1 pytest tests/test_macos_integration.py -v
+
+# Over SSH — launch via `open` so the process runs in the GUI Aqua session:
+# (direct SSH execution won't have TCC trust even if Python is whitelisted)
+ssh user@mac-host "open /path/to/python.app --args -m pytest \
+    /path/to/uia-x/tests/test_macos_integration.py -v"
+
+# Or use the live demo script for a quick smoke test:
+open /path/to/python.app --args /path/to/uia-x/tests/live_macos_demo.py
+cat /tmp/uiax_live_demo.txt   # output is tee'd to this file
+```
+
+Prerequisites (macOS):
+
+```bash
+pip install pyobjc-framework-ApplicationServices pyobjc-framework-Quartz pyobjc-framework-Cocoa
 ```
 
 ### Running Linux integration tests
