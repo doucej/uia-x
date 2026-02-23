@@ -191,13 +191,10 @@ class TestCalculatorCompute:
             bridge.invoke({"by": "name", "value": btn})
             time.sleep(0.3)
 
-        # Read the result — look for a text element or the main display
-        tree = bridge.inspect({"depth": 8})
-        result_text = _extract_result(tree)
-        dump = _dump_tree(tree)
-        assert result_text is not None, (
-            f"Could not find result in tree:\n{dump}"
-        )
+        # Read the result by searching the live AT-SPI tree directly
+        # (the GTK4 tree can be 15+ panels deep, so serialized dumps miss it)
+        result_text = _find_result_live(bridge)
+        assert result_text is not None, "Could not find numeric result in live tree"
         assert "42" in result_text, f"Expected '42' in result, got: {result_text}"
 
     def test_addition(self) -> None:
@@ -216,13 +213,61 @@ class TestCalculatorCompute:
             bridge.invoke({"by": "name", "value": btn})
             time.sleep(0.3)
 
-        tree = bridge.inspect({"depth": 8})
-        result_text = _extract_result(tree)
-        dump = _dump_tree(tree)
-        assert result_text is not None, (
-            f"Could not find result in tree:\n{dump}"
-        )
+        result_text = _find_result_live(bridge)
+        assert result_text is not None, "Could not find numeric result in live tree"
         assert "42" in result_text, f"Expected '42', got: {result_text}"
+
+
+def _find_result_live(bridge: object) -> str | None:
+    """
+    Search the live AT-SPI tree for the calculator's result display.
+
+    GTK4 / libadwaita gnome-calculator can nest widgets 15+ panels deep,
+    so serialising the tree with a fixed depth misses the actual content.
+    Instead we search the *live* tree via ``bridge.inspect({"by": ...})``
+    which calls ``find_accessible`` with unlimited depth.
+
+    Strategy (in priority order):
+      1. Search by ``name_substring`` for "42" — fast, unambiguous.
+      2. Search each display-like role and read its text/name/value.
+      3. Give up and return None.
+    """
+    # Strategy 1: look for any element whose name already contains "42"
+    try:
+        result = bridge.inspect({"by": "name_substring", "value": "42"})  # type: ignore[union-attr]
+        if result:
+            for field in ("text", "name", "value"):
+                v = result.get(field, "")
+                if v and "42" in str(v):
+                    return str(v)
+    except Exception:
+        pass
+
+    # Strategy 2: probe display-like roles directly
+    for role in (
+        "editbar",
+        "label",
+        "text",
+        "static",
+        "status bar",
+        "section",
+        "paragraph",
+    ):
+        try:
+            result = bridge.inspect({"by": "role", "value": role})  # type: ignore[union-attr]
+            for field in ("text", "name", "value"):
+                v = result.get(field, "")
+                if v and any(c.isdigit() for c in str(v)):
+                    return str(v)
+        except Exception:
+            continue
+
+    # Strategy 3: very deep tree dump as last resort
+    try:
+        tree = bridge.inspect({"depth": 30})  # type: ignore[union-attr]
+        return _extract_result(tree)
+    except Exception:
+        return None
 
 
 def _extract_result(node: dict, depth: int = 0) -> str | None:
