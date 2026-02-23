@@ -860,6 +860,13 @@ sudo apt install -y \
 
 ---
 
+## Contributing
+
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for setup
+instructions, the bridge interface, and PR guidelines.
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
