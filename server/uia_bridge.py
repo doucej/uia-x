@@ -152,14 +152,28 @@ def get_bridge(backend: str = "real") -> UIABridge:
     Parameters
     ----------
     backend : str
-        ``"real"``  – live Windows UI Automation via pywinauto
+        ``"real"``  – live UI Automation (Windows UIA or Linux AT-SPI2)
         ``"mock"``  – in-process mock tree (no target app required)
+        ``"linux"`` – force Linux AT-SPI2 backend
     """
     if backend == "mock":
         from server.mock_bridge import MockUIABridge  # noqa: PLC0415
 
         return MockUIABridge()
-    else:
-        from server.real_bridge import RealUIABridge  # noqa: PLC0415
 
-        return RealUIABridge()
+    if backend == "linux" or (backend == "real" and _is_linux()):
+        from uiax.backends.linux.bridge import LinuxBridge  # noqa: PLC0415
+
+        return LinuxBridge()
+
+    # Default: Windows UIA backend
+    from server.real_bridge import RealUIABridge  # noqa: PLC0415
+
+    return RealUIABridge()
+
+
+def _is_linux() -> bool:
+    """Return True if the current platform is Linux."""
+    import sys  # noqa: PLC0415
+
+    return sys.platform.startswith("linux")

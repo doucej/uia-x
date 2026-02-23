@@ -5,8 +5,8 @@ through UI Automation.  Point any MCP client (Claude Desktop, VS Code Copilot,
 opencode, custom agents) at UIA-X and it can see, click, type, and navigate
 any windowed app — just like a human operator.
 
-> **Today:** Windows (UIA / MSAA via pywinauto).
-> **Planned:** Linux (AT-SPI / Qt) and macOS (Accessibility API) backends.
+> **Today:** Windows (UIA / MSAA via pywinauto) and Linux (AT-SPI2 via pyatspi).
+> **Planned:** macOS (Accessibility API) backend.
 > The bridge abstraction is already in place — new platforms plug in without
 > changing the tool surface.
 
@@ -53,7 +53,7 @@ key as a Bearer token header or as the `api_key` parameter on each tool call.
 | `MCP_PORT` | `8000` | Listen port (HTTP modes) |
 | `UIA_X_AUTH` | `apikey` | Auth mode: `apikey` or `none` |
 | `UIA_X_API_KEY` | *(auto)* | Override API key (skip on-disk generation) |
-| `UIA_BACKEND` | `real` | Backend: `real` (pywinauto) or `mock` (tests) |
+| `UIA_BACKEND` | `real` | Backend: `real` (auto-detect), `linux` (AT-SPI2), or `mock` (tests) |
 
 ---
 
@@ -244,12 +244,15 @@ directly — no header needed.
 | Module | Responsibility |
 |--------|---------------|
 | `server/server.py` | FastMCP app, all tool registrations, auth gating |
-| `server/uia_bridge.py` | Abstract bridge interface, error taxonomy |
-| `server/real_bridge.py` | Live UIA + MSAA backend via pywinauto |
-| `server/mock_bridge.py` | Mock backend for tests (no Windows required) |
+| `server/uia_bridge.py` | Abstract bridge interface, error taxonomy, platform detection |
+| `server/real_bridge.py` | Live UIA + MSAA backend via pywinauto (Windows) |
+| `server/mock_bridge.py` | Mock backend for tests (any platform) |
 | `server/process_manager.py` | Enumerate processes/windows, attach/detach |
 | `server/auth.py` | API key generation, validation, pluggable auth |
 | `mock_uia/tree.py` | Mock element trees (generic, Quicken, MSAA) |
+| `uiax/backends/linux/bridge.py` | LinuxBridge – AT-SPI2 UIABridge implementation |
+| `uiax/backends/linux/atspi_backend.py` | Node model, tree traversal, element search |
+| `uiax/backends/linux/util.py` | AT-SPI2 utility functions, keystroke synthesis |
 
 ---
 
@@ -259,11 +262,18 @@ directly — no header needed.
 uia-x/
 ├── server/
 │   ├── server.py             ← FastMCP app, tool registrations
-│   ├── uia_bridge.py         ← Abstract bridge + error types
-│   ├── real_bridge.py         ← Live UIA + MSAA backend (pywinauto)
+│   ├── uia_bridge.py         ← Abstract bridge + error types + platform detection
+│   ├── real_bridge.py         ← Live UIA + MSAA backend (pywinauto, Windows)
 │   ├── mock_bridge.py         ← Mock backend for tests
 │   ├── process_manager.py     ← Process/window enumeration & attachment
 │   └── auth.py                ← API key authentication layer
+├── uiax/
+│   └── backends/
+│       └── linux/
+│           ├── __init__.py        ← Public API exports
+│           ├── atspi_backend.py   ← Node model, tree traversal, search
+│           ├── bridge.py          ← LinuxBridge (UIABridge impl) + LinuxProcessManager
+│           └── util.py            ← AT-SPI2 helpers, keystroke synthesis
 ├── mock_uia/
 │   └── tree.py                ← MockElement, MockTree, fixture factories
 ├── tests/
@@ -271,7 +281,10 @@ uia-x/
 │   ├── test_process.py        ← Process enumeration & attachment tests
 │   ├── test_auth.py           ← Authentication layer tests
 │   ├── test_input.py          ← Keystroke & mouse input tests
-│   └── test_msaa.py           ← MSAA / LegacyIAccessible tests
+│   ├── test_msaa.py           ← MSAA / LegacyIAccessible tests
+│   ├── test_linux_backend.py   ← Linux backend unit tests (mock AT-SPI)
+│   ├── test_linux_integration.py ← Linux integration tests (live AT-SPI)
+│   └── run_headless.sh        ← Headless test harness (Xvfb + D-Bus)
 ├── schemas/                   ← JSON Schema for every tool
 ├── examples/
 │   └── quicken/               ← Quicken-specific skill (from V1)
@@ -290,12 +303,13 @@ uia-x/
 ## Requirements
 
 - **Python 3.11+**
-- **Windows** (for the real UIA backend today; mock backend runs anywhere)
-- A **desktop session** (physical or RDP) — UI Automation requires an active desktop
+- **Windows** – pywinauto, comtypes (for the Windows UIA backend)
+- **Linux** – python3-pyatspi, at-spi2-core, gir1.2-atspi-2.0 (for the Linux AT-SPI2 backend)
+- A **desktop session** (physical, RDP, or virtual X11/Wayland) – accessibility APIs require an active desktop
 
-> Linux (AT-SPI / Qt) and macOS (Accessibility API) backends are on the roadmap.
-> The abstract bridge in `server/uia_bridge.py` makes adding new platforms
-> a matter of implementing a single class — no tool API changes needed.
+> macOS (Accessibility API) backend is on the roadmap.  The abstract bridge
+> in `server/uia_bridge.py` makes adding new platforms a matter of
+> implementing a single class — no tool API changes needed.
 
 ---
 
@@ -447,10 +461,7 @@ session on the same machine (or a VM) and run the server there.
 > only if the target app requires hardware rendering — most Win32/WPF apps
 > are fine on standard instances.
 
-### Linux — Docker + virtual display (planned)
-
-> **Note:** Linux support (AT-SPI / Qt accessibility) is on the roadmap but
-> not yet implemented.  The isolation pattern below is ready for when it is.
+### Linux — Docker + virtual display
 
 Run UIA-X inside a Docker container with a virtual X11 or Wayland display.
 The agent sees only what's inside the container.
@@ -461,6 +472,8 @@ FROM ubuntu:24.04
 
 RUN apt-get update && apt-get install -y \
     xvfb x11vnc python3 python3-pip \
+    python3-pyatspi gir1.2-atspi-2.0 at-spi2-core \
+    dbus-x11 xdotool \
     # install target app dependencies here
     && rm -rf /var/lib/apt/lists/*
 
@@ -468,11 +481,11 @@ COPY . /opt/uia-x
 WORKDIR /opt/uia-x
 RUN pip install -r requirements.txt
 
-# Start a virtual framebuffer + the MCP server
+# Start a virtual framebuffer + AT-SPI2 + the MCP server
 CMD Xvfb :99 -screen 0 1920x1080x24 & \
     export DISPLAY=:99 && \
     export MCP_TRANSPORT=streamable-http && \
-    python -m server.server
+    dbus-run-session -- python -m server.server
 ```
 
 ```bash
@@ -512,7 +525,7 @@ Virtualization framework, or via UTM/Parallels) and run UIA-X inside the VM.
 | Platform | Recommended isolation | Observability | Status |
 |----------|----------------------|---------------|--------|
 | Windows  | RDP session (restricted user) | RDP viewer / `tscon` keep-alive | **Available now** |
-| Linux    | Docker + Xvfb | VNC into container (optional) | Planned |
+| Linux    | Docker + Xvfb | VNC into container (optional) | **Available now** |
 | macOS    | Secondary user / macOS VM | Fast User Switch / VNC | Planned |
 
 ---
@@ -711,14 +724,37 @@ All UIA tools accept a `target` object:
 pytest tests/ -v
 ```
 
-All tests use the **mock backend** — no Windows or target app required.
+All core tests use the **mock backend** — no Windows or target app required.
 
 ```
-tests/test_tools.py      – Core UIA tools (inspect/invoke/set_value)
-tests/test_process.py    – Process enumeration & window attachment
-tests/test_auth.py       – API key authentication
-tests/test_input.py      – Keystroke & mouse input
-tests/test_msaa.py       – MSAA / LegacyIAccessible fallback
+tests/test_tools.py              – Core UIA tools (inspect/invoke/set_value)
+tests/test_process.py            – Process enumeration & window attachment
+tests/test_auth.py               – API key authentication
+tests/test_input.py              – Keystroke & mouse input
+tests/test_msaa.py               – MSAA / LegacyIAccessible fallback
+tests/test_linux_backend.py      – Linux AT-SPI2 backend unit tests
+tests/test_linux_integration.py  – Linux integration tests (requires AT-SPI2)
+```
+
+### Running Linux integration tests
+
+Linux integration tests require a live AT-SPI2 session and a test application.
+Use the headless harness:
+
+```bash
+# Run with Xvfb + D-Bus session (no real display needed)
+./tests/run_headless.sh pytest tests/test_linux_integration.py -v
+
+# Or manually enable integration tests
+UIA_RUN_INTEGRATION=1 pytest tests/test_linux_integration.py -v
+```
+
+Prerequisites (Debian/Ubuntu):
+
+```bash
+sudo apt install -y \
+    python3-pyatspi gir1.2-atspi-2.0 at-spi2-core \
+    xvfb dbus xterm xdotool
 ```
 
 ---

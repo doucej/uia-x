@@ -256,6 +256,61 @@ class MockProcessManager(ProcessManager):
 
 
 # ---------------------------------------------------------------------------
+# Linux AT-SPI2 adapter
+# ---------------------------------------------------------------------------
+
+
+class LinuxProcessManagerAdapter(ProcessManager):
+    """
+    Adapter that wraps :class:`uiax.backends.linux.bridge.LinuxProcessManager`
+    to conform to the :class:`ProcessManager` ABC.
+
+    Translates AT-SPI2 window dicts into :class:`WindowInfo` instances.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        from uiax.backends.linux.bridge import get_linux_process_manager  # noqa: PLC0415
+
+        self._lpm = get_linux_process_manager()
+
+    def list_windows(self, *, visible_only: bool = True) -> list[WindowInfo]:
+        raw = self._lpm.list_windows(visible_only=visible_only)
+        return [self._to_window_info(w) for w in raw]
+
+    def attach(
+        self,
+        *,
+        pid: int | None = None,
+        process_name: str | None = None,
+        window_title: str | None = None,
+        class_name: str | None = None,
+        hwnd: int | None = None,
+    ) -> WindowInfo:
+        win = self._lpm.attach(
+            pid=pid,
+            process_name=process_name,
+            window_title=window_title,
+            class_name=class_name,
+            hwnd=hwnd,
+        )
+        self._attached = self._to_window_info(win)
+        return self._attached
+
+    @staticmethod
+    def _to_window_info(w: dict) -> WindowInfo:
+        return WindowInfo(
+            hwnd=w.get("hwnd", 0),
+            title=w.get("title", ""),
+            class_name=w.get("class_name", ""),
+            pid=w.get("pid", 0),
+            process_name=w.get("process_name", ""),
+            visible=w.get("visible", True),
+            rect=w.get("rect", {"left": 0, "top": 0, "right": 0, "bottom": 0}),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Default mock fixtures
 # ---------------------------------------------------------------------------
 
@@ -310,9 +365,18 @@ def get_process_manager(backend: str | None = None) -> ProcessManager:
             backend = os.environ.get("UIA_BACKEND", "real").lower()
         if backend == "mock":
             _instance = MockProcessManager()
+        elif backend == "linux" or (backend == "real" and _is_linux()):
+            _instance = LinuxProcessManagerAdapter()
         else:
             _instance = RealProcessManager()
     return _instance
+
+
+def _is_linux() -> bool:
+    """Return True if the current platform is Linux."""
+    import sys  # noqa: PLC0415
+
+    return sys.platform.startswith("linux")
 
 
 def reset_process_manager() -> None:
