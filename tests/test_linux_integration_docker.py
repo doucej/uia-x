@@ -192,9 +192,12 @@ class TestCalculatorCompute:
             time.sleep(0.3)
 
         # Read the result — look for a text element or the main display
-        tree = bridge.inspect({"depth": 5})
+        tree = bridge.inspect({"depth": 8})
         result_text = _extract_result(tree)
-        assert result_text is not None, f"Could not find result in tree: {tree}"
+        dump = _dump_tree(tree)
+        assert result_text is not None, (
+            f"Could not find result in tree:\n{dump}"
+        )
         assert "42" in result_text, f"Expected '42' in result, got: {result_text}"
 
     def test_addition(self) -> None:
@@ -213,9 +216,12 @@ class TestCalculatorCompute:
             bridge.invoke({"by": "name", "value": btn})
             time.sleep(0.3)
 
-        tree = bridge.inspect({"depth": 5})
+        tree = bridge.inspect({"depth": 8})
         result_text = _extract_result(tree)
-        assert result_text is not None, f"Could not find result in tree"
+        dump = _dump_tree(tree)
+        assert result_text is not None, (
+            f"Could not find result in tree:\n{dump}"
+        )
         assert "42" in result_text, f"Expected '42', got: {result_text}"
 
 
@@ -223,26 +229,61 @@ def _extract_result(node: dict, depth: int = 0) -> str | None:
     """
     Walk the inspect tree to find the calculator's result display.
 
-    gnome-calculator exposes the result as a text content in an editbar
-    or label element.
-    """
-    # Check this node's text content
-    text = node.get("text", "")
-    if text and any(c.isdigit() for c in text):
-        return text
+    gnome-calculator versions expose the result in different ways:
+    - As ``text`` content on an editbar / text element
+    - As ``value`` on a numeric display
+    - As the ``name`` of a label, section, or panel
 
-    # Check the name for a numeric display value
-    name = node.get("name", "")
+    We do a DFS and return the first node whose text/value/name looks
+    like it contains a numeric result, skipping interactive controls
+    like push buttons.
+    """
     role = node.get("role", "")
-    if role in ("label", "editbar", "text", "static") and name and any(
-        c.isdigit() for c in name
-    ):
+
+    # Skip buttons — they have numeric names ("7", "42") but aren't the display
+    if role in ("push button", "button", "toggle button"):
+        return None
+
+    # 1. Check text content  (EditableText / Text interface)
+    text = node.get("text", "")
+    if text and any(c.isdigit() for c in str(text)):
+        return str(text)
+
+    # 2. Check value  (Value interface — some calculators use this)
+    value = node.get("value")
+    if value is not None:
+        val_str = str(value)
+        if any(c.isdigit() for c in val_str):
+            return val_str
+
+    # 3. Check name — accept any non-button role whose name has digits
+    name = node.get("name", "")
+    if name and any(c.isdigit() for c in name):
         return name
 
-    # Recurse into children
+    # 4. Recurse into children
     for child in node.get("children", []):
         found = _extract_result(child, depth + 1)
         if found is not None:
             return found
 
     return None
+
+
+def _dump_tree(node: dict, indent: int = 0) -> str:
+    """Produce a compact text dump of the inspect tree for debug output."""
+    lines: list[str] = []
+    prefix = "  " * indent
+    role = node.get("role", "?")
+    name = node.get("name", "")
+    text = node.get("text", "")
+    value = node.get("value", "")
+    extra = ""
+    if text:
+        extra += f" text={text!r}"
+    if value:
+        extra += f" value={value!r}"
+    lines.append(f"{prefix}[{role}] name={name!r}{extra}")
+    for child in node.get("children", []):
+        lines.append(_dump_tree(child, indent + 1))
+    return "\n".join(lines)
