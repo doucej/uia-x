@@ -152,9 +152,10 @@ def get_bridge(backend: str = "real") -> UIABridge:
     Parameters
     ----------
     backend : str
-        ``"real"``  – live UI Automation (Windows UIA or Linux AT-SPI2)
-        ``"mock"``  – in-process mock tree (no target app required)
-        ``"linux"`` – force Linux AT-SPI2 backend
+        ``"real"``   – live UI Automation (auto-detect platform)
+        ``"mock"``   – in-process mock tree (no target app required)
+        ``"linux"``  – force Linux AT-SPI2 backend
+        ``"macos"``  – force macOS AXAPI backend
     """
     if backend == "mock":
         from server.mock_bridge import MockUIABridge  # noqa: PLC0415
@@ -165,6 +166,11 @@ def get_bridge(backend: str = "real") -> UIABridge:
         from uiax.backends.linux.bridge import LinuxBridge  # noqa: PLC0415
 
         return LinuxBridge()
+
+    if backend == "macos" or (backend == "real" and _is_macos()):
+        from uiax.backends.macos.bridge import MacOSBridge  # noqa: PLC0415
+
+        return MacOSBridge()
 
     # Default: Windows UIA backend
     from server.real_bridge import RealUIABridge  # noqa: PLC0415
@@ -177,3 +183,10 @@ def _is_linux() -> bool:
     import sys  # noqa: PLC0415
 
     return sys.platform.startswith("linux")
+
+
+def _is_macos() -> bool:
+    """Return True if the current platform is macOS."""
+    import sys  # noqa: PLC0415
+
+    return sys.platform == "darwin"
