@@ -135,6 +135,19 @@ def load_key_hash() -> Optional[str]:
     return None
 
 
+def delete_key_file() -> bool:
+    """
+    Delete the stored key hash file.
+
+    Returns True if the file was deleted, False if it did not exist.
+    Used by the ``--reset-key`` startup flag to force new-key generation.
+    """
+    if _KEY_FILE.is_file():
+        _KEY_FILE.unlink()
+        return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Provider factory
 # ---------------------------------------------------------------------------
@@ -163,8 +176,13 @@ def get_auth_provider() -> AuthProvider:
     if env_key:
         env_var_used = _ENV_API_KEY if os.environ.get(_ENV_API_KEY) else _ENV_API_KEY_LEGACY
         key_hash = hashlib.sha256(env_key.encode()).hexdigest()
+        disk_note = (
+            f" (overrides key stored at {_KEY_FILE})"
+            if _KEY_FILE.is_file()
+            else ""
+        )
         print(
-            f"[uia-x] API key sourced from environment variable {env_var_used}.\n"
+            f"[uia-x] API key sourced from environment variable {env_var_used}{disk_note}.\n"
             f"[uia-x] Key: {env_key}",
             file=sys.stdout,
         )

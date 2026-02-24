@@ -20,12 +20,13 @@ from __future__ import annotations
 
 import os
 import sys
+import argparse
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
 from server.uia_bridge import get_bridge, UIAError
-from server.auth import require_auth, NoAuthProvider, set_auth_provider, BearerAuthMiddleware, init_auth
+from server.auth import require_auth, NoAuthProvider, set_auth_provider, BearerAuthMiddleware, init_auth, delete_key_file
 from server.process_manager import (
     get_process_manager,
     WindowInfo,
@@ -538,11 +539,27 @@ def mouse_click_tool(
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="uia-x MCP server")
+    parser.add_argument(
+        "--reset-key",
+        action="store_true",
+        help="Delete the stored API key hash and generate a new key on startup.",
+    )
+    # parse_known_args so MCP-client-injected arguments don't cause a hard error.
+    args, _ = parser.parse_known_args()
+
     backend = os.environ.get("UIA_BACKEND", "real").lower()
     auth_mode = os.environ.get("UIA_X_AUTH", "apikey").lower()
     transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()
     host = os.environ.get("MCP_HOST", "0.0.0.0")
     port = int(os.environ.get("MCP_PORT", "8000"))
+
+    if args.reset_key:
+        deleted = delete_key_file()
+        if deleted:
+            print("[uia-x] Stored API key hash deleted; a new key will be generated.", file=sys.stdout)
+        else:
+            print("[uia-x] --reset-key: no stored key found; a new key will be generated.", file=sys.stdout)
 
     # Eagerly initialise the auth provider so the API key is printed to stdout
     # *before* the HTTP server emits its own log lines.
