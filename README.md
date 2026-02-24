@@ -24,12 +24,12 @@ python -m venv .venv
 .venv\Scripts\activate
 pip install -e .
 
-# 2. Start the server  (first run prints an API key — save it!)
+# 2. Start the server  (prints the active API key to stdout at startup)
 $env:MCP_TRANSPORT="streamable-http"
 python -m server.server
 ```
 
-On first launch you'll see:
+On **first** startup (new key generated and hash saved to disk):
 
 ```
 [uia-x] *** NEW API KEY GENERATED ***
@@ -37,6 +37,24 @@ On first launch you'll see:
 [uia-x] Stored hash in: C:\Users\<you>\.uia_x\api_key
 [uia-x] Save this key – it will not be shown again.
 [uiax] starting server (backend=real, auth=apikey, transport=streamable-http, http://0.0.0.0:8000)
+```
+
+On **subsequent** startups (hash loaded from disk — plaintext not recoverable):
+
+```
+[uia-x] API key loaded from disk (C:\Users\<you>\.uia_x\api_key).
+[uia-x] The hash is stored; use your saved key to authenticate.
+[uia-x] To display the key again set UIAX_API_KEY=<your-key> or delete the file to regenerate.
+[uiax] starting server (backend=real, auth=apikey, transport=streamable-http, http://0.0.0.0:8000)
+```
+
+To pin a fixed key that is printed on every startup, set `UIAX_API_KEY`:
+
+```powershell
+$env:UIAX_API_KEY="my-fixed-key"
+python -m server.server
+# [uia-x] API key sourced from environment variable UIAX_API_KEY.
+# [uia-x] Key: my-fixed-key
 ```
 
 **3. Point your MCP client at `http://localhost:8000/mcp`** and pass the API
@@ -52,7 +70,7 @@ key as a Bearer token header or as the `api_key` parameter on each tool call.
 | `MCP_HOST` | `0.0.0.0` | Bind address (HTTP modes) |
 | `MCP_PORT` | `8000` | Listen port (HTTP modes) |
 | `UIA_X_AUTH` | `apikey` | Auth mode: `apikey` or `none` |
-| `UIA_X_API_KEY` | *(auto)* | Override API key (skip on-disk generation) |
+| `UIAX_API_KEY` | *(auto)* | Pin a specific API key (skips on-disk generation). Legacy alias: `UIA_X_API_KEY` |
 | `UIA_BACKEND` | `real` | Backend: `real` (auto-detect), `linux` (AT-SPI2), `macos` (AXAPI), or `mock` (tests) |
 
 ---
@@ -234,8 +252,8 @@ directly — no header needed.
                │
                ▼  pywinauto / ctypes / comtypes
 ┌─────────────────────────────────────┐
-│     Windows Desktop (RDP session)   │
-│   Target application (any app)      │
+│     Windows Desktop (dedicated VM session)  │
+│   Target application (any app)              │
 └─────────────────────────────────────┘
 ```
 
@@ -418,12 +436,22 @@ could do.  This is the point of the tool, but it means:
 day-to-day work.  See [Isolation strategies](#isolation-strategies) below for
 recommended setups on each platform.
 
-### First run
+### Startup key behaviour
 
-On first start the server will:
-1. Generate a cryptographically random API key
-2. Print it to **stderr** (copy it now — it's shown only once)
-3. Store a SHA-256 hash in `~/.uia_x/api_key`
+Every time the server starts it resolves the active API key and prints status
+to **stdout** before the HTTP server begins accepting connections:
+
+* **First run** – a new cryptographically random key is generated, its
+  SHA-256 hash is written to `~/.uia_x/api_key`, and the **plaintext key** is
+  printed.  Copy and save it — the file stores only the hash, so the
+  plaintext cannot be recovered on subsequent runs.
+* **Subsequent runs** – the hash is loaded from disk and a confirmation
+  notice is printed.  The plaintext key is not shown again.
+* **`UIAX_API_KEY` env var set** – that key is used as-is and printed on
+  every startup (ideal for scripted or containerised deployments).
+
+Only the SHA-256 hash is ever written to disk — the server never stores the
+raw key on disk.
 
 ### Authenticating via HTTP header (recommended for HTTP transports)
 
@@ -460,6 +488,8 @@ UIA_X_AUTH=none python -m server.server
 ### Overriding the key via environment
 
 ```bash
+UIAX_API_KEY=my-fixed-key python -m server.server
+# Legacy alias also accepted:
 UIA_X_API_KEY=my-fixed-key python -m server.server
 ```
 
@@ -498,36 +528,48 @@ Because UIA-X has full desktop access (see
 it in an **isolated session** that contains only the application(s) the agent
 needs.  Below are platform-specific recommendations.
 
-### Windows — dedicated RDP session (recommended)
+### Windows — dedicated VM (recommended)
 
-The simplest and most battle-tested approach: open a separate Remote Desktop
-session on the same machine (or a VM) and run the server there.
+> **Note on multi-session RDP:** Standard Windows 10/11 **Pro** does not
+> support concurrent Remote Desktop sessions — connecting a second RDP client
+> disconnects the first.  Multi-session is a Windows Server feature and is
+> not available on Pro.  Do not rely on "concurrent RDP" workarounds on
+> standard Windows Pro installations.
 
-1. **Create a restricted local user** (optional but recommended):
+**Safety and stability recommendation:** if UIA-X runs inside *your own
+active desktop session* the LLM agent and you are sharing the same UI.
+This causes focus conflicts, unexpected window closures, and unpredictable
+automation behaviour because both parties compete for keyboard and mouse focus.
+This is a safety and stability concern, not a licensing issue.
+
+The cleanest solution is to run UIA-X inside a **dedicated Windows VM** that
+contains only the target application(s).
+
+1. **Create a Windows VM** (Hyper-V, VirtualBox, VMware, Azure, AWS, or any
+   hypervisor).  A minimal Windows 10/11 installation is sufficient;
+   GPU passthrough is only needed if the target app requires hardware
+   rendering.
+2. **Create a restricted local user** in the VM (optional but recommended):
    ```powershell
    net user uiax-agent P@ssw0rd123 /add
    # Do NOT add to Administrators — limit what the agent can reach
    ```
-2. **Open an RDP session** as that user — to `localhost` or a dedicated VM.
-3. **Keep the session connected.** UI Automation requires an active desktop.
-   If you need to disconnect your *viewer* without killing the session:
-   ```cmd
-   tscon %sessionname% /dest:console
-   ```
-4. **Install only the target application** in that session.  The agent can
-   only see what's on this desktop — your email, browser, and password
-   manager stay on your real session.
-5. **Start UIA-X** inside the RDP session:
+3. **Log in as that user** in the VM console to create an active desktop
+   session.  UI Automation requires an active, logged-in session.
+4. **Install only the target application** in the VM.  The agent sees only
+   what is on that VM’s desktop — your email, browser, and password manager
+   remain on your host machine.
+5. **Start UIA-X** inside the VM session:
    ```powershell
    $env:MCP_TRANSPORT = "streamable-http"
    $env:UIA_X_AUTH    = "apikey"        # or "none" for local-only
    python -m server.server
    ```
-6. **Connect your MCP client** from anywhere to `http://<host>:8000/mcp`.
+6. **Connect your MCP client** from your host to `http://<vm-ip>:8000/mcp`.
 
-> **Cloud VMs:** Azure / AWS instances work well.  Use a GPU-accelerated SKU
-> only if the target app requires hardware rendering — most Win32/WPF apps
-> are fine on standard instances.
+> **Cloud VMs:** Azure / AWS instances work equally well.  The agent connects
+> over the network; observe progress through the hypervisor console or an
+> optional VNC viewer connected to the single active session.
 
 ### Linux — Docker + virtual display
 
@@ -594,7 +636,7 @@ Virtualization framework, or via UTM/Parallels) and run UIA-X inside the VM.
 
 | Platform | Recommended isolation | Observability | Status |
 |----------|----------------------|---------------|--------|
-| Windows  | RDP session (restricted user) | RDP viewer / `tscon` keep-alive | **Available now** |
+| Windows  | Dedicated Windows VM (restricted user) | VM console / optional VNC viewer | **Available now** |
 | Linux    | Docker + Xvfb | VNC into container (optional) | **Available now** |
 | macOS    | Secondary user / macOS VM | Fast User Switch / VNC | **Available now** |
 

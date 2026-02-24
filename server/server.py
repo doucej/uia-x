@@ -25,7 +25,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from server.uia_bridge import get_bridge, UIAError
-from server.auth import require_auth, NoAuthProvider, set_auth_provider, BearerAuthMiddleware
+from server.auth import require_auth, NoAuthProvider, set_auth_provider, BearerAuthMiddleware, init_auth
 from server.process_manager import (
     get_process_manager,
     WindowInfo,
@@ -543,6 +543,11 @@ def main() -> None:
     transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()
     host = os.environ.get("MCP_HOST", "0.0.0.0")
     port = int(os.environ.get("MCP_PORT", "8000"))
+
+    # Eagerly initialise the auth provider so the API key is printed to stdout
+    # *before* the HTTP server emits its own log lines.
+    init_auth()
+
     print(
         f"[uiax] starting server "
         f"(backend={backend}, auth={auth_mode}, transport={transport}"
