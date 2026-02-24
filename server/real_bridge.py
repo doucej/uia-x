@@ -72,6 +72,14 @@ _ROLE_LABEL: dict[int, str] = {
 
 _MSAA_STRATEGIES = {"legacy_name", "legacy_role", "child_id", "hwnd"}
 
+# All valid 'by' strategy names — also accepted as flat shorthand keys.
+_SELECTOR_STRATEGIES = {
+    "automation_id", "name", "control_type", "class_name", "path",
+} | _MSAA_STRATEGIES
+
+# Keys that carry plumbing metadata, not selector values.
+_META_KEYS = {"by", "value", "index", "depth"}
+
 
 def _require_pywinauto() -> None:
     if not _PYWINAUTO_AVAILABLE:
@@ -302,6 +310,39 @@ def _matches_msaa(element, by: str, value: str) -> bool:
 def _find_element(root, target: dict[str, Any]):
     if not target:
         return root
+
+    # ------------------------------------------------------------------
+    # Normalise shorthand form  {"automation_id": "okBtn"}  into
+    # the canonical form        {"by": "automation_id", "value": "okBtn"}
+    # and reject unknown keys so a typo never silently matches the wrong
+    # element (e.g. the old default 'name=""' fallback could invoke the
+    # Minimize button).
+    # ------------------------------------------------------------------
+    if "by" not in target:
+        extra_keys = {k for k in target if k not in _META_KEYS}
+        unknown = extra_keys - _SELECTOR_STRATEGIES
+        if unknown:
+            raise UIAError(
+                f"Unrecognised target key(s): {sorted(unknown)!r}. "
+                "Use {\"by\": \"<strategy>\", \"value\": \"<val>\"} "
+                "or a shorthand like {\"automation_id\": \"myButton\"}.",
+                code="INVALID_SELECTOR",
+            )
+        known = extra_keys & _SELECTOR_STRATEGIES
+        if len(known) > 1:
+            raise UIAError(
+                f"Ambiguous shorthand: multiple selector keys {sorted(known)!r}. "
+                "Use the explicit {\"by\": \"<strategy>\", \"value\": \"<val>\"} form.",
+                code="INVALID_SELECTOR",
+            )
+        if known:
+            shorthand_by = next(iter(known))
+            target = {
+                "by": shorthand_by,
+                "value": str(target[shorthand_by]),
+                "index": target.get("index", 0),
+            }
+
     by = target.get("by", "name")
     value = target.get("value", "")
     index = int(target.get("index", 0))

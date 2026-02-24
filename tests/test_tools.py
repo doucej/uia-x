@@ -309,3 +309,60 @@ class TestGetText:
         text, source = b.get_text({})
         assert text == "56"
         assert source == "msaa_value"
+
+
+# ---------------------------------------------------------------------------
+# Selector shorthand / validation tests
+# ---------------------------------------------------------------------------
+
+
+class TestSelectorShorthand:
+    """
+    Verify that flat-dict shorthand selectors work and unknown keys are
+    rejected with a clear error instead of silently falling back to
+    name="" (which could invoke the wrong element, e.g. Minimize button).
+    """
+
+    def test_shorthand_automation_id(self, bridge: MockUIABridge):
+        """{"automation_id": "btn_save"} works without "by"/"value" keys."""
+        result = bridge.inspect({"automation_id": "btn_save"})
+        assert result["name"] == "Save"
+
+    def test_shorthand_name(self, bridge: MockUIABridge):
+        """{"name": "Save"} works as shorthand."""
+        result = bridge.inspect({"name": "Save"})
+        assert result["automation_id"] == "btn_save"
+
+    def test_shorthand_control_type(self, bridge: MockUIABridge):
+        """{"control_type": "Button"} returns first matching button."""
+        result = bridge.inspect({"control_type": "Button"})
+        assert result["control_type"] == "Button"
+
+    def test_shorthand_invoke(self, bridge: MockUIABridge):
+        """invoke() also accepts shorthand selectors."""
+        bridge.invoke({"automation_id": "btn_save"})
+
+    def test_shorthand_get_text(self, bridge: MockUIABridge):
+        """get_text() also accepts shorthand selectors."""
+        text, source = bridge.get_text({"automation_id": "btn_save"})
+        assert text == "Save"
+
+    def test_unknown_key_raises(self, bridge: MockUIABridge):
+        """A completely unknown key must raise INVALID_SELECTOR, not silently
+        degrade to a name="" search that could hit the wrong element."""
+        with pytest.raises(UIAError) as exc_info:
+            bridge.invoke({"typo_automation_id": "btn_save"})
+        assert exc_info.value.code == "INVALID_SELECTOR"
+        assert "typo_automation_id" in str(exc_info.value)
+
+    def test_ambiguous_shorthand_raises(self, bridge: MockUIABridge):
+        """Providing two selector keys without 'by' is ambiguous and must error."""
+        with pytest.raises(UIAError) as exc_info:
+            bridge.inspect({"automation_id": "btn_save", "name": "Save"})
+        assert exc_info.value.code == "INVALID_SELECTOR"
+        assert "Ambiguous" in str(exc_info.value)
+
+    def test_canonical_form_still_works(self, bridge: MockUIABridge):
+        """The existing {"by": ..., "value": ...} form is unchanged."""
+        result = bridge.inspect({"by": "automation_id", "value": "btn_save"})
+        assert result["name"] == "Save"
