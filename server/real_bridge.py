@@ -541,3 +541,57 @@ class RealUIABridge(UIABridge):
             mouse.double_click(button=button, coords=coords)
         else:
             mouse.click(button=button, coords=coords)
+
+    def get_text(self, target: dict[str, Any]) -> tuple[str, str]:
+        """
+        Return the human-readable text of an element and the source field.
+
+        Priority
+        --------
+        1. UIA ``ValuePattern`` (``iface_value.CurrentValue`` /
+           ``get_value()``) — the programmatic value for editable and
+           display elements.  Empty string is treated as *absent*.
+        2. UIA ``window_text()`` — the accessible name (e.g. UWP Calculator
+           exposes ``"Display is 56"`` here when ValuePattern is absent).
+        3. MSAA ``Value`` from ``legacy_properties()``.
+        4. MSAA ``Name`` from ``legacy_properties()``.
+        """
+        root = _attach_target()
+        element = _find_element(root, target)
+
+        # 1. UIA Value pattern
+        uia_value: str | None = None
+        try:
+            uia_value = element.iface_value.CurrentValue
+        except Exception:
+            pass
+        if uia_value is None:
+            try:
+                uia_value = element.get_value()
+            except Exception:
+                pass
+        if uia_value is not None and str(uia_value).strip():
+            return str(uia_value), "value"
+
+        # 2. Accessible name (window_text)
+        name = ""
+        try:
+            name = element.window_text()
+        except Exception:
+            pass
+        if name.strip():
+            return name, "name"
+
+        # 3. MSAA legacy value / name
+        try:
+            raw = element.legacy_properties() or {}
+            msaa_val = (raw.get("Value") or "").strip()
+            if msaa_val:
+                return msaa_val, "msaa_value"
+            msaa_name = (raw.get("Name") or "").strip()
+            if msaa_name:
+                return msaa_name, "msaa_name"
+        except Exception:
+            pass
+
+        return "", "none"

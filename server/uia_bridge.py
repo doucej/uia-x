@@ -139,6 +139,37 @@ class UIABridge(ABC):
             ``"left"`` (default), ``"right"``, or ``"middle"``.
         """
 
+    @abstractmethod
+    def get_text(self, target: dict[str, Any]) -> tuple[str, str]:
+        """
+        Return the human-readable text of an element and the field it came from.
+
+        Tries text sources in priority order and returns on the first non-empty
+        result.  The priority is platform-specific but generally:
+
+        1. UIA / AXAPI / AT-SPI *value* (e.g. ValuePattern, AXValue, Value
+           interface) — the programmatic value of editable or display elements.
+        2. Accessible *name* (``window_text()`` / ``acc.name`` / AXTitle) —
+           the human-readable label attached to every element.
+        3. Platform-specific text content (AT-SPI Text interface, MSAA
+           ``acc_value``) as a last resort.
+
+        Returns
+        -------
+        tuple[str, str]
+            ``(text, source)`` where *source* is one of ``"value"``,
+            ``"name"``, ``"text"``, ``"description"``, ``"msaa_value"``,
+            ``"msaa_name"``, or ``"none"`` when no readable text was found.
+
+        Notes
+        -----
+        This intentionally returns the raw string without stripping
+        application-defined prefixes (e.g. Windows Calculator exposes its
+        result as ``"Display is 56"`` via the accessible name).  Callers
+        that need only the numeric portion should parse the returned *text*
+        themselves, guided by a skill guide for the target application.
+        """
+
 
 # ---------------------------------------------------------------------------
 # Factory

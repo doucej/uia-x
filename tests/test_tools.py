@@ -226,3 +226,86 @@ class TestErrorCodes:
             bridge.inspect({"by": "magic", "value": "x"})
         except UIAError as exc:
             assert exc.code == "INVALID_SELECTOR"
+
+
+# ---------------------------------------------------------------------------
+# uia_get_text tests
+# ---------------------------------------------------------------------------
+
+
+class TestGetText:
+    """Tests for MockUIABridge.get_text – covers the value/name fallback logic."""
+
+    def test_get_text_returns_value_when_set(self, bridge_quicken: MockUIABridge):
+        """Elements with a non-empty UIA value return it with source='value'."""
+        text, source = bridge_quicken.get_text(
+            {"by": "automation_id", "value": "txn_date"}
+        )
+        assert text == "02/21/2026"
+        assert source == "value"
+
+    def test_get_text_returns_value_over_name(self, bridge_quicken: MockUIABridge):
+        """UIA value takes precedence over accessible name."""
+        text, source = bridge_quicken.get_text(
+            {"by": "automation_id", "value": "txn_amount"}
+        )
+        assert text == "0.00"
+        assert source == "value"
+
+    def test_get_text_falls_back_to_name_when_value_empty(
+        self, bridge: MockUIABridge
+    ):
+        """When value is empty the accessible name is returned (simulates
+        Windows Calculator CalculatorResults)."""
+        text, source = bridge.get_text({"by": "name", "value": "Save"})
+        assert text == "Save"
+        assert source == "name"
+
+    def test_get_text_status_bar(self, bridge: MockUIABridge):
+        """Status bar has no value – name is returned."""
+        text, source = bridge.get_text({"by": "control_type", "value": "StatusBar"})
+        assert text == "Ready"
+        assert source == "name"
+
+    def test_get_text_root_returns_window_name(self, bridge: MockUIABridge):
+        """Empty selector targets root window – its name is returned."""
+        text, source = bridge.get_text({})
+        assert text == "Untitled - Notepad"
+        assert source == "name"
+
+    def test_get_text_source_field_present(self, bridge: MockUIABridge):
+        """Return value must always be a (str, str) 2-tuple."""
+        result = bridge.get_text({})
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        assert isinstance(result[0], str)
+        assert isinstance(result[1], str)
+
+    def test_get_text_element_not_found(self, bridge: MockUIABridge):
+        """Missing element raises ElementNotFoundError."""
+        with pytest.raises(UIAError) as exc_info:
+            bridge.get_text({"by": "name", "value": "NoSuchElement"})
+        assert exc_info.value.code == "ELEMENT_NOT_FOUND"
+
+    def test_get_text_by_automation_id(self, bridge: MockUIABridge):
+        """Selector by automation_id works for get_text."""
+        text, source = bridge.get_text({"by": "automation_id", "value": "btn_save"})
+        assert text == "Save"
+        assert source == "name"
+
+    def test_get_text_prefers_msaa_value_over_name(self):
+        """When UIA value is absent but MSAA legacy_value is set, prefer it."""
+        from mock_uia.tree import MockTree, MockElement, _el  # noqa: PLC0415
+
+        result_el = MockElement(
+            name="Display is 56",
+            control_type="Static",
+            automation_id="CalculatorResults",
+            value="",           # UIA value absent – simulates Windows Calculator
+            legacy_value="56",  # MSAA value present
+        )
+        tree = MockTree(root=result_el)
+        b = MockUIABridge(tree=tree)
+        text, source = b.get_text({})
+        assert text == "56"
+        assert source == "msaa_value"

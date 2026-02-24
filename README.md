@@ -644,7 +644,7 @@ Virtualization framework, or via UTM/Parallels) and run UIA-X inside the VM.
 
 ## Exposed tools
 
-Ten tools are registered.  All return `{"ok": true, ...}` on success or
+Eleven tools are registered.  All return `{"ok": true, ...}` on success or
 `{"ok": false, "error": "...", "code": "..."}` on failure.
 
 ### `process_list`
@@ -750,6 +750,41 @@ Lower-level mouse click (no UIA target context).
 | `y` | integer | Yes | — | Screen Y |
 | `double` | boolean | No | `false` | Double-click |
 | `button` | string | No | `"left"` | Mouse button |
+
+### `uia_get_text`
+
+Return the human-readable text of a single element without dumping the full
+tree.  Prefers the UIA/AXAPI/AT-SPI *value* property; falls back to the
+accessible *name*, then platform-specific text content.  Returns both the text
+and a `source` field so callers know which property it came from.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `api_key` | string | Yes* | API key |
+| `target` | object | No | Element selector (default: root window) |
+
+**Response fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `text` | string | The retrieved text (may be empty if element has no readable text) |
+| `source` | string | Source property: `"value"`, `"name"`, `"text"`, `"description"`, `"msaa_value"`, `"msaa_name"`, or `"none"` |
+
+**Windows Calculator example** — the result display exposes its value through
+the accessible *name* (not through ValuePattern, which is absent on this
+element):
+
+```json
+// call
+{ "tool": "uia_get_text",
+  "input": { "target": { "by": "automation_id", "value": "CalculatorResults" } } }
+
+// response
+{ "ok": true, "text": "Display is 56", "source": "name" }
+```
+
+The `"Display is "` prefix is part of the UWP Calculator’s accessible name.
+Skill guides should document this pattern so the model knows to strip it.
 
 > *Required unless `UIA_X_AUTH=none`.
 

@@ -533,6 +533,64 @@ def mouse_click_tool(
         return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
 
 
+# ===================================================================
+# Tool: uia_get_text
+# ===================================================================
+
+
+@mcp.tool(
+    name="uia_get_text",
+    description=(
+        "Return the human-readable text of a single UI element without "
+        "dumping the full tree.  "
+        "Tries, in order: the UIA/AXAPI/AT-SPI value (ValuePattern / "
+        "AXValue / Value interface), then the accessible name, then "
+        "platform-specific text content.  "
+        "Returns the first non-empty result together with a 'source' field "
+        "that identifies which property it came from.  "
+        "Useful for reading display labels such as a calculator result, "
+        "status bar text, or the current value of any control."
+    ),
+)
+def uia_get_text(
+    target: dict[str, Any],
+    api_key: str = "",
+) -> dict[str, Any]:
+    """
+    Get the text of a UI element.
+
+    Parameters
+    ----------
+    target : dict
+        Selector describing which element to read.  Accepts all standard
+        ``by`` strategies (``name``, ``automation_id``, ``control_type``,
+        ``class_name``, ``path``, ``hwnd``, ``legacy_name``, ``legacy_role``,
+        ``child_id``).  Pass ``{}`` to read the root window.
+
+    Returns
+    -------
+    dict
+        ``{"ok": true, "text": "...", "source": "value"|"name"|"text"|
+        "description"|"msaa_value"|"msaa_name"|"none"}``
+
+        ``source`` tells the caller *which* accessibility property the text
+        came from, which is helpful when parsing app-specific prefixes (e.g.
+        Windows Calculator returns ``"Display is 56"`` from ``source="name"``
+        rather than a bare ``"56"``).
+    """
+    auth_err = _check_auth(api_key)
+    if auth_err:
+        return auth_err
+    try:
+        bridge = _get_bridge()
+        text, source = bridge.get_text(target)
+        return {"ok": True, "text": text, "source": source}
+    except UIAError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------

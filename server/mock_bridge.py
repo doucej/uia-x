@@ -127,3 +127,16 @@ class MockUIABridge(UIABridge):
         self.mouse_log.append(
             {"x": x, "y": y, "double": double, "button": button}
         )
+
+    def get_text(self, target: dict[str, Any]) -> tuple[str, str]:
+        """
+        Return the human-readable text of a mock element.
+
+        Priority: UIA ``value`` → MSAA ``legacy_value`` → accessible ``name``.
+        """
+        element = self._find(target)
+        if element.value:
+            return element.value, "value"
+        if element.legacy_value:
+            return element.legacy_value, "msaa_value"
+        return element.name, "name"

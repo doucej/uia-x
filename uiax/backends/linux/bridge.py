@@ -360,3 +360,33 @@ class LinuxBridge(UIABridge):
         button: str = "left",
     ) -> None:
         mouse_click_atspi(x, y, double=double, button=button)
+
+    def get_text(self, target: dict[str, Any]) -> tuple[str, str]:
+        """
+        Return the human-readable text of an AT-SPI accessible element.
+
+        Priority
+        --------
+        1. AT-SPI ``Text`` interface (full text content of editable/display
+           elements — this is what GNOME Calculator exposes for its result).
+        2. AT-SPI ``Value`` interface (numeric or range value).
+        3. Accessible ``name`` (human-readable label).
+        """
+        acc = self._find(target)
+
+        # 1. Text interface
+        text = get_text_content(acc)
+        if text is not None and text.strip():
+            return text, "text"
+
+        # 2. Value interface
+        val = get_value(acc)
+        if val is not None and val.strip():
+            return val, "value"
+
+        # 3. Accessible name
+        name = acc.name or ""
+        if name.strip():
+            return name, "name"
+
+        return "", "none"

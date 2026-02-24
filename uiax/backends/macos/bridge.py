@@ -341,3 +341,33 @@ class MacOSBridge(UIABridge):
         button: str = "left",
     ) -> None:
         mouse_click_quartz(x, y, double=double, button=button)
+
+    def get_text(self, target: dict[str, Any]) -> tuple[str, str]:
+        """
+        Return the human-readable text of an AXAPI element.
+
+        Priority
+        --------
+        1. ``AXValue`` — the most specific programmatic value (editable
+           fields, display labels such as macOS Calculator's result).
+        2. ``AXTitle`` / accessible name — the human-readable label.
+        3. ``AXDescription`` — longer description text.
+        """
+        element = self._find(target)
+
+        # 1. AXValue
+        val = get_value(element)
+        if val is not None and val.strip():
+            return val, "value"
+
+        # 2. AXTitle / name
+        title = get_title(element)
+        if title and title.strip():
+            return title, "name"
+
+        # 3. AXDescription
+        desc = get_description(element)
+        if desc and desc.strip():
+            return desc, "description"
+
+        return "", "none"

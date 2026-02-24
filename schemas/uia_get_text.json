@@ -1,0 +1,30 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "uia_get_text",
+  "description": "Return the human-readable text of a single UI element without dumping the full element tree.",
+  "type": "object",
+  "properties": {
+    "target": {
+      "$ref": "target.json",
+      "description": "Element selector.  Accepts all standard 'by' strategies.  Pass {} to read the root window."
+    },
+    "api_key": {
+      "type": "string",
+      "description": "API key for authentication (omit when using Bearer header or UIA_X_AUTH=none).",
+      "default": ""
+    }
+  },
+  "required": [],
+  "additionalProperties": false,
+  "examples": [
+    {
+      "target": {"by": "automation_id", "value": "CalculatorResults"}
+    },
+    {
+      "target": {"by": "name", "value": "Ready"}
+    },
+    {
+      "target": {}
+    }
+  ]
+}
