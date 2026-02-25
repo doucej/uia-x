@@ -263,7 +263,7 @@ directly — no header needed.
 |--------|---------------|
 | `server/server.py` | FastMCP app, all tool registrations, auth gating |
 | `server/uia_bridge.py` | Abstract bridge interface, error taxonomy, platform detection |
-| `server/real_bridge.py` | Live UIA + MSAA backend via pywinauto (Windows) |
+| `server/win_bridge.py` | Live UIA + MSAA backend via pywinauto (Windows) |
 | `server/mock_bridge.py` | Mock backend for tests (any platform) |
 | `server/process_manager.py` | Enumerate processes/windows, attach/detach |
 | `server/auth.py` | API key generation, validation, pluggable auth |
@@ -284,7 +284,7 @@ uia-x/
 ├── server/
 │   ├── server.py             ← FastMCP app, tool registrations
 │   ├── uia_bridge.py         ← Abstract bridge + error types + platform detection
-│   ├── real_bridge.py         ← Live UIA + MSAA backend (pywinauto, Windows)
+│   ├── win_bridge.py          ← Live UIA + MSAA backend (pywinauto, Windows)
 │   ├── mock_bridge.py         ← Mock backend for tests
 │   ├── process_manager.py     ← Process/window enumeration & attachment
 │   └── auth.py                ← API key authentication layer

@@ -8,7 +8,7 @@ All three platform backends are live:
 
 | Platform | Backend | Accessibility API |
 |----------|---------|-------------------|
-| Windows  | `server/real_bridge.py` | UIA + MSAA via pywinauto |
+| Windows  | `server/win_bridge.py` | UIA + MSAA via pywinauto |
 | Linux    | `uiax/backends/linux/` | AT‑SPI2 via pyatspi |
 | macOS    | `uiax/backends/macos/` | AXAPI via PyObjC |
 | (any)    | `server/mock_bridge.py` | Mock backend for CI and local dev |
@@ -26,7 +26,7 @@ uia-x/
 │   ├── server.py              ← FastMCP app, tool registrations, auth gating
 │   ├── uia_bridge.py          ← Abstract UIABridge interface, error taxonomy,
 │   │                            platform detection & factory
-│   ├── real_bridge.py         ← Windows UIA + MSAA backend (pywinauto)
+│   ├── win_bridge.py          ← Windows UIA + MSAA backend (pywinauto)
 │   ├── mock_bridge.py         ← Mock backend for tests
 │   ├── process_manager.py     ← ProcessManager ABC + per-platform impls
 │   └── auth.py                ← API key auth, Bearer middleware

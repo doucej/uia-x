@@ -146,6 +146,9 @@ class MockUIABridge(UIABridge):
     def send_keys(self, keys: str, target: dict[str, Any] | None = None) -> None:
         self.keys_log.append(keys)
 
+    def type_text(self, text: str, target: dict[str, Any] | None = None) -> None:
+        self.keys_log.append(text)
+
     def legacy_invoke(self, target: dict[str, Any]) -> None:
         element = self._find(target)
         if not element.legacy_invokable:

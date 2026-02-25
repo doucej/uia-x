@@ -747,6 +747,30 @@ def _type_char_quartz(source: Any, ch: str, flags: int = 0) -> None:
         time.sleep(0.01)
 
 
+def type_text_quartz(text: str) -> None:
+    """
+    Type plain text literally via Quartz CGEvent, character by character.
+
+    Unlike :func:`send_keys_quartz`, no special encoding is needed — spaces,
+    punctuation, and symbols are all typed as-is.  ``\\n`` is sent as Return
+    (keycode 36).
+    """
+    require_axapi()
+    _init_modifier_flags()
+    import Quartz as Q  # type: ignore[import-untyped]
+
+    _RETURN_KEYCODE = 36
+
+    source = Q.CGEventSourceCreate(Q.kCGEventSourceStateHIDSystemState)
+    for ch in text:
+        if ch == "\n":
+            _send_keycode(source, _RETURN_KEYCODE, 0)
+        elif ch == "\t":
+            _send_keycode(source, 48, 0)  # Tab keycode
+        else:
+            _type_char_quartz(source, ch, 0)
+
+
 # ---------------------------------------------------------------------------
 # Mouse helpers via Quartz CGEvent
 # ---------------------------------------------------------------------------

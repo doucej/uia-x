@@ -1,5 +1,5 @@
 """
-Real Windows UI Automation bridge via pywinauto.
+Windows UI Automation bridge via pywinauto.
 
 V2: generalised – attaches to whatever window is selected by the process
 manager rather than hard-coding Quicken.  Falls back gracefully with
@@ -79,6 +79,28 @@ _SELECTOR_STRATEGIES = {
 
 # Keys that carry plumbing metadata, not selector values.
 _META_KEYS = {"by", "value", "index", "depth"}
+
+# ---------------------------------------------------------------------------
+# SendKeys helpers
+# ---------------------------------------------------------------------------
+
+# Characters that have special meaning in pywinauto SendKeys notation and must
+# be escaped with braces when the caller wants them typed literally.
+_SENDKEYS_ESCAPE = str.maketrans({
+    "~": "{~}",   # Enter
+    "^": "{^}",   # Ctrl modifier
+    "+": "{+}",   # Shift modifier
+    "%": "{%}",   # Alt modifier
+    "(": "{(}",
+    ")": "{)}",
+    "{": "{{}",
+    "}": "{}}",
+})
+
+
+def _escape_text_for_send_keys(text: str) -> str:
+    """Escape all pywinauto SendKeys special characters so *text* is typed literally."""
+    return text.translate(_SENDKEYS_ESCAPE)
 
 
 def _require_pywinauto() -> None:
@@ -419,12 +441,12 @@ def _find_element(root, target: dict[str, Any]):
 
 
 # ---------------------------------------------------------------------------
-# RealUIABridge
+# WinUIABridge
 # ---------------------------------------------------------------------------
 
 
-class RealUIABridge(UIABridge):
-    """Live Windows UIA bridge using pywinauto (UIA + MSAA)."""
+class WinUIABridge(UIABridge):
+    """Live Windows UIA bridge using pywinauto (UIA + MSAA).⁠"""
 
     def inspect(self, target: dict[str, Any]) -> dict[str, Any]:
         root = _attach_target()
@@ -488,7 +510,28 @@ class RealUIABridge(UIABridge):
                 root.set_focus()
             except Exception:
                 pass
-        keyboard.send_keys(keys, pause=0.05)
+        keyboard.send_keys(keys, pause=0.05, with_spaces=True, with_newlines=True, with_tabs=True)
+
+    def type_text(self, text: str, target: dict[str, Any] | None = None) -> None:
+        """Type *text* literally, auto-escaping all SendKeys special characters."""
+        _require_pywinauto()
+        from pywinauto import keyboard  # noqa: PLC0415
+
+        if target:
+            root = _attach_target()
+            element = _find_element(root, target)
+            try:
+                element.set_focus()
+            except Exception:
+                pass
+        else:
+            root = _attach_target()
+            try:
+                root.set_focus()
+            except Exception:
+                pass
+        escaped = _escape_text_for_send_keys(text)
+        keyboard.send_keys(escaped, pause=0.05, with_spaces=True, with_newlines=True, with_tabs=True)
 
     def legacy_invoke(self, target: dict[str, Any]) -> None:
         """Invoke via MSAA DoDefaultAction / Win32 WM_LBUTTONDBLCLK."""

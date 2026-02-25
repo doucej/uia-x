@@ -94,7 +94,7 @@ class UIABridge(ABC):
     @abstractmethod
     def send_keys(self, keys: str, target: dict[str, Any] | None = None) -> None:
         """
-        Send keystrokes to the attached window.
+        Send keystrokes to the attached window using SendKeys notation.
 
         Parameters
         ----------
@@ -104,6 +104,22 @@ class UIABridge(ABC):
             Optional element selector.  When provided the element is focused
             before keys are sent.  Pass ``None`` to send to the currently
             focused control.
+        """
+
+    @abstractmethod
+    def type_text(self, text: str, target: dict[str, Any] | None = None) -> None:
+        """
+        Type plain text into the attached window, auto-escaping special chars.
+
+        Unlike ``send_keys``, all characters in *text* are sent literally —
+        spaces, punctuation, and symbols require no special encoding.
+
+        Parameters
+        ----------
+        text : str
+            The plain text to type.
+        target : dict or None
+            Optional element selector to focus before typing.
         """
 
     @abstractmethod
@@ -204,9 +220,9 @@ def get_bridge(backend: str = "real") -> UIABridge:
         return MacOSBridge()
 
     # Default: Windows UIA backend
-    from server.real_bridge import RealUIABridge  # noqa: PLC0415
+    from server.win_bridge import WinUIABridge  # noqa: PLC0415
 
-    return RealUIABridge()
+    return WinUIABridge()
 
 
 def _is_linux() -> bool:
