@@ -17,6 +17,7 @@ from server.auth import (
     BearerAuthMiddleware,
     NoAuthProvider,
     _bearer_authenticated,
+    delete_key_file,
     generate_api_key,
     get_auth_provider,
     load_key_hash,
@@ -148,6 +149,69 @@ class TestKeyGeneration:
                 key = generate_api_key()
                 assert isinstance(key, str)
                 assert len(key) > 20
+
+
+# ---------------------------------------------------------------------------
+# Key file deletion (delete_key_file)
+# ---------------------------------------------------------------------------
+
+
+class TestDeleteKeyFile:
+    def test_deletes_existing_file(self):
+        tmp_dir = Path(tempfile.mkdtemp())
+        tmp_key = tmp_dir / "api_key"
+        tmp_key.write_text("somehash", encoding="utf-8")
+        with patch("server.auth._KEY_FILE", tmp_key):
+            result = delete_key_file()
+        assert result is True
+        assert not tmp_key.exists()
+
+    def test_returns_false_when_no_file(self):
+        tmp_dir = Path(tempfile.mkdtemp())
+        tmp_key = tmp_dir / "api_key"  # does not exist
+        with patch("server.auth._KEY_FILE", tmp_key):
+            result = delete_key_file()
+        assert result is False
+
+    def test_reset_key_triggers_new_generation(self):
+        """Deleting the key file causes get_auth_provider to generate a new key."""
+        tmp_dir = Path(tempfile.mkdtemp())
+        tmp_key = tmp_dir / "api_key"
+        # Write an existing key hash
+        old_hash = hashlib.sha256(b"old-key").hexdigest()
+        tmp_key.write_text(old_hash, encoding="utf-8")
+        with patch("server.auth._KEY_FILE", tmp_key):
+            delete_key_file()
+            assert not tmp_key.exists()
+            # Now get_auth_provider should generate a new key
+            p = get_auth_provider()
+        assert isinstance(p, ApiKeyProvider)
+        # The new hash on disk must differ from the old one
+        new_hash = tmp_key.read_text(encoding="utf-8").strip()
+        assert new_hash != old_hash
+
+
+# ---------------------------------------------------------------------------
+# Env-var precedence over disk key
+# ---------------------------------------------------------------------------
+
+
+class TestEnvVarPrecedence:
+    def test_env_var_overrides_disk_key(self):
+        """UIAX_API_KEY must win even when a disk key hash is present."""
+        tmp_dir = Path(tempfile.mkdtemp())
+        tmp_key = tmp_dir / "api_key"
+        disk_hash = hashlib.sha256(b"disk-key").hexdigest()
+        tmp_key.write_text(disk_hash, encoding="utf-8")
+        env_key = "env-override-key"
+        with patch("server.auth._KEY_FILE", tmp_key):
+            with patch.dict(os.environ, {"UIAX_API_KEY": env_key}, clear=False):
+                p = get_auth_provider()
+        assert isinstance(p, ApiKeyProvider)
+        # Env var key must authenticate successfully
+        assert p.validate({"api_key": env_key}) is True
+        # Disk key must NOT authenticate
+        assert p.validate({"api_key": "disk-key"}) is False
 
 
 # ---------------------------------------------------------------------------

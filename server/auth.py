@@ -37,8 +37,9 @@ from server.uia_bridge import AuthenticationError
 
 _CONFIG_DIR = Path.home() / ".uia_x"
 _KEY_FILE = _CONFIG_DIR / "api_key"
-_ENV_AUTH_MODE = "UIA_X_AUTH"        # "apikey" (default) | "none"
-_ENV_API_KEY = "UIA_X_API_KEY"       # override key from env
+_ENV_AUTH_MODE = "UIA_X_AUTH"         # "apikey" (default) | "none"
+_ENV_API_KEY = "UIAX_API_KEY"         # primary override key from env
+_ENV_API_KEY_LEGACY = "UIA_X_API_KEY" # backward-compat alias
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +135,19 @@ def load_key_hash() -> Optional[str]:
     return None
 
 
+def delete_key_file() -> bool:
+    """
+    Delete the stored key hash file.
+
+    Returns True if the file was deleted, False if it did not exist.
+    Used by the ``--reset-key`` startup flag to force new-key generation.
+    """
+    if _KEY_FILE.is_file():
+        _KEY_FILE.unlink()
+        return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Provider factory
 # ---------------------------------------------------------------------------
@@ -144,34 +158,57 @@ def get_auth_provider() -> AuthProvider:
     Build the appropriate AuthProvider based on environment / config.
 
     Priority:
-    1. ``UIA_X_AUTH=none`` → NoAuthProvider
-    2. ``UIA_X_API_KEY`` env var → ApiKeyProvider using that key
-    3. Key hash on disk → ApiKeyProvider
-    4. No key yet → generate one, print to stderr, return ApiKeyProvider
+    1. ``UIA_X_AUTH=none``  → NoAuthProvider
+    2. ``UIAX_API_KEY`` env var (or legacy ``UIA_X_API_KEY``) → ApiKeyProvider
+    3. Key hash on disk    → ApiKeyProvider  (key shown on first-run only)
+    4. No key yet          → generate one, print to **stdout**, persist hash
     """
     mode = os.environ.get(_ENV_AUTH_MODE, "apikey").lower()
     if mode == "none":
         return NoAuthProvider()
 
-    # Check env-var override
-    env_key = os.environ.get(_ENV_API_KEY, "").strip()
+    # Check env-var override (UIAX_API_KEY takes precedence; UIA_X_API_KEY is
+    # a backward-compatible alias kept for existing deployments).
+    env_key = (
+        os.environ.get(_ENV_API_KEY, "").strip()
+        or os.environ.get(_ENV_API_KEY_LEGACY, "").strip()
+    )
     if env_key:
+        env_var_used = _ENV_API_KEY if os.environ.get(_ENV_API_KEY) else _ENV_API_KEY_LEGACY
         key_hash = hashlib.sha256(env_key.encode()).hexdigest()
+        disk_note = (
+            f" (overrides key stored at {_KEY_FILE})"
+            if _KEY_FILE.is_file()
+            else ""
+        )
+        print(
+            f"[uia-x] API key sourced from environment variable {env_var_used}{disk_note}.\n"
+            f"[uia-x] Key: {env_key}",
+            file=sys.stdout,
+        )
         return ApiKeyProvider(key_hash)
 
-    # Check on-disk key
+    # Check on-disk key (only the hash is stored — the raw key cannot be
+    # recovered after first generation).
     stored_hash = load_key_hash()
     if stored_hash:
+        print(
+            f"[uia-x] API key loaded from disk ({_KEY_FILE}).\n"
+            f"[uia-x] The hash is stored; use your saved key to authenticate.\n"
+            f"[uia-x] To display the key again set {_ENV_API_KEY}=<your-key> "
+            f"or delete {_KEY_FILE} to generate a new one.",
+            file=sys.stdout,
+        )
         return ApiKeyProvider(stored_hash)
 
-    # First-run: generate
+    # First-run: generate a new key, persist the hash, display the plaintext.
     raw_key = generate_api_key()
     print(
         f"[uia-x] *** NEW API KEY GENERATED ***\n"
         f"[uia-x] Key: {raw_key}\n"
         f"[uia-x] Stored hash in: {_KEY_FILE}\n"
         f"[uia-x] Save this key – it will not be shown again.",
-        file=sys.stderr,
+        file=sys.stdout,
     )
     return ApiKeyProvider(hashlib.sha256(raw_key.encode()).hexdigest())
 
@@ -188,6 +225,17 @@ def _get_provider() -> AuthProvider:
     if _provider is None:
         _provider = get_auth_provider()
     return _provider
+
+
+def init_auth() -> None:
+    """
+    Eagerly initialise (and print) the auth provider at server startup.
+
+    Call this once from ``main()`` before the server begins accepting
+    connections so that the API key is printed to stdout before any
+    log noise from the HTTP server fills the terminal.
+    """
+    _get_provider()
 
 
 def reset_auth() -> None:
