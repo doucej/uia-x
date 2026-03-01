@@ -414,6 +414,35 @@ def _type_char(ch: str) -> None:
     pyatspi.Registry.generateKeyboardEvent(0, ch, pyatspi.KEY_STRING)
 
 
+def focus_window(title: str) -> bool:
+    """
+    Bring a window with the given title into keyboard focus.
+
+    Tries ``wmctrl -a <title>`` first (reliable under most Xorg/XWayland
+    compositors).  Falls back to ``xdotool search --name <title>
+    windowfocus`` if wmctrl is unavailable.  Returns True if either
+    command succeeded, False if neither tool is installed or the window
+    was not found.
+    """
+    import time  # noqa: PLC0415
+    display = os.environ.get("DISPLAY", ":0")
+    env = {**os.environ, "DISPLAY": display}
+    for cmd in (
+        ["wmctrl", "-a", title],
+        ["xdotool", "search", "--name", title, "windowfocus", "--sync"],
+    ):
+        try:
+            result = subprocess.run(
+                cmd, env=env, capture_output=True, timeout=3
+            )
+            if result.returncode == 0:
+                time.sleep(0.15)  # give the WM time to complete the focus
+                return True
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+    return False
+
+
 def send_keys_xdotool(keys: str) -> None:
     """
     Fallback keystroke injection via xdotool.
@@ -462,7 +491,17 @@ def type_text_xdotool(text: str) -> None:
 
 
 def _parse_keys_to_xdotool(keys: str) -> list[str]:
-    """Convert SendKeys notation into xdotool argument tokens."""
+    """Convert SendKeys notation into xdotool argument tokens.
+
+    xdotool supports chained subcommands in a single invocation, e.g.::
+
+        xdotool key Escape type --clearmodifiers "6*7" key Return
+
+    The key rule: consecutive plain (unmodified) characters must be batched
+    into a *single* ``type --clearmodifiers <text>`` subcommand.  Emitting
+    one ``type`` per character causes xdotool to treat subsequent ``type``
+    tokens as text arguments of the first ``type`` subcommand.
+    """
     _XDOTOOL_MAP: dict[str, str] = {
         "ENTER": "Return", "RETURN": "Return", "TAB": "Tab",
         "ESC": "Escape", "ESCAPE": "Escape", "BACKSPACE": "BackSpace",
@@ -482,11 +521,19 @@ def _parse_keys_to_xdotool(keys: str) -> list[str]:
     i = 0
     length = len(keys)
     modifiers: list[str] = []
+    # Buffer for consecutive plain characters – flushed as one "type" call
+    plain_buf: list[str] = []
+
+    def _flush_plain() -> None:
+        if plain_buf:
+            result.extend(["type", "--clearmodifiers", "".join(plain_buf)])
+            plain_buf.clear()
 
     while i < length:
         ch = keys[i]
 
         if ch in _MOD_XDOTOOL:
+            _flush_plain()
             modifiers.append(_MOD_XDOTOOL[ch])
             i += 1
             continue
@@ -494,8 +541,10 @@ def _parse_keys_to_xdotool(keys: str) -> list[str]:
         if ch == "{":
             end = keys.find("}", i + 1)
             if end == -1:
+                plain_buf.append(ch)
                 i += 1
                 continue
+            _flush_plain()
             key_name = keys[i + 1 : end].upper()
             xkey = _XDOTOOL_MAP.get(key_name, key_name)
             combo = "+".join(modifiers + [xkey])
@@ -506,13 +555,15 @@ def _parse_keys_to_xdotool(keys: str) -> list[str]:
 
         # Literal character
         if modifiers:
+            _flush_plain()
             combo = "+".join(modifiers + [ch])
             result.extend(["key", combo])
             modifiers.clear()
         else:
-            result.extend(["type", "--clearmodifiers", ch])
+            plain_buf.append(ch)
         i += 1
 
+    _flush_plain()
     return result
 
 

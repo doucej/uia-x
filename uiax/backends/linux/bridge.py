@@ -31,8 +31,10 @@ from uiax.backends.linux.util import (
     atspi_available,
     do_action,
     do_action_by_name,
+    focus_window,
     get_actions,
     get_text_content,
+    get_value,
     mouse_click_atspi,
     require_atspi,
     role_name,
@@ -312,50 +314,59 @@ class LinuxBridge(UIABridge):
             acc.name or role_name(acc),
         )
 
-    def send_keys(self, keys: str, target: dict[str, Any] | None = None) -> None:
-        if target:
-            acc = self._find(target)
-            # Try to focus the element first
-            try:
-                comp = acc.queryComponent()
-                comp.grabFocus()
-            except Exception:
-                pass
-        else:
-            # Focus the attached window
-            root = self._get_root()
-            try:
-                comp = root.queryComponent()
-                comp.grabFocus()
-            except Exception:
-                pass
+    def _focus_target(self, acc: Any | None) -> bool:
+        """
+        Best-effort: focus *acc* so that subsequent keystroke calls land on
+        the right window.
 
-        # Send keys – try AT-SPI first, fall back to xdotool
+        Returns True if AT-SPI ``grabFocus()`` succeeded (indicating an
+        AT-SPI-native app where ``generateKeyboardEvent`` will also work),
+        or False if we had to fall back to ``wmctrl``/xdotool (e.g. GTK4 /
+        XWayland apps where AT-SPI key injection is unreliable).
+        """
+        if acc is None:
+            return False
         try:
-            send_keys_atspi(keys)
+            acc.queryComponent().grabFocus()
+            return True
         except Exception:
-            send_keys_xdotool(keys)
+            pass
+        # grabFocus failed – raise the window via wmctrl/xdotool but always
+        # return False: the caller should use xdotool for key injection too,
+        # since AT-SPI generateKeyboardEvent is unreliable on GTK4/XWayland.
+        try:
+            title = acc.name or ""
+        except Exception:
+            title = ""
+        if title:
+            focus_window(title)
+        return False
+
+    def send_keys(self, keys: str, target: dict[str, Any] | None = None) -> None:
+        acc = self._find(target) if target else self._get_root()
+        atspi_focus = self._focus_target(acc)
+
+        if atspi_focus:
+            # AT-SPI grabFocus worked → use AT-SPI injection
+            try:
+                send_keys_atspi(keys)
+                return
+            except Exception:
+                pass
+        # Fall back to xdotool (handles GTK4/XWayland and any AT-SPI failure)
+        send_keys_xdotool(keys)
 
     def type_text(self, text: str, target: dict[str, Any] | None = None) -> None:
-        if target:
-            acc = self._find(target)
-            try:
-                comp = acc.queryComponent()
-                comp.grabFocus()
-            except Exception:
-                pass
-        else:
-            root = self._get_root()
-            try:
-                comp = root.queryComponent()
-                comp.grabFocus()
-            except Exception:
-                pass
+        acc = self._find(target) if target else self._get_root()
+        atspi_focus = self._focus_target(acc)
 
-        try:
-            type_text_atspi(text)
-        except Exception:
-            type_text_xdotool(text)
+        if atspi_focus:
+            try:
+                type_text_atspi(text)
+                return
+            except Exception:
+                pass
+        type_text_xdotool(text)
 
     def legacy_invoke(self, target: dict[str, Any]) -> None:
         """
