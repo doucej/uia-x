@@ -462,8 +462,8 @@ class TestAtspiBackend:
 class TestKeyTranslation:
     def test_plain_text(self):
         tokens = _parse_keys_to_xdotool("hello")
-        # Each character becomes: type --clearmodifiers <char>
-        assert tokens.count("type") == 5
+        # All plain chars are batched into a single: type --clearmodifiers hello
+        assert tokens == ["type", "--clearmodifiers", "hello"]
 
     def test_special_key(self):
         tokens = _parse_keys_to_xdotool("{ENTER}")
@@ -487,9 +487,8 @@ class TestKeyTranslation:
 
     def test_mixed_input(self):
         tokens = _parse_keys_to_xdotool("abc{ENTER}")
-        # 3 chars + 1 special key
-        assert tokens.count("type") == 3
-        assert "Return" in tokens
+        # 3 chars batched into one type call + 1 special key
+        assert tokens == ["type", "--clearmodifiers", "abc", "key", "Return"]
 
 
 # ---------------------------------------------------------------------------

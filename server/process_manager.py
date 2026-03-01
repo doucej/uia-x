@@ -3,12 +3,11 @@ Process and window manager – enumerate running processes, their top-level
 windows, and attach to a specific process/window as the active automation
 target.
 
-Operates in two modes:
-  * **real** – uses ctypes/psutil/pywinauto to query the live system
-  * **mock** – returns canned data for unit tests
-
-The manager is a singleton within the server process; tools call
-``get_process_manager()`` to obtain it.
+Operates in several modes:
+  * **real**   – auto-detects platform and delegates to the appropriate backend
+  * **mock**   – returns canned data for unit tests
+  * **linux**  – force AT-SPI2 backend (Linux)
+  * **macos**  – force AXAPI backend (macOS)
 """
 
 from __future__ import annotations
@@ -311,6 +310,61 @@ class LinuxProcessManagerAdapter(ProcessManager):
 
 
 # ---------------------------------------------------------------------------
+# macOS AXAPI adapter
+# ---------------------------------------------------------------------------
+
+
+class MacOSProcessManagerAdapter(ProcessManager):
+    """
+    Adapter that wraps :class:`uiax.backends.macos.bridge.MacOSProcessManager`
+    to conform to the :class:`ProcessManager` ABC.
+
+    Translates AXAPI window dicts into :class:`WindowInfo` instances.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        from uiax.backends.macos.bridge import get_macos_process_manager  # noqa: PLC0415
+
+        self._mpm = get_macos_process_manager()
+
+    def list_windows(self, *, visible_only: bool = True) -> list[WindowInfo]:
+        raw = self._mpm.list_windows(visible_only=visible_only)
+        return [self._to_window_info(w) for w in raw]
+
+    def attach(
+        self,
+        *,
+        pid: int | None = None,
+        process_name: str | None = None,
+        window_title: str | None = None,
+        class_name: str | None = None,
+        hwnd: int | None = None,
+    ) -> WindowInfo:
+        win = self._mpm.attach(
+            pid=pid,
+            process_name=process_name,
+            window_title=window_title,
+            class_name=class_name,
+            hwnd=hwnd,
+        )
+        self._attached = self._to_window_info(win)
+        return self._attached
+
+    @staticmethod
+    def _to_window_info(w: dict) -> WindowInfo:
+        return WindowInfo(
+            hwnd=w.get("hwnd", 0),
+            title=w.get("title", ""),
+            class_name=w.get("class_name", ""),
+            pid=w.get("pid", 0),
+            process_name=w.get("process_name", ""),
+            visible=w.get("visible", True),
+            rect=w.get("rect", {"left": 0, "top": 0, "right": 0, "bottom": 0}),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Default mock fixtures
 # ---------------------------------------------------------------------------
 
@@ -362,13 +416,18 @@ def get_process_manager(backend: str | None = None) -> ProcessManager:
     global _instance
     if _instance is None:
         if backend is None:
-            backend = os.environ.get("UIA_BACKEND", "real").lower()
+            backend = (
+                os.environ.get("UIAX_BACKEND", "")
+                or os.environ.get("UIA_BACKEND", "real")
+            ).lower()
         if backend == "mock":
             _instance = MockProcessManager()
         elif backend == "linux" or (backend == "real" and _is_linux()):
             _instance = LinuxProcessManagerAdapter()
+        elif backend == "macos" or (backend == "real" and _is_macos()):
+            _instance = MacOSProcessManagerAdapter()
         else:
-            _instance = RealProcessManager()
+            _instance = RealProcessManager()  # Windows
     return _instance
 
 
@@ -377,6 +436,13 @@ def _is_linux() -> bool:
     import sys  # noqa: PLC0415
 
     return sys.platform.startswith("linux")
+
+
+def _is_macos() -> bool:
+    """Return True if the current platform is macOS."""
+    import sys  # noqa: PLC0415
+
+    return sys.platform == "darwin"
 
 
 def reset_process_manager() -> None:

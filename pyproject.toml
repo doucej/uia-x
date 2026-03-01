@@ -55,7 +55,7 @@ dev = [
 ]
 
 [project.scripts]
-uiax-server = "server.server:main"
+uiax-server = "uiax.server:main"
 
 [project.urls]
 Homepage = "https://github.com/doucej/uia-x"
