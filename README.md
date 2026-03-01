@@ -38,8 +38,8 @@ python -m uiax.server
 > `--system-site-packages` or use the system Python directly.
 
 ```bash
-# 1. Install the OS-level AT-SPI2 library
-sudo apt install python3-pyatspi gir1.2-atspi-2.0 at-spi2-core
+# 1. Install system dependencies (AT-SPI2 + venv support for system Python)
+sudo apt install python3-pyatspi gir1.2-atspi-2.0 at-spi2-core python3-venv
 
 # 2. Clone and install (system Python, so pyatspi is visible)
 git clone https://github.com/doucej/uia-x.git
