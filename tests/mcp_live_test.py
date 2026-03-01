@@ -74,7 +74,19 @@ async def main() -> None:
             print(f"  children: {[c.get('name') or c.get('role') for c in root.get('children', [])]}\n")
 
             # ----------------------------------------------------------------
-            # 5. Clear the calculator
+            # 5. Discover all buttons with uia_find_all
+            # ----------------------------------------------------------------
+            found = await call(session, "uia_find_all")
+            # call() unwraps {"element":...} but not {"elements":...}; find_all returns the latter
+            elements = found.get("elements", []) if isinstance(found, dict) else []
+            btn_names = {e["name"] for e in elements if e.get("role") in ("button", "push button")}
+            print(f"[uia_find_all] {len(elements)} elements, buttons: {sorted(btn_names)}\n")
+            assert "7" in btn_names, f"Button '7' not found. Buttons: {btn_names}"
+            assert "×" in btn_names, f"Button '×' not found."
+            assert "=" in btn_names, f"Button '=' not found."
+
+            # ----------------------------------------------------------------
+            # 6. Clear the calculator
             # ----------------------------------------------------------------
             for clear_name in ("C", "Clear", "AC"):
                 try:

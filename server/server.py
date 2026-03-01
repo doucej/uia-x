@@ -272,6 +272,71 @@ def uia_inspect(
 
 
 # ===================================================================
+# Tool: uia_find_all
+# ===================================================================
+
+
+@mcp.tool(
+    name="uia_find_all",
+    description=(
+        "Return a flat list of every named/interactive element in the target window. "
+        "Call this first to discover what buttons, inputs, and controls exist — "
+        "especially useful for deep UI frameworks (GTK4, Electron) where "
+        "uia_inspect with a fixed depth may not reach all elements. "
+        "Each entry includes name, role, and available actions so you know "
+        "exactly what to pass to uia_invoke."
+    ),
+)
+def uia_find_all(
+    roles: list[str] = [],  # noqa: B006
+    has_actions: bool = True,
+    named_only: bool = True,
+    target: dict[str, Any] = {},  # noqa: B006  # optional subtree root
+    api_key: str = "",
+) -> dict[str, Any]:
+    """
+    Discover all interactive UI elements in the current window.
+
+    Parameters
+    ----------
+    roles : list[str]
+        Restrict results to these AT-SPI/UIA roles, e.g.
+        ``["push button", "check box", "text"]``.  Empty list (default)
+        returns all matching elements regardless of role.
+    has_actions : bool
+        When True (default) only elements with at least one invokable
+        action (click, activate, …) are returned.
+    named_only : bool
+        When True (default) skip elements without a name.
+    target : dict
+        Optional selector for a subtree root — same format as uia_inspect.
+        Omit (or pass ``{}``) to search the whole window.
+
+    Returns
+    -------
+    dict
+        ``{"ok": true, "count": N, "elements": [{"name": ..., "role": ...,
+        "actions": [...], "text": ..., "value": ...}, ...]}``
+    """
+    auth_err = _check_auth(api_key)
+    if auth_err:
+        return auth_err
+    try:
+        bridge = _get_bridge()
+        items = bridge.find_all({
+            "roles": roles,
+            "has_actions": has_actions,
+            "named_only": named_only,
+            "root": target or None,
+        })
+        return {"ok": True, "count": len(items), "elements": items}
+    except UIAError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+
+# ===================================================================
 # Tool: uia_invoke
 # ===================================================================
 

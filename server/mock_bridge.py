@@ -126,6 +126,9 @@ class MockUIABridge(UIABridge):
     # UIABridge implementation
     # ------------------------------------------------------------------
 
+    def find_all(self, filter: dict[str, Any]) -> list[dict[str, Any]]:
+        return []
+
     def inspect(self, target: dict[str, Any]) -> dict[str, Any]:
         depth = int(target.get("depth", 3)) if target else 3
         element = self._find(target)
