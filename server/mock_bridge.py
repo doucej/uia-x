@@ -31,11 +31,50 @@ class MockUIABridge(UIABridge):
     # ------------------------------------------------------------------
 
     _META_KEYS = frozenset({"depth"})
+    _SELECTOR_STRATEGIES = frozenset({
+        "automation_id", "name", "control_type", "class_name", "path",
+        "legacy_name", "legacy_role", "child_id", "hwnd",
+    })
+    # All keys that have non-selector meaning; not treated as shorthand.
+    _NON_SELECTOR_KEYS = frozenset({"by", "value", "index", "depth"})
 
     def _find(self, target: dict[str, Any]) -> MockElement:
-        selector_keys = {k for k in target if k not in self._META_KEYS}
-        if not selector_keys:
+        if not target:
             return self._tree.root
+
+        # ------------------------------------------------------------------
+        # Normalise shorthand form  {"automation_id": "okBtn"}  →
+        # canonical form            {"by": "automation_id", "value": "okBtn"}
+        # and reject unknown keys so a typo never silently matches the wrong
+        # element (e.g. a name="" fallback that could invoke Minimize).
+        # ------------------------------------------------------------------
+        if "by" not in target:
+            extra = {k for k in target if k not in self._NON_SELECTOR_KEYS}
+            if not extra:
+                # Only structural keys like "depth" — treat as root selector.
+                return self._tree.root
+            unknown = extra - self._SELECTOR_STRATEGIES
+            if unknown:
+                raise UIAError(
+                    f"Unrecognised target key(s): {sorted(unknown)!r}. "
+                    "Use {\"by\": \"<strategy>\", \"value\": \"<val>\"} "
+                    "or a shorthand like {\"automation_id\": \"myButton\"}.",
+                    code="INVALID_SELECTOR",
+                )
+            known = extra & self._SELECTOR_STRATEGIES
+            if len(known) > 1:
+                raise UIAError(
+                    f"Ambiguous shorthand: multiple selector keys {sorted(known)!r}. "
+                    "Use the explicit {\"by\": \"<strategy>\", \"value\": \"<val>\"} form.",
+                    code="INVALID_SELECTOR",
+                )
+            if known:
+                shorthand_by = next(iter(known))
+                target = {
+                    "by": shorthand_by,
+                    "value": str(target[shorthand_by]),
+                    "index": target.get("index", 0),
+                }
 
         by = target.get("by", "name")
         value = target.get("value", "")
@@ -107,6 +146,9 @@ class MockUIABridge(UIABridge):
     def send_keys(self, keys: str, target: dict[str, Any] | None = None) -> None:
         self.keys_log.append(keys)
 
+    def type_text(self, text: str, target: dict[str, Any] | None = None) -> None:
+        self.keys_log.append(text)
+
     def legacy_invoke(self, target: dict[str, Any]) -> None:
         element = self._find(target)
         if not element.legacy_invokable:
@@ -127,3 +169,16 @@ class MockUIABridge(UIABridge):
         self.mouse_log.append(
             {"x": x, "y": y, "double": double, "button": button}
         )
+
+    def get_text(self, target: dict[str, Any]) -> tuple[str, str]:
+        """
+        Return the human-readable text of a mock element.
+
+        Priority: UIA ``value`` → MSAA ``legacy_value`` → accessible ``name``.
+        """
+        element = self._find(target)
+        if element.value:
+            return element.value, "value"
+        if element.legacy_value:
+            return element.legacy_value, "msaa_value"
+        return element.name, "name"

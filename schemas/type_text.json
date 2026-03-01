@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "type_text",
+  "description": "Type plain text into the focused window or element. All characters are typed literally — no special encoding needed for spaces, punctuation, or symbols. Use send_keys / uia_send_keys for keyboard shortcuts instead.",
+  "type": "object",
+  "required": ["text"],
+  "properties": {
+    "api_key": {
+      "type": "string",
+      "description": "API key for authentication."
+    },
+    "text": {
+      "type": "string",
+      "description": "Plain text to type. Spaces, punctuation (! @ # $ etc.) and symbols are all typed as-is. Newline characters (\\n) are sent as Enter key presses."
+    },
+    "target": {
+      "$ref": "target.json",
+      "description": "Optional element to focus before typing."
+    }
+  },
+  "additionalProperties": false
+}

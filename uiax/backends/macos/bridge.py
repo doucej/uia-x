@@ -1,7 +1,7 @@
 """
 macOS AXAPI bridge – implements the ``UIABridge`` interface.
 
-This is the macOS equivalent of :mod:`server.real_bridge` and
+This is the macOS equivalent of :mod:`server.win_bridge` and
 :mod:`uiax.backends.linux.bridge`.  It translates the MCP tool surface
 (inspect/invoke/set_value/send_keys/…) into AXAPI calls via
 :mod:`uiax.backends.macos.axapi_backend` and
@@ -43,6 +43,7 @@ from uiax.backends.macos.util import (
     require_axapi,
     role_name,
     send_keys_quartz,
+    type_text_quartz,
 )
 
 _DEPTH_DEFAULT = 3
@@ -184,7 +185,7 @@ class MacOSBridge(UIABridge):
     """
     macOS AXAPI bridge implementing the cross-platform UIABridge interface.
 
-    This is the macOS equivalent of :class:`server.real_bridge.RealUIABridge`
+    This is the macOS equivalent of :class:`server.win_bridge.WinUIABridge`
     and :class:`uiax.backends.linux.bridge.LinuxBridge`.  All methods operate
     on the currently-attached window (selected via ``MacOSProcessManager``).
     """
@@ -309,6 +310,22 @@ class MacOSBridge(UIABridge):
 
         send_keys_quartz(keys)
 
+    def type_text(self, text: str, target: dict[str, Any] | None = None) -> None:
+        if target:
+            element = self._find(target)
+            try:
+                ax_set_attribute(element, "AXFocused", True)
+            except Exception:
+                pass
+        else:
+            root = self._get_root()
+            try:
+                ax_perform_action(root, "AXRaise")
+            except Exception:
+                pass
+
+        type_text_quartz(text)
+
     def legacy_invoke(self, target: dict[str, Any]) -> None:
         """
         Invoke via the default action (macOS equivalent of MSAA
@@ -341,3 +358,33 @@ class MacOSBridge(UIABridge):
         button: str = "left",
     ) -> None:
         mouse_click_quartz(x, y, double=double, button=button)
+
+    def get_text(self, target: dict[str, Any]) -> tuple[str, str]:
+        """
+        Return the human-readable text of an AXAPI element.
+
+        Priority
+        --------
+        1. ``AXValue`` — the most specific programmatic value (editable
+           fields, display labels such as macOS Calculator's result).
+        2. ``AXTitle`` / accessible name — the human-readable label.
+        3. ``AXDescription`` — longer description text.
+        """
+        element = self._find(target)
+
+        # 1. AXValue
+        val = get_value(element)
+        if val is not None and val.strip():
+            return val, "value"
+
+        # 2. AXTitle / name
+        title = get_title(element)
+        if title and title.strip():
+            return title, "name"
+
+        # 3. AXDescription
+        desc = get_description(element)
+        if desc and desc.strip():
+            return desc, "description"
+
+        return "", "none"

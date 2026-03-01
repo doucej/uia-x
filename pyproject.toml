@@ -65,6 +65,7 @@ Issues = "https://github.com/doucej/uia-x/issues"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+norecursedirs = ["pytest-cache-files-*", ".venv", "__pycache__", ".git", "docker"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["server", "mock_uia", "uiax"]

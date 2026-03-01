@@ -98,3 +98,39 @@ class TestMouseClick:
 
     def test_mouse_log_starts_empty(self, bridge: MockUIABridge):
         assert bridge.mouse_log == []
+
+
+# ---------------------------------------------------------------------------
+# type_text tests
+# ---------------------------------------------------------------------------
+
+
+class TestTypeText:
+    def test_type_text_records_in_log(self, bridge: MockUIABridge):
+        bridge.type_text("Hello, World!")
+        assert bridge.keys_log == ["Hello, World!"]
+
+    def test_type_text_spaces_preserved(self, bridge: MockUIABridge):
+        bridge.type_text("hello world")
+        assert bridge.keys_log == ["hello world"]
+
+    def test_type_text_special_chars_preserved(self, bridge: MockUIABridge):
+        """Characters that are special in SendKeys notation are stored as-is."""
+        bridge.type_text("price: ^100 + 50% = ~$150 (approx)")
+        assert bridge.keys_log == ["price: ^100 + 50% = ~$150 (approx)"]
+
+    def test_type_text_with_newline(self, bridge: MockUIABridge):
+        bridge.type_text("line1\nline2")
+        assert bridge.keys_log == ["line1\nline2"]
+
+    def test_type_text_with_target(self, bridge: MockUIABridge):
+        bridge.type_text("typed", target={"by": "automation_id", "value": "textEditor"})
+        assert "typed" in bridge.keys_log
+
+    def test_type_text_empty(self, bridge: MockUIABridge):
+        bridge.type_text("")
+        assert bridge.keys_log == [""]
+
+    def test_type_text_does_not_interfere_with_mouse_log(self, bridge: MockUIABridge):
+        bridge.type_text("abc")
+        assert bridge.mouse_log == []

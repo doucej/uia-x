@@ -427,6 +427,40 @@ def send_keys_xdotool(keys: str) -> None:
         subprocess.run(["xdotool"] + tokens, check=True)
 
 
+def type_text_atspi(text: str) -> None:
+    """
+    Type plain text literally via AT-SPI, character by character.
+
+    Unlike :func:`send_keys_atspi`, no special encoding is needed — spaces,
+    punctuation, and symbols are all typed as-is.  ``\\n`` is sent as Enter.
+    """
+    require_atspi()
+    for ch in text:
+        if ch == "\n":
+            _send_keys_via_atspi("{ENTER}")
+        elif ch == "\t":
+            _send_keys_via_atspi("{TAB}")
+        else:
+            _type_char(ch)
+
+
+def type_text_xdotool(text: str) -> None:
+    """
+    Type plain text literally via ``xdotool type``.
+
+    Uses ``xdotool type --clearmodifiers -- <text>`` which handles all
+    characters (including spaces and punctuation) without special encoding.
+    ``\\n`` is sent as a Return key press before/after splitting lines.
+    """
+    if not text:
+        return
+    # xdotool type handles multi-line text well with --clearmodifiers
+    subprocess.run(
+        ["xdotool", "type", "--clearmodifiers", "--delay", "20", "--", text],
+        check=False,
+    )
+
+
 def _parse_keys_to_xdotool(keys: str) -> list[str]:
     """Convert SendKeys notation into xdotool argument tokens."""
     _XDOTOOL_MAP: dict[str, str] = {

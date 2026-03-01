@@ -46,7 +46,11 @@ mcp = FastMCP(
         "Windows UI Automation MCP server.  Use process_list and select_window "
         "to pick an automation target, then use uia_inspect, uia_invoke, "
         "uia_set_value, uia_send_keys, uia_legacy_invoke, and uia_mouse_click "
-        "to interact with the target application's UI elements."
+        "to interact with the target application's UI elements.  "
+        "To type plain text content use type_text — it handles spaces, punctuation, "
+        "and symbols automatically.  Use send_keys / uia_send_keys only for "
+        "keyboard shortcuts and special-key sequences (Ctrl+S, Alt+F4, arrow keys, "
+        "etc.)."
     ),
     host=_host,
     port=_port,
@@ -336,13 +340,32 @@ def uia_set_value(
 # ===================================================================
 
 
+_SEND_KEYS_NOTATION = (
+    "Key sequence in pywinauto / SendKeys notation.  "
+    "Use type_text instead for plain prose — send_keys is for shortcuts and navigation.  "
+    "Notation reference: "
+    "plain letters/digits are typed as-is; "
+    "spaces are typed literally (no escaping needed); "
+    "special keys use braces: {ENTER} {TAB} {ESC} {BACKSPACE} {DELETE} "
+    "{HOME} {END} {UP} {DOWN} {LEFT} {RIGHT} {F1}-{F12} {PGUP} {PGDN}; "
+    "modifier prefixes (applied to the NEXT key only): "
+    "^ = Ctrl (e.g. ^s = Ctrl+S, ^a = Ctrl+A, ^z = Ctrl+Z), "
+    "+ = Shift (e.g. +{F10} = Shift+F10), "
+    "% = Alt (e.g. %{F4} = Alt+F4, %f = Alt+F to open File menu); "
+    "repeat a key with {key N}: e.g. {TAB 3} = Tab x3; "
+    "to type ~ ^ + % ( ) { } literally wrap in braces: {^} {+} {%} {~} "
+    "{(} {)} {{} {}}.  "
+    "Examples: '^s' saves, '^{HOME}' goes to start, '%f' opens File menu, "
+    "'%{F4}' closes the window."
+)
+
+
 @mcp.tool(
     name="uia_send_keys",
     description=(
-        "Send keystrokes to the target window (or a specific focused element). "
-        "Uses pywinauto / SendKeys notation: plain text is typed literally; "
-        "special keys use braces e.g. {ENTER}, {TAB}, {ESC}, {F4}; "
-        "modifiers are ^ (Ctrl), + (Shift), % (Alt)."
+        "Send keyboard shortcuts or special-key sequences to the target window. "
+        "For typing plain text content use the type_text tool instead. "
+        + _SEND_KEYS_NOTATION
     ),
 )
 def uia_send_keys(
@@ -467,9 +490,10 @@ def uia_mouse_click(
 @mcp.tool(
     name="send_keys",
     description=(
-        "Inject keystrokes via Windows SendInput API.  This is a lower-level "
-        "alternative to uia_send_keys that doesn't require a UIA target. "
-        "Uses pywinauto / SendKeys notation."
+        "Inject keyboard shortcuts or special-key sequences via Windows SendInput "
+        "(lower-level alternative to uia_send_keys — no UIA target required). "
+        "For typing plain text content use the type_text tool instead. "
+        + _SEND_KEYS_NOTATION
     ),
 )
 def send_keys_tool(
@@ -490,6 +514,51 @@ def send_keys_tool(
     try:
         bridge = _get_bridge()
         bridge.send_keys(keys)
+        return {"ok": True}
+    except UIAError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+
+# ===================================================================
+# Tool: type_text  (plain-text typing, no SendKeys encoding needed)
+# ===================================================================
+
+
+@mcp.tool(
+    name="type_text",
+    description=(
+        "Type plain text into the focused window or element. "
+        "All characters are typed literally — spaces, punctuation (!, @, #, etc.), "
+        "and symbols require NO special encoding. "
+        "Newlines (\\n) are sent as Enter key presses. "
+        "Use this to type text content; use send_keys / uia_send_keys for "
+        "keyboard shortcuts and navigation (Ctrl+S, Alt+F4, arrow keys, etc.)."
+    ),
+)
+def type_text_tool(
+    text: str,
+    target: dict[str, Any] = {},  # noqa: B006
+    api_key: str = "",
+) -> dict[str, Any]:
+    """
+    Type plain text into the target window.
+
+    Parameters
+    ----------
+    text : str
+        The plain text to type.  All characters are sent literally.
+    target : dict, optional
+        Element selector to focus before typing.  Pass ``{}`` to send to
+        whatever is currently focused.
+    """
+    auth_err = _check_auth(api_key)
+    if auth_err:
+        return auth_err
+    try:
+        bridge = _get_bridge()
+        bridge.type_text(text, target or None)
         return {"ok": True}
     except UIAError as exc:
         return {"ok": False, "error": str(exc), "code": exc.code}
@@ -527,6 +596,64 @@ def mouse_click_tool(
         bridge = _get_bridge()
         bridge.mouse_click(x, y, double=double, button=button)
         return {"ok": True}
+    except UIAError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+
+# ===================================================================
+# Tool: uia_get_text
+# ===================================================================
+
+
+@mcp.tool(
+    name="uia_get_text",
+    description=(
+        "Return the human-readable text of a single UI element without "
+        "dumping the full tree.  "
+        "Tries, in order: the UIA/AXAPI/AT-SPI value (ValuePattern / "
+        "AXValue / Value interface), then the accessible name, then "
+        "platform-specific text content.  "
+        "Returns the first non-empty result together with a 'source' field "
+        "that identifies which property it came from.  "
+        "Useful for reading display labels such as a calculator result, "
+        "status bar text, or the current value of any control."
+    ),
+)
+def uia_get_text(
+    target: dict[str, Any],
+    api_key: str = "",
+) -> dict[str, Any]:
+    """
+    Get the text of a UI element.
+
+    Parameters
+    ----------
+    target : dict
+        Selector describing which element to read.  Accepts all standard
+        ``by`` strategies (``name``, ``automation_id``, ``control_type``,
+        ``class_name``, ``path``, ``hwnd``, ``legacy_name``, ``legacy_role``,
+        ``child_id``).  Pass ``{}`` to read the root window.
+
+    Returns
+    -------
+    dict
+        ``{"ok": true, "text": "...", "source": "value"|"name"|"text"|
+        "description"|"msaa_value"|"msaa_name"|"none"}``
+
+        ``source`` tells the caller *which* accessibility property the text
+        came from, which is helpful when parsing app-specific prefixes (e.g.
+        Windows Calculator returns ``"Display is 56"`` from ``source="name"``
+        rather than a bare ``"56"``).
+    """
+    auth_err = _check_auth(api_key)
+    if auth_err:
+        return auth_err
+    try:
+        bridge = _get_bridge()
+        text, source = bridge.get_text(target)
+        return {"ok": True, "text": text, "source": source}
     except UIAError as exc:
         return {"ok": False, "error": str(exc), "code": exc.code}
     except Exception as exc:  # noqa: BLE001

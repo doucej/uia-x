@@ -1,7 +1,7 @@
 """
 Linux AT-SPI2 bridge – implements the ``UIABridge`` interface.
 
-This is the Linux equivalent of :mod:`server.real_bridge`.  It translates
+This is the Linux equivalent of :mod:`server.win_bridge`.  It translates
 the MCP tool surface (inspect/invoke/set_value/send_keys/…) into AT-SPI2
 calls via :mod:`uiax.backends.linux.atspi_backend` and
 :mod:`uiax.backends.linux.util`.
@@ -39,6 +39,8 @@ from uiax.backends.linux.util import (
     send_keys_atspi,
     send_keys_xdotool,
     set_text_content,
+    type_text_atspi,
+    type_text_xdotool,
 )
 
 _DEPTH_DEFAULT = 3
@@ -202,7 +204,7 @@ class LinuxBridge(UIABridge):
     """
     Linux AT-SPI2 bridge implementing the cross-platform UIABridge interface.
 
-    This is the Linux equivalent of :class:`server.real_bridge.RealUIABridge`.
+    This is the Linux equivalent of :class:`server.win_bridge.WinUIABridge`.
     All methods operate on the currently-attached window (selected via the
     ``LinuxProcessManager``).
     """
@@ -334,6 +336,27 @@ class LinuxBridge(UIABridge):
         except Exception:
             send_keys_xdotool(keys)
 
+    def type_text(self, text: str, target: dict[str, Any] | None = None) -> None:
+        if target:
+            acc = self._find(target)
+            try:
+                comp = acc.queryComponent()
+                comp.grabFocus()
+            except Exception:
+                pass
+        else:
+            root = self._get_root()
+            try:
+                comp = root.queryComponent()
+                comp.grabFocus()
+            except Exception:
+                pass
+
+        try:
+            type_text_atspi(text)
+        except Exception:
+            type_text_xdotool(text)
+
     def legacy_invoke(self, target: dict[str, Any]) -> None:
         """
         Invoke via the default action (AT-SPI equivalent of MSAA
@@ -360,3 +383,33 @@ class LinuxBridge(UIABridge):
         button: str = "left",
     ) -> None:
         mouse_click_atspi(x, y, double=double, button=button)
+
+    def get_text(self, target: dict[str, Any]) -> tuple[str, str]:
+        """
+        Return the human-readable text of an AT-SPI accessible element.
+
+        Priority
+        --------
+        1. AT-SPI ``Text`` interface (full text content of editable/display
+           elements — this is what GNOME Calculator exposes for its result).
+        2. AT-SPI ``Value`` interface (numeric or range value).
+        3. Accessible ``name`` (human-readable label).
+        """
+        acc = self._find(target)
+
+        # 1. Text interface
+        text = get_text_content(acc)
+        if text is not None and text.strip():
+            return text, "text"
+
+        # 2. Value interface
+        val = get_value(acc)
+        if val is not None and val.strip():
+            return val, "value"
+
+        # 3. Accessible name
+        name = acc.name or ""
+        if name.strip():
+            return name, "name"
+
+        return "", "none"

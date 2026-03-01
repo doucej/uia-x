@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "send_keys",
-  "description": "Inject keystrokes via Windows SendInput (lower-level, no UIA target required).",
+  "description": "Inject keyboard shortcuts or special-key sequences via Windows SendInput. For plain text use type_text instead.",
   "type": "object",
   "required": ["keys"],
   "properties": {
@@ -11,7 +11,7 @@
     },
     "keys": {
       "type": "string",
-      "description": "Key sequence in pywinauto / SendKeys notation."
+      "description": "Key sequence in pywinauto / SendKeys notation. Spaces are typed literally. Special keys: {ENTER} {TAB} {ESC} {BACKSPACE} {DELETE} {HOME} {END} {UP} {DOWN} {LEFT} {RIGHT} {F1}-{F12}. Modifier prefixes: ^ = Ctrl (^s = Ctrl+S), + = Shift (+{F10}), % = Alt (%f = Alt+F, %{F4} = Alt+F4). Repeat: {TAB 3}. Literal special chars: {^} {+} {%} {~} {(} {)} {{} {}}. Examples: '^s' saves, '%f' opens File menu, '%{F4}' closes window."
     }
   },
   "additionalProperties": false
