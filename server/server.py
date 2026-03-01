@@ -54,14 +54,23 @@ _port = int(os.environ.get("MCP_PORT", "8000"))
 mcp = FastMCP(
     "uiax-automation",
     instructions=(
-        "Windows UI Automation MCP server.  Use process_list and select_window "
-        "to pick an automation target, then use uia_inspect, uia_invoke, "
-        "uia_set_value, uia_send_keys, uia_legacy_invoke, and uia_mouse_click "
-        "to interact with the target application's UI elements.  "
-        "To type plain text content use type_text — it handles spaces, punctuation, "
-        "and symbols automatically.  Use send_keys / uia_send_keys only for "
-        "keyboard shortcuts and special-key sequences (Ctrl+S, Alt+F4, arrow keys, "
-        "etc.)."
+        "UI Automation MCP server (Linux AT-SPI2 / Windows UIA). "
+        "Workflow: "
+        "(1) call process_list to find the target application window, "
+        "(2) call select_window to attach to it, "
+        "(3) call uia_find_all to get a FLAT LIST of every named/interactive "
+        "element in the window — this is the most reliable way to discover "
+        "buttons, inputs, and controls, especially in GTK4/Electron apps where "
+        "uia_inspect at a fixed depth returns an empty or truncated tree, "
+        "(4) call uia_invoke with {'by': 'name', 'value': '<element name>'} to "
+        "click a button or activate a control discovered via uia_find_all. "
+        "Only fall back to uia_inspect when you need structural/hierarchical data "
+        "for a specific subtree. "
+        "NEVER use send_keys or type_text to drive buttons that are visible in "
+        "uia_find_all — always prefer uia_invoke on named elements. "
+        "Use send_keys / uia_send_keys only for keyboard shortcuts and "
+        "special-key sequences (Ctrl+S, Alt+F4, arrow keys, etc.). "
+        "Use type_text only for typing into text input fields."
     ),
     host=_host,
     port=_port,
@@ -226,8 +235,14 @@ def select_window(
     name="uia_inspect",
     description=(
         "Inspect the UI Automation element tree of the active target window. "
-        "Returns a JSON snapshot of the matched element and its children. "
-        "Pass an empty target ({}) to get the full window tree."
+        "Returns a JSON snapshot of the matched element and its children up to "
+        "'depth' levels (default 3). "
+        "NOTE: GTK4 and Electron apps nest widgets 10-15 levels deep, so the "
+        "root tree at depth=3 will appear empty or show only structural panels. "
+        "If the tree looks shallow or empty, switch to uia_find_all instead — "
+        "it walks the full tree regardless of depth and returns all named elements "
+        "as a flat list. Use uia_inspect only when you need hierarchical structure "
+        "for a specific known subtree."
     ),
 )
 def uia_inspect(
@@ -279,12 +294,15 @@ def uia_inspect(
 @mcp.tool(
     name="uia_find_all",
     description=(
-        "Return a flat list of every named/interactive element in the target window. "
-        "Call this first to discover what buttons, inputs, and controls exist — "
-        "especially useful for deep UI frameworks (GTK4, Electron) where "
-        "uia_inspect with a fixed depth may not reach all elements. "
-        "Each entry includes name, role, and available actions so you know "
-        "exactly what to pass to uia_invoke."
+        "RECOMMENDED FIRST STEP after select_window. "
+        "Returns a flat list of every named/interactive element in the window, "
+        "regardless of how deeply nested it is. "
+        "Essential for GTK4 and Electron apps where uia_inspect at a fixed depth "
+        "returns an empty tree. "
+        "Each entry has 'name', 'role', and 'actions' fields. "
+        "Use the 'name' values directly with uia_invoke to click buttons. "
+        "Filter by role with roles=['button'] or include display labels with "
+        "has_actions=false to read the current value shown on screen."
     ),
 )
 def uia_find_all(
