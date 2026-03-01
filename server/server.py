@@ -1,19 +1,30 @@
 """
-Main MCP server entry point – V2: Windows UI Automation substrate.
+Main MCP server entry point – cross-platform UI Automation over MCP.
 
-Generalised beyond any single application.  Use the ``process_list`` and
-``select_window`` tools to choose a target window, then use the UIA tools
-to inspect and interact with it.
+Use the ``process_list`` and ``select_window`` tools to choose a target window,
+then use the UIA tools to inspect and interact with it.
 
 Environment variables
 ---------------------
-UIA_BACKEND       "real" (default) or "mock"
-UIA_X_AUTH    "apikey" (default) or "none"
-UIA_X_API_KEY Override API key (skip on-disk generation)
+UIAX_BACKEND      Backend: ``real`` (auto-detect, default), ``mock``, ``linux``,
+                  ``macos``.  Legacy alias: ``UIA_BACKEND``.
+UIAX_AUTH         Auth mode: ``apikey`` (default) or ``none``.
+                  Legacy alias: ``UIA_X_AUTH``.
+UIAX_API_KEY      Pin a specific API key (printed on startup; skips on-disk keygen).
+                  Deprecated alias: ``UIA_X_API_KEY``.
+MCP_TRANSPORT     Transport: ``stdio`` (default), ``sse``, ``streamable-http``.
+MCP_HOST          Bind address for HTTP transports (default ``0.0.0.0``).
+MCP_PORT          Port for HTTP transports (default ``8000``).
 
-Usage:
-    python -m server.server
-    UIA_BACKEND=mock python -m server.server
+Usage
+-----
+    python -m uiax.server
+    UIAX_BACKEND=mock python -m uiax.server
+    UIAX_AUTH=none MCP_TRANSPORT=streamable-http python -m uiax.server
+
+Key rotation
+------------
+    uiax-server --reset-key   # delete stored hash and generate a new key
 """
 
 from __future__ import annotations
@@ -66,7 +77,10 @@ _bridge = None
 def _get_bridge():
     global _bridge
     if _bridge is None:
-        backend = os.environ.get("UIA_BACKEND", "real").lower()
+        backend = (
+            os.environ.get("UIAX_BACKEND", "")
+            or os.environ.get("UIA_BACKEND", "real")
+        ).lower()
         _bridge = get_bridge(backend)
     return _bridge
 
@@ -675,11 +689,32 @@ def main() -> None:
     # parse_known_args so MCP-client-injected arguments don't cause a hard error.
     args, _ = parser.parse_known_args()
 
-    backend = os.environ.get("UIA_BACKEND", "real").lower()
-    auth_mode = os.environ.get("UIA_X_AUTH", "apikey").lower()
+    backend = (
+        os.environ.get("UIAX_BACKEND", "")
+        or os.environ.get("UIA_BACKEND", "real")
+    ).lower()
+    auth_mode = (
+        os.environ.get("UIAX_AUTH", "")
+        or os.environ.get("UIA_X_AUTH", "apikey")
+    ).lower()
     transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()
     host = os.environ.get("MCP_HOST", "0.0.0.0")
     port = int(os.environ.get("MCP_PORT", "8000"))
+
+    # Early warning on Linux if AT-SPI2 bindings are not importable.
+    if sys.platform.startswith("linux") and backend in ("real", "linux"):
+        try:
+            import pyatspi  # noqa: F401
+        except ImportError:
+            print(
+                "[uiax] WARNING: python3-pyatspi not found.\n"
+                "[uiax] Linux AT-SPI2 automation requires the system package:\n"
+                "[uiax]   sudo apt install python3-pyatspi gir1.2-atspi-2.0 at-spi2-core\n"
+                "[uiax] If running in a venv, either:\n"
+                "[uiax]   a) Create the venv with --system-site-packages, or\n"
+                "[uiax]   b) Use the system Python directly (python3 -m uiax.server)",
+                file=sys.stderr,
+            )
 
     if args.reset_key:
         deleted = delete_key_file()

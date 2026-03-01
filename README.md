@@ -16,6 +16,8 @@ any windowed app — just like a human operator.
 
 The recommended deployment: serve over HTTP with a generated API key.
 
+**Windows (PowerShell)**
+
 ```powershell
 # 1. Clone and install
 git clone https://github.com/doucej/uia-x.git
@@ -26,35 +28,97 @@ pip install -e .
 
 # 2. Start the server  (prints the active API key to stdout at startup)
 $env:MCP_TRANSPORT="streamable-http"
-python -m server.server
+python -m uiax.server
+```
+
+**Linux**
+
+> **Note:** pyatspi must be visible to the Python interpreter you use.  If
+> you are running inside a virtualenv, either create it with
+> `--system-site-packages` or use the system Python directly.
+
+```bash
+# 1. Install the OS-level AT-SPI2 library
+sudo apt install python3-pyatspi gir1.2-atspi-2.0 at-spi2-core
+
+# 2. Clone and install (system Python, so pyatspi is visible)
+git clone https://github.com/doucej/uia-x.git
+cd uia-x
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+pip install -e .
+
+# 3. Start the server
+export MCP_TRANSPORT=streamable-http
+python -m uiax.server
+```
+
+**macOS**
+
+```bash
+# 1. Clone and install
+git clone https://github.com/doucej/uia-x.git
+cd uia-x
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+
+# 2. Grant Accessibility access to Terminal (System Settings → Privacy & Security
+#    → Accessibility) so AXAPI can inspect other apps.
+
+# 3. Start the server
+export MCP_TRANSPORT=streamable-http
+python -m uiax.server
 ```
 
 On **first** startup (new key generated and hash saved to disk):
 
 ```
-[uia-x] *** NEW API KEY GENERATED ***
-[uia-x] Key: <your-key>
-[uia-x] Stored hash in: C:\Users\<you>\.uia_x\api_key
-[uia-x] Save this key – it will not be shown again.
+[uiax] *** NEW API KEY GENERATED ***
+[uiax] Key: <your-key>
+[uiax] Stored hash in: ~/.uiax/api_key
+[uiax] Save this key – it will not be shown again.
+[uiax] To rotate the key run: uiax-server --reset-key
 [uiax] starting server (backend=real, auth=apikey, transport=streamable-http, http://0.0.0.0:8000)
 ```
+
+The key file lives under your home directory on every platform:
+
+| Platform | Path |
+|----------|------|
+| Windows | `C:\Users\<you>\.uiax\api_key` |
+| Linux | `/home/<you>/.uiax/api_key` |
+| macOS | `/Users/<you>/.uiax/api_key` |
 
 On **subsequent** startups (hash loaded from disk — plaintext not recoverable):
 
 ```
-[uia-x] API key loaded from disk (C:\Users\<you>\.uia_x\api_key).
-[uia-x] The hash is stored; use your saved key to authenticate.
-[uia-x] To display the key again set UIAX_API_KEY=<your-key> or delete the file to regenerate.
+[uiax] API key loaded from disk (~/.uiax/api_key).
+[uiax] The hash is stored; use your saved key to authenticate.
+[uiax] To display the key again set UIAX_API_KEY=<your-key> or delete the file to regenerate.
+[uiax] To rotate the key run: uiax-server --reset-key
 [uiax] starting server (backend=real, auth=apikey, transport=streamable-http, http://0.0.0.0:8000)
+```
+
+To rotate the key at any time:
+
+```bash
+uiax-server --reset-key   # generates and saves a new key, then exits
 ```
 
 To pin a fixed key that is printed on every startup, set `UIAX_API_KEY`:
 
-```powershell
+```bash
+# Linux / macOS
+export UIAX_API_KEY="my-fixed-key"
+python -m uiax.server
+
+# Windows (PowerShell)
 $env:UIAX_API_KEY="my-fixed-key"
-python -m server.server
-# [uia-x] API key sourced from environment variable UIAX_API_KEY.
-# [uia-x] Key: my-fixed-key
+python -m uiax.server
+
+# [uiax] API key sourced from environment variable UIAX_API_KEY.
+# [uiax] Key: my-fixed-key
 ```
 
 **3. Point your MCP client at `http://localhost:8000/mcp`** and pass the API
@@ -69,9 +133,9 @@ key as a Bearer token header or as the `api_key` parameter on each tool call.
 | `MCP_TRANSPORT` | `stdio` | Transport: `stdio`, `sse`, `streamable-http` |
 | `MCP_HOST` | `0.0.0.0` | Bind address (HTTP modes) |
 | `MCP_PORT` | `8000` | Listen port (HTTP modes) |
-| `UIA_X_AUTH` | `apikey` | Auth mode: `apikey` or `none` |
+| `UIAX_AUTH` | `apikey` | Auth mode: `apikey` or `none`. Legacy alias: `UIA_X_AUTH` |
 | `UIAX_API_KEY` | *(auto)* | Pin a specific API key (skips on-disk generation). Legacy alias: `UIA_X_API_KEY` |
-| `UIA_BACKEND` | `real` | Backend: `real` (auto-detect), `linux` (AT-SPI2), `macos` (AXAPI), or `mock` (tests) |
+| `UIAX_BACKEND` | `real` | Backend: `real` (auto-detect), `linux` (AT-SPI2), `macos` (AXAPI), or `mock` (tests). Legacy alias: `UIA_BACKEND` |
 
 ---
 
@@ -81,7 +145,7 @@ key as a Bearer token header or as the `api_key` parameter on each tool call.
 > block in your client config simply tells the client what credentials to
 > present — the server decides whether to accept them.  A client that omits
 > or forges the header is rejected with a 401.  If the server is started with
-> `UIA_X_AUTH=none`, no credentials are checked regardless of what the client
+> `UIAX_AUTH=none`, no credentials are checked regardless of what the client
 > sends.
 
 UIA-X supports **two ways** to present an API key — use whichever
@@ -103,14 +167,31 @@ is ignored (you can omit it).
 
 Stdio — the server runs as a local subprocess. No key needed.
 
+**Windows:**
+
 ```json
 {
   "mcpServers": {
     "uiax": {
-      "command": "python",
-      "args": ["-m", "server.server"],
+      "command": "C:/path/to/uia-x/.venv/Scripts/python.exe",
+      "args": ["-m", "uiax.server"],
       "cwd": "C:/path/to/uia-x",
-      "env": { "UIA_X_AUTH": "none" }
+      "env": { "UIAX_AUTH": "none" }
+    }
+  }
+}
+```
+
+**Linux / macOS:**
+
+```json
+{
+  "mcpServers": {
+    "uiax": {
+      "command": "/path/to/uia-x/.venv/bin/python",
+      "args": ["-m", "uiax.server"],
+      "cwd": "/path/to/uia-x",
+      "env": { "UIAX_AUTH": "none" }
     }
   }
 }
@@ -126,9 +207,11 @@ Stdio — no API key required.
   "servers": {
     "uiax": {
       "type": "stdio",
+      // Windows: "${workspaceFolder}/.venv/Scripts/python.exe"
+      // Linux / macOS: "${workspaceFolder}/.venv/bin/python"
       "command": "${workspaceFolder}/.venv/Scripts/python.exe",
-      "args": ["-m", "server.server"],
-      "env": { "UIA_X_AUTH": "none", "UIA_BACKEND": "real" }
+      "args": ["-m", "uiax.server"],
+      "env": { "UIAX_AUTH": "none", "UIAX_BACKEND": "real" }
     }
   }
 }
@@ -183,7 +266,7 @@ opencode uses `"type": "remote"` for HTTP MCP servers.
 }
 ```
 
-**Without auth (local dev)** — start the server with `UIA_X_AUTH=none` and
+**Without auth (local dev)** — start the server with `UIAX_AUTH=none` and
 omit the `headers` block:
 
 ```jsonc
@@ -198,7 +281,7 @@ omit the `headers` block:
 ```
 
 > **Note:** opencode stores the key in plain text (no `${input:...}` prompt
-> like VS Code).  For local-only use, running with `UIA_X_AUTH=none` is the
+> like VS Code).  For local-only use, running with `UIAX_AUTH=none` is the
 > simplest path.  For remote/shared servers, treat the config file as
 > sensitive.
 
@@ -213,7 +296,7 @@ curl -H "Authorization: Bearer <your-api-key>" \
      http://<host>:8000/mcp
 ```
 
-If auth is disabled server-side (`UIA_X_AUTH=none`), just hit the URL
+If auth is disabled server-side (`UIAX_AUTH=none`), just hit the URL
 directly — no header needed.
 
 ---
@@ -442,7 +525,7 @@ Every time the server starts it resolves the active API key and prints status
 to **stdout** before the HTTP server begins accepting connections:
 
 * **First run** – a new cryptographically random key is generated, its
-  SHA-256 hash is written to `~/.uia_x/api_key`, and the **plaintext key** is
+  SHA-256 hash is written to `~/.uiax/api_key`, and the **plaintext key** is
   printed.  Copy and save it — the file stores only the hash, so the
   plaintext cannot be recovered on subsequent runs.
 * **Subsequent runs** – the hash is loaded from disk and a confirmation
@@ -482,15 +565,15 @@ Every tool also accepts `api_key` as a parameter:
 ### Disabling auth (local dev)
 
 ```bash
-UIA_X_AUTH=none python -m server.server
+UIAX_AUTH=none python -m uiax.server
 ```
 
 ### Overriding the key via environment
 
 ```bash
-UIAX_API_KEY=my-fixed-key python -m server.server
+UIAX_API_KEY=my-fixed-key python -m uiax.server
 # Legacy alias also accepted:
-UIA_X_API_KEY=my-fixed-key python -m server.server
+UIA_X_API_KEY=my-fixed-key python -m uiax.server
 ```
 
 ### Future auth methods
@@ -504,19 +587,30 @@ provider by implementing the `AuthProvider` protocol in `server/auth.py`.
 
 **Against a live desktop (stdio, default):**
 ```bash
-python -m server.server
+# Linux / macOS
+python -m uiax.server
+
+# Windows (PowerShell)
+python -m uiax.server
 ```
 
 **HTTP mode (recommended for remote / multi-client):**
+```bash
+# Linux / macOS
+export MCP_TRANSPORT=streamable-http
+python -m uiax.server
+# → Listening on http://0.0.0.0:8000/mcp
+```
 ```powershell
+# Windows (PowerShell)
 $env:MCP_TRANSPORT="streamable-http"
-python -m server.server
+python -m uiax.server
 # → Listening on http://0.0.0.0:8000/mcp
 ```
 
-**Mock backend (no Windows required):**
+**Mock backend (no desktop required — for testing):**
 ```bash
-UIA_BACKEND=mock python -m server.server
+UIAX_BACKEND=mock python -m uiax.server
 ```
 
 ---
@@ -562,8 +656,8 @@ contains only the target application(s).
 5. **Start UIA-X** inside the VM session:
    ```powershell
    $env:MCP_TRANSPORT = "streamable-http"
-   $env:UIA_X_AUTH    = "apikey"        # or "none" for local-only
-   python -m server.server
+   $env:UIAX_AUTH     = "apikey"        # or "none" for local-only
+   python -m uiax.server
    ```
 6. **Connect your MCP client** from your host to `http://<vm-ip>:8000/mcp`.
 
@@ -595,7 +689,7 @@ RUN pip install -r requirements.txt
 CMD Xvfb :99 -screen 0 1920x1080x24 & \
     export DISPLAY=:99 && \
     export MCP_TRANSPORT=streamable-http && \
-    dbus-run-session -- python -m server.server
+    dbus-run-session -- python -m uiax.server
 ```
 
 ```bash
@@ -786,7 +880,7 @@ element):
 The `"Display is "` prefix is part of the UWP Calculator’s accessible name.
 Skill guides should document this pattern so the model knows to strip it.
 
-> *Required unless `UIA_X_AUTH=none`.
+> *Required unless `UIAX_AUTH=none`.
 
 ---
 

@@ -14,8 +14,9 @@ Design
 
 Disabling auth
 --------------
-Set the environment variable ``UIA_X_AUTH=none`` to skip all
+Set the environment variable ``UIAX_AUTH=none`` to skip all
 authentication checks (useful for local-only / dev usage).
+``UIA_X_AUTH`` is a deprecated alias that still works.
 """
 
 from __future__ import annotations
@@ -35,11 +36,12 @@ from server.uia_bridge import AuthenticationError
 # Config
 # ---------------------------------------------------------------------------
 
-_CONFIG_DIR = Path.home() / ".uia_x"
+_CONFIG_DIR = Path.home() / ".uiax"
 _KEY_FILE = _CONFIG_DIR / "api_key"
-_ENV_AUTH_MODE = "UIA_X_AUTH"         # "apikey" (default) | "none"
+_ENV_AUTH_MODE = "UIAX_AUTH"           # "apikey" (default) | "none" (primary)
+_ENV_AUTH_MODE_LEGACY = "UIA_X_AUTH"   # deprecated alias – still accepted
 _ENV_API_KEY = "UIAX_API_KEY"         # primary override key from env
-_ENV_API_KEY_LEGACY = "UIA_X_API_KEY" # backward-compat alias
+_ENV_API_KEY_LEGACY = "UIA_X_API_KEY" # deprecated alias – still accepted
 
 
 # ---------------------------------------------------------------------------
@@ -158,17 +160,21 @@ def get_auth_provider() -> AuthProvider:
     Build the appropriate AuthProvider based on environment / config.
 
     Priority:
-    1. ``UIA_X_AUTH=none``  → NoAuthProvider
-    2. ``UIAX_API_KEY`` env var (or legacy ``UIA_X_API_KEY``) → ApiKeyProvider
+    1. ``UIAX_AUTH=none`` (or deprecated ``UIA_X_AUTH=none``) → NoAuthProvider
+    2. ``UIAX_API_KEY`` env var (or deprecated ``UIA_X_API_KEY``) → ApiKeyProvider
     3. Key hash on disk    → ApiKeyProvider  (key shown on first-run only)
     4. No key yet          → generate one, print to **stdout**, persist hash
     """
-    mode = os.environ.get(_ENV_AUTH_MODE, "apikey").lower()
+    mode = (
+        os.environ.get(_ENV_AUTH_MODE, "").lower()
+        or os.environ.get(_ENV_AUTH_MODE_LEGACY, "").lower()
+        or "apikey"
+    )
     if mode == "none":
         return NoAuthProvider()
 
-    # Check env-var override (UIAX_API_KEY takes precedence; UIA_X_API_KEY is
-    # a backward-compatible alias kept for existing deployments).
+    # Check env-var override (UIAX_API_KEY takes precedence;
+    # UIA_X_API_KEY is a deprecated backward-compatible alias).
     env_key = (
         os.environ.get(_ENV_API_KEY, "").strip()
         or os.environ.get(_ENV_API_KEY_LEGACY, "").strip()
@@ -182,8 +188,8 @@ def get_auth_provider() -> AuthProvider:
             else ""
         )
         print(
-            f"[uia-x] API key sourced from environment variable {env_var_used}{disk_note}.\n"
-            f"[uia-x] Key: {env_key}",
+            f"[uiax] API key sourced from environment variable {env_var_used}{disk_note}.\n"
+            f"[uiax] Key: {env_key}",
             file=sys.stdout,
         )
         return ApiKeyProvider(key_hash)
@@ -193,10 +199,11 @@ def get_auth_provider() -> AuthProvider:
     stored_hash = load_key_hash()
     if stored_hash:
         print(
-            f"[uia-x] API key loaded from disk ({_KEY_FILE}).\n"
-            f"[uia-x] The hash is stored; use your saved key to authenticate.\n"
-            f"[uia-x] To display the key again set {_ENV_API_KEY}=<your-key> "
-            f"or delete {_KEY_FILE} to generate a new one.",
+            f"[uiax] API key loaded from disk ({_KEY_FILE}).\n"
+            f"[uiax] The hash is stored; use your saved key to authenticate.\n"
+            f"[uiax] To display the key again set {_ENV_API_KEY}=<your-key> "
+            f"or delete {_KEY_FILE} to generate a new one.\n"
+            f"[uiax] To rotate the key run: uiax-server --reset-key",
             file=sys.stdout,
         )
         return ApiKeyProvider(stored_hash)
@@ -204,10 +211,11 @@ def get_auth_provider() -> AuthProvider:
     # First-run: generate a new key, persist the hash, display the plaintext.
     raw_key = generate_api_key()
     print(
-        f"[uia-x] *** NEW API KEY GENERATED ***\n"
-        f"[uia-x] Key: {raw_key}\n"
-        f"[uia-x] Stored hash in: {_KEY_FILE}\n"
-        f"[uia-x] Save this key – it will not be shown again.",
+        f"[uiax] *** NEW API KEY GENERATED ***\n"
+        f"[uiax] Key: {raw_key}\n"
+        f"[uiax] Stored hash in: {_KEY_FILE}\n"
+        f"[uiax] Save this key – it will not be shown again.\n"
+        f"[uiax] To rotate the key run: uiax-server --reset-key",
         file=sys.stdout,
     )
     return ApiKeyProvider(hashlib.sha256(raw_key.encode()).hexdigest())
