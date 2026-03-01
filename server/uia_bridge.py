@@ -83,6 +83,24 @@ class UIABridge(ABC):
     def inspect(self, target: dict[str, Any]) -> dict[str, Any]:
         """Return a JSON-serialisable tree of the matched element."""
 
+    def find_all(self, filter: dict[str, Any]) -> list[dict[str, Any]]:
+        """
+        Return a flat list of all accessible elements in the current window
+        that match *filter*.
+
+        Parameters
+        ----------
+        filter : dict
+            Supported keys:
+
+            ``roles``       – list of role strings to include (empty = all).
+            ``has_actions`` – if True (default), only include elements that
+                              have at least one invokable action.
+            ``named_only``  – if True (default), skip unnamed elements.
+            ``root``        – optional selector dict to scope the search.
+        """
+        raise NotImplementedError("find_all is not supported by this backend")
+
     @abstractmethod
     def invoke(self, target: dict[str, Any]) -> None:
         """Invoke (click/activate) the matched element."""
@@ -94,7 +112,7 @@ class UIABridge(ABC):
     @abstractmethod
     def send_keys(self, keys: str, target: dict[str, Any] | None = None) -> None:
         """
-        Send keystrokes to the attached window using SendKeys notation.
+        Send keystrokes to the attached window.
 
         Parameters
         ----------
@@ -104,22 +122,6 @@ class UIABridge(ABC):
             Optional element selector.  When provided the element is focused
             before keys are sent.  Pass ``None`` to send to the currently
             focused control.
-        """
-
-    @abstractmethod
-    def type_text(self, text: str, target: dict[str, Any] | None = None) -> None:
-        """
-        Type plain text into the attached window, auto-escaping special chars.
-
-        Unlike ``send_keys``, all characters in *text* are sent literally —
-        spaces, punctuation, and symbols require no special encoding.
-
-        Parameters
-        ----------
-        text : str
-            The plain text to type.
-        target : dict or None
-            Optional element selector to focus before typing.
         """
 
     @abstractmethod
@@ -155,37 +157,6 @@ class UIABridge(ABC):
             ``"left"`` (default), ``"right"``, or ``"middle"``.
         """
 
-    @abstractmethod
-    def get_text(self, target: dict[str, Any]) -> tuple[str, str]:
-        """
-        Return the human-readable text of an element and the field it came from.
-
-        Tries text sources in priority order and returns on the first non-empty
-        result.  The priority is platform-specific but generally:
-
-        1. UIA / AXAPI / AT-SPI *value* (e.g. ValuePattern, AXValue, Value
-           interface) — the programmatic value of editable or display elements.
-        2. Accessible *name* (``window_text()`` / ``acc.name`` / AXTitle) —
-           the human-readable label attached to every element.
-        3. Platform-specific text content (AT-SPI Text interface, MSAA
-           ``acc_value``) as a last resort.
-
-        Returns
-        -------
-        tuple[str, str]
-            ``(text, source)`` where *source* is one of ``"value"``,
-            ``"name"``, ``"text"``, ``"description"``, ``"msaa_value"``,
-            ``"msaa_name"``, or ``"none"`` when no readable text was found.
-
-        Notes
-        -----
-        This intentionally returns the raw string without stripping
-        application-defined prefixes (e.g. Windows Calculator exposes its
-        result as ``"Display is 56"`` via the accessible name).  Callers
-        that need only the numeric portion should parse the returned *text*
-        themselves, guided by a skill guide for the target application.
-        """
-
 
 # ---------------------------------------------------------------------------
 # Factory
@@ -199,10 +170,9 @@ def get_bridge(backend: str = "real") -> UIABridge:
     Parameters
     ----------
     backend : str
-        ``"real"``   – live UI Automation (auto-detect platform)
-        ``"mock"``   – in-process mock tree (no target app required)
-        ``"linux"``  – force Linux AT-SPI2 backend
-        ``"macos"``  – force macOS AXAPI backend
+        ``"real"``  – live UI Automation (Windows UIA or Linux AT-SPI2)
+        ``"mock"``  – in-process mock tree (no target app required)
+        ``"linux"`` – force Linux AT-SPI2 backend
     """
     if backend == "mock":
         from server.mock_bridge import MockUIABridge  # noqa: PLC0415
@@ -214,15 +184,10 @@ def get_bridge(backend: str = "real") -> UIABridge:
 
         return LinuxBridge()
 
-    if backend == "macos" or (backend == "real" and _is_macos()):
-        from uiax.backends.macos.bridge import MacOSBridge  # noqa: PLC0415
-
-        return MacOSBridge()
-
     # Default: Windows UIA backend
-    from server.win_bridge import WinUIABridge  # noqa: PLC0415
+    from server.real_bridge import RealUIABridge  # noqa: PLC0415
 
-    return WinUIABridge()
+    return RealUIABridge()
 
 
 def _is_linux() -> bool:
@@ -230,10 +195,3 @@ def _is_linux() -> bool:
     import sys  # noqa: PLC0415
 
     return sys.platform.startswith("linux")
-
-
-def _is_macos() -> bool:
-    """Return True if the current platform is macOS."""
-    import sys  # noqa: PLC0415
-
-    return sys.platform == "darwin"

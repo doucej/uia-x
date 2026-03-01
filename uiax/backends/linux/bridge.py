@@ -259,6 +259,60 @@ class LinuxBridge(UIABridge):
     # UIABridge implementation
     # ------------------------------------------------------------------
 
+    def find_all(self, filter: dict[str, Any]) -> list[dict[str, Any]]:
+        """
+        DFS the full AT-SPI tree and return every named/interactive element
+        as a flat list.  Skips structural containers so the result is a
+        clean "what can I click or read" summary.
+        """
+        named_only = bool(filter.get("named_only", True))
+        must_have_actions = bool(filter.get("has_actions", True))
+        roles_filter = [r.lower() for r in (filter.get("roles") or [])]
+        root_target = filter.get("root") or {}
+
+        acc = self._find(root_target) if root_target else self._get_root()
+
+        results: list[dict[str, Any]] = []
+        stack = [acc]
+        while stack:
+            node = stack.pop()
+            try:
+                name = node.name or ""
+                node_role = role_name(node)
+                actions = get_actions(node)
+
+                include = True
+                if named_only and not name:
+                    include = False
+                if roles_filter and node_role not in roles_filter:
+                    include = False
+                if must_have_actions and not actions:
+                    include = False
+
+                if include:
+                    d: dict[str, Any] = {
+                        "name": name,
+                        "role": node_role,
+                        "actions": actions,
+                    }
+                    text = get_text_content(node)
+                    if text:
+                        d["text"] = text
+                    val = get_value(node)
+                    if val is not None:
+                        d["value"] = str(val)
+                    results.append(d)
+
+                # Traverse children regardless of whether this node matched
+                for i in range(node.childCount - 1, -1, -1):
+                    child = node.getChildAtIndex(i)
+                    if child is not None:
+                        stack.append(child)
+            except Exception:
+                pass
+
+        return results
+
     def inspect(self, target: dict[str, Any]) -> dict[str, Any]:
         depth = int(target.get("depth", _DEPTH_DEFAULT)) if target else _DEPTH_DEFAULT
         acc = self._find(target or {})
