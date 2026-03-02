@@ -136,6 +136,7 @@ class MockUIABridge(UIABridge):
         root_elem = self._find(root_target) if root_target else self._tree.root
 
         results: list[dict[str, Any]] = []
+        name_counts: dict[str, int] = {}
         stack = [root_elem]
         while stack:
             elem = stack.pop()
@@ -156,8 +157,10 @@ class MockUIABridge(UIABridge):
                 include = False
 
             if include:
+                per_name_idx = name_counts.get(name, 0)
+                name_counts[name] = per_name_idx + 1
                 d: dict[str, Any] = {
-                    "index": len(results),
+                    "index": per_name_idx,
                     "name": name,
                     "role": node_role,
                     "actions": actions,

@@ -385,10 +385,17 @@ class TestFindAllIndexAndStates:
             assert isinstance(item["index"], int)
 
     def test_find_all_indices_are_sequential(self, bridge: MockUIABridge):
-        """Indices must be 0-based and consecutive."""
+        """Index is the per-name ordinal: elements with a unique name all have
+        index=0; if two share a name, the second has index=1."""
         items = bridge.find_all({"has_actions": True, "named_only": True})
-        for i, item in enumerate(items):
-            assert item["index"] == i
+        # Collect per-name indices
+        seen: dict[str, list[int]] = {}
+        for item in items:
+            seen.setdefault(item["name"], []).append(item["index"])
+        for name, idxs in seen.items():
+            assert idxs == list(range(len(idxs))), (
+                f"Indices for name={name!r} are not sequential: {idxs}"
+            )
 
     def test_find_all_includes_name_and_role(self, bridge: MockUIABridge):
         """Sanity check: basic fields are still present."""

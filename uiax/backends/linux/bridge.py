@@ -54,6 +54,17 @@ _MEANINGFUL_STATES = frozenset({
     "armed", "expanded", "collapsed", "active", "visited",
 })
 
+# Actions that indicate a text/label widget (clipboard handling) rather than a
+# real interactive UI element.  An element whose entire action set consists of
+# only these is treated as non-interactive for the purposes of has_actions=True.
+_CLIPBOARD_ONLY_ACTIONS = frozenset({
+    "clipboard.copy", "clipboard.paste", "clipboard.cut",
+    "clipboard.selectall", "clipboard.select-all",
+    "selection.select-all", "selection.delete",
+    "link.open", "link.copy",
+    "menu.popup",
+})
+
 
 # ---------------------------------------------------------------------------
 # LinuxProcessManager – AT-SPI equivalent of the Windows ProcessManager
@@ -256,9 +267,18 @@ class LinuxBridge(UIABridge):
             "legacy_role": "role",         # MSAA role → AT-SPI role
         }
         by = strategy_remap.get(by, by)
+        role_filter = str(target.get("role", "")).lower()
+        # When searching by name with no explicit role constraint, prefer
+        # interactive elements (buttons, menu items, …) over passive display
+        # elements (labels, history entries, …) that happen to share the name.
+        prefer_interactive = (by == "name" and not role_filter)
 
         try:
-            return find_accessible(root, by=by, value=value, index=index)
+            return find_accessible(
+                root, by=by, value=value, index=index,
+                role_filter=role_filter,
+                prefer_interactive=prefer_interactive,
+            )
         except (LookupError, ValueError) as exc:
             raise ElementNotFoundError(target) from exc
 
@@ -280,6 +300,10 @@ class LinuxBridge(UIABridge):
         acc = self._find(root_target) if root_target else self._get_root()
 
         results: list[dict[str, Any]] = []
+        # Tracks how many elements with the same name have been seen so far.
+        # The per-name count becomes the 'index' field, which maps 1:1 to the
+        # 'index' selector parameter in uia_invoke / _find().
+        name_counts: dict[str, int] = {}
         stack = [acc]
         while stack:
             node = stack.pop()
@@ -295,10 +319,20 @@ class LinuxBridge(UIABridge):
                     include = False
                 if must_have_actions and not actions:
                     include = False
+                # Exclude elements whose only actions are clipboard/text-management
+                # operations — they are content labels, not interactive controls.
+                if must_have_actions and actions and all(
+                    a.lower().replace(" ", "") in {x.replace("-", "").replace(".", "") for x in _CLIPBOARD_ONLY_ACTIONS}
+                    or a.lower() in _CLIPBOARD_ONLY_ACTIONS
+                    for a in actions
+                ):
+                    include = False
 
                 if include:
+                    per_name_idx = name_counts.get(name, 0)
+                    name_counts[name] = per_name_idx + 1
                     d: dict[str, Any] = {
-                        "index": len(results),
+                        "index": per_name_idx,
                         "name": name,
                         "role": node_role,
                         "actions": actions,
