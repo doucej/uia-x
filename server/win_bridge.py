@@ -78,7 +78,15 @@ _SELECTOR_STRATEGIES = {
 } | _MSAA_STRATEGIES
 
 # Keys that carry plumbing metadata, not selector values.
-_META_KEYS = {"by", "value", "index", "depth"}
+_META_KEYS = {"by", "value", "index", "depth", "role"}
+
+# Windows control types (friendly_class_name()) that represent interactive controls.
+_WIN_INTERACTIVE_ROLES = frozenset({
+    "button", "checkbox", "radiobutton", "combobox", "listitem",
+    "menuitem", "edit", "richedit", "richedit20", "treeitem",
+    "tabitem", "hyperlink", "slider", "spinner", "toolbar",
+    "calendar", "timepicker",
+})
 
 # ---------------------------------------------------------------------------
 # SendKeys helpers
@@ -416,6 +424,9 @@ def _find_element(root, target: dict[str, Any]):
     if by not in attr_map:
         raise UIAError(f"Unknown selector strategy: {by!r}", code="INVALID_SELECTOR")
 
+    role_filter = str(target.get("role", "")).lower().replace(" ", "")
+    prefer_interactive = (by == "name" and not role_filter)
+
     kwarg_name, fallback_pred = attr_map[by]
     try:
         matches = root.descendants(**{kwarg_name: value})
@@ -432,6 +443,20 @@ def _find_element(root, target: dict[str, Any]):
         for elem in root.descendants():
             if _matches_msaa(elem, "legacy_name", value):
                 matches.append(elem)
+    if matches and role_filter:
+        def _win_role(e) -> str:
+            try:
+                return e.friendly_class_name().lower().replace(" ", "")
+            except Exception:
+                return ""
+        matches = [m for m in matches if _win_role(m) == role_filter]
+    elif matches and prefer_interactive:
+        def _win_role_key(e) -> int:
+            try:
+                return 0 if e.friendly_class_name().lower().replace(" ", "") in _WIN_INTERACTIVE_ROLES else 1
+            except Exception:
+                return 1
+        matches.sort(key=_win_role_key)
     if not matches:
         raise ElementNotFoundError(target)
     try:

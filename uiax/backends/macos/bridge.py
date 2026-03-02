@@ -229,8 +229,15 @@ class MacOSBridge(UIABridge):
         }
         by = strategy_remap.get(by, by)
 
+        role_filter = str(target.get("role", "")).lower()
+        prefer_interactive = (by == "name" and not role_filter)
+
         try:
-            return find_element(root, by=by, value=value, index=index)
+            return find_element(
+                root, by=by, value=value, index=index,
+                role_filter=role_filter,
+                prefer_interactive=prefer_interactive,
+            )
         except (LookupError, ValueError) as exc:
             raise ElementNotFoundError(target) from exc
 
