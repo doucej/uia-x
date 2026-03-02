@@ -366,3 +366,97 @@ class TestSelectorShorthand:
         """The existing {"by": ..., "value": ...} form is unchanged."""
         result = bridge.inspect({"by": "automation_id", "value": "btn_save"})
         assert result["name"] == "Save"
+
+
+# ---------------------------------------------------------------------------
+# find_all index / states tests  (agent-ux improvement #1/#2)
+# ---------------------------------------------------------------------------
+
+
+class TestFindAllIndexAndStates:
+    """Tests for the new 'index' field in find_all results."""
+
+    def test_find_all_returns_index_field(self, bridge: MockUIABridge):
+        """Every element returned by find_all must have a numeric 'index' field."""
+        items = bridge.find_all({"has_actions": True, "named_only": True})
+        assert len(items) > 0
+        for item in items:
+            assert "index" in item, f"Missing 'index' in {item}"
+            assert isinstance(item["index"], int)
+
+    def test_find_all_indices_are_sequential(self, bridge: MockUIABridge):
+        """Indices must be 0-based and consecutive."""
+        items = bridge.find_all({"has_actions": True, "named_only": True})
+        for i, item in enumerate(items):
+            assert item["index"] == i
+
+    def test_find_all_includes_name_and_role(self, bridge: MockUIABridge):
+        """Sanity check: basic fields are still present."""
+        items = bridge.find_all({"has_actions": True, "named_only": True})
+        assert any(it["name"] == "Save" for it in items)
+        for item in items:
+            assert "name" in item
+            assert "role" in item
+            assert "actions" in item
+
+    def test_find_all_empty_filter_returns_elements(self, bridge: MockUIABridge):
+        """Default filter (has_actions=True, named_only=True) returns something."""
+        items = bridge.find_all({})
+        assert len(items) > 0
+
+    def test_find_all_has_actions_false_includes_all(self, bridge: MockUIABridge):
+        """has_actions=False should return at least as many items as True."""
+        with_actions = bridge.find_all({"has_actions": True})
+        without_filter = bridge.find_all({"has_actions": False})
+        assert len(without_filter) >= len(with_actions)
+
+    def test_find_all_roles_filter(self, bridge: MockUIABridge):
+        """Roles filter restricts results to the named roles."""
+        items = bridge.find_all({"has_actions": True, "roles": ["button"]})
+        for item in items:
+            assert item["role"] == "button"
+
+    def test_find_all_value_field_present_when_set(self):
+        """Elements with a UIA value appear with 'value' key in find_all output."""
+        from mock_uia.tree import MockTree  # noqa: PLC0415
+        b = MockUIABridge(tree=MockTree.quicken())
+        # Quicken has elements with values set
+        items = b.find_all({"has_actions": False, "named_only": True})
+        valued = [it for it in items if it.get("value")]
+        # At least some quicken elements have values
+        assert len(valued) > 0
+        for item in valued:
+            assert "index" in item  # index must be present even on valued elements
+
+
+# ---------------------------------------------------------------------------
+# get_text optional target (agent-ux improvement #4)
+# ---------------------------------------------------------------------------
+
+
+class TestGetTextOptionalTarget:
+    """Tests for get_text with optional / None target."""
+
+    def test_get_text_no_args_returns_root(self, bridge: MockUIABridge):
+        """get_text() with no arguments returns root window text."""
+        text, source = bridge.get_text()
+        assert text == "Untitled - Notepad"
+        assert source == "name"
+
+    def test_get_text_none_target_returns_root(self, bridge: MockUIABridge):
+        """get_text(None) returns root window text (mock has no focus concept)."""
+        text, source = bridge.get_text(None)
+        assert text == "Untitled - Notepad"
+        assert source == "name"
+
+    def test_get_text_empty_dict_unchanged(self, bridge: MockUIABridge):
+        """get_text({}) still works as root selector (backward compat)."""
+        text, source = bridge.get_text({})
+        assert text == "Untitled - Notepad"
+        assert source == "name"
+
+    def test_get_text_explicit_target_still_works(self, bridge: MockUIABridge):
+        """Providing a target still selects the named element."""
+        text, source = bridge.get_text({"by": "name", "value": "Save"})
+        assert text == "Save"
+        assert source == "name"

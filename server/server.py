@@ -187,7 +187,12 @@ def process_list(
         "Attach to a specific window as the active automation target. "
         "Provide at least one criterion: pid, process_name, window_title, "
         "class_name, or hwnd.  Multiple criteria act as an AND filter. "
-        "The selected window becomes the target for all subsequent UIA calls."
+        "The selected window becomes the target for all subsequent UIA calls. "
+        "On success, a 'context' field may be present listing the currently-focused element "
+        "and any active toggle buttons (e.g. checked, pressed) — useful for detecting "
+        "whether a mode like 'second function' (x²) is active before you start. "
+        "Example: select_window(process_name='gnome-calculator') "
+        "Example: select_window(window_title='Calculator')"
     ),
 )
 def select_window(
@@ -218,7 +223,29 @@ def select_window(
             class_name=class_name,
             hwnd=hwnd,
         )
-        return {"ok": True, "window": _window_to_dict(win)}
+        result: dict[str, Any] = {"ok": True, "window": _window_to_dict(win)}
+        # Best-effort context snapshot: scan for active mode toggles and focused element
+        try:
+            bridge = _get_bridge()
+            items = bridge.find_all({"has_actions": True, "named_only": True})
+            focused = next(
+                (it["name"] for it in items if it.get("focused")), None
+            )
+            active_toggles = [
+                {"name": it["name"], "states": it.get("states", [])}
+                for it in items
+                if any(s in it.get("states", []) for s in ("checked", "pressed", "selected"))
+            ]
+            context: dict[str, Any] = {}
+            if focused:
+                context["focused_element"] = focused
+            if active_toggles:
+                context["active_toggles"] = active_toggles
+            if context:
+                result["context"] = context
+        except Exception:  # noqa: BLE001
+            pass  # context is optional; never break the attach
+        return result
     except UIAError as exc:
         return {"ok": False, "error": str(exc), "code": exc.code}
     except Exception as exc:  # noqa: BLE001
@@ -294,8 +321,13 @@ def uia_inspect(
         "regardless of how deeply nested it is. "
         "Essential for GTK4 and Electron apps where uia_inspect at a fixed depth "
         "returns an empty tree. "
-        "Each entry has 'name', 'role', and 'actions' fields. "
+        "Each entry has 'index', 'name', 'role', 'actions', and optionally 'states', "
+        "'focused', 'text', 'value' fields. "
+        "The 'states' list reveals toggle state (e.g. ['checked'] means active). "
         "Use the 'name' values directly with uia_invoke to click buttons. "
+        "Example: uia_find_all() lists all interactive elements. "
+        "Example: uia_find_all(has_actions=false) includes display labels to read values. "
+        "Example: uia_find_all(roles=['push button','toggle button']) shows only buttons. "
         "Filter by role with roles=['button'] or include display labels with "
         "has_actions=false to read the current value shown on screen."
     ),
@@ -360,12 +392,18 @@ def uia_find_all(
         "Click or activate a UI element by name. "
         "Use name='Button Name' with the exact name from uia_find_all. "
         "Example: uia_invoke(name='7') clicks the '7' button. "
-        "For advanced selectors pass target={'by':'role','value':'button'} instead."
+        "Example: uia_invoke(name='=') presses equals and returns the result when read_after=true. "
+        "Set read_after=true to read the focused element's text immediately after invoking "
+        "(useful for getting calculator results, updated labels, etc.). "
+        "For advanced selectors pass target={'by':'role','value':'button'} instead. "
+        "To invoke a specific element when multiple share the same name, use "
+        "target={'by':'name','value':'×','index':1} to pick the second one."
     ),
 )
 def uia_invoke(
     name: str = "",
     target: dict[str, Any] = {},  # noqa: B006
+    read_after: bool = False,
     api_key: str = "",
 ) -> dict[str, Any]:
     """
@@ -379,6 +417,10 @@ def uia_invoke(
         Use names from uia_find_all output.
     target : dict
         Full selector dict (used when name is not set).
+    read_after : bool
+        When True, read the focused element's text after invoking and include
+        it in the response as ``after_text`` / ``after_source``.  Useful after
+        pressing = or Enter to capture the calculator result in one round-trip.
     """
     auth_err = _check_auth(api_key)
     if auth_err:
@@ -390,7 +432,15 @@ def uia_invoke(
     try:
         bridge = _get_bridge()
         bridge.invoke(target)
-        return {"ok": True}
+        result: dict[str, Any] = {"ok": True}
+        if read_after:
+            try:
+                after_text, after_source = bridge.get_text(None)
+                result["after_text"] = after_text
+                result["after_source"] = after_source
+            except Exception:  # noqa: BLE001
+                pass
+        return result
     except UIAError as exc:
         return {"ok": False, "error": str(exc), "code": exc.code}
     except Exception as exc:  # noqa: BLE001
@@ -706,6 +756,70 @@ def mouse_click_tool(
 
 
 # ===================================================================
+# ===================================================================
+# Tool: uia_read_display
+# ===================================================================
+
+
+@mcp.tool(
+    name="uia_read_display",
+    description=(
+        "Read all visible text/values currently shown in the window without specifying a target. "
+        "Returns display-like elements (labels, text areas, result fields) that have non-empty "
+        "text or value content. Focused elements appear first. "
+        "Use this after invoking buttons to see what changed on screen. "
+        "Example: uia_read_display() after pressing = returns the calculator result. "
+        "More convenient than uia_get_text when you don't know the element name."
+    ),
+)
+def uia_read_display(
+    api_key: str = "",
+) -> dict[str, Any]:
+    """
+    Read all display text currently visible in the attached window.
+
+    Returns elements that have non-empty ``text`` or ``value`` fields, sorted
+    so that the focused element appears first.  Useful for reading a calculator
+    result, status label, or any dynamic display area without knowing its name.
+
+    Returns
+    -------
+    dict
+        ``{"ok": true, "count": N, "elements": [{"name":..., "role":...,
+        "text":..., "focused": true, ...}, ...]}``
+    """
+    auth_err = _check_auth(api_key)
+    if auth_err:
+        return auth_err
+    try:
+        bridge = _get_bridge()
+        all_items = bridge.find_all({
+            "has_actions": False,
+            "named_only": False,
+        })
+        # Keep only elements with actual content
+        candidates = [
+            item for item in all_items
+            if item.get("text") or item.get("value")
+        ]
+
+        def _rank(item: dict) -> int:
+            if item.get("focused"):
+                return 0
+            role = item.get("role", "")
+            if role in ("label", "text", "static text", "entry", "editable text"):
+                return 1
+            return 2
+
+        candidates.sort(key=_rank)
+        return {"ok": True, "count": len(candidates), "elements": candidates[:10]}
+    except UIAError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+
+# ===================================================================
 # Tool: uia_get_text
 # ===================================================================
 
@@ -713,19 +827,18 @@ def mouse_click_tool(
 @mcp.tool(
     name="uia_get_text",
     description=(
-        "Return the human-readable text of a single UI element without "
-        "dumping the full tree.  "
-        "Tries, in order: the UIA/AXAPI/AT-SPI value (ValuePattern / "
-        "AXValue / Value interface), then the accessible name, then "
-        "platform-specific text content.  "
+        "Return the human-readable text of a UI element without dumping the full tree. "
+        "When called with no target (or target={}), reads the currently-focused element "
+        "— ideal for capturing a calculator result after pressing =. "
+        "Example: uia_get_text() → {\"text\": \"5040\", \"source\": \"text\"} "
+        "Example: uia_get_text(target={\"by\":\"name\",\"value\":\"Display\"}) reads a named element. "
+        "Tries, in order: AT-SPI/UIA text content, value interface, then accessible name. "
         "Returns the first non-empty result together with a 'source' field "
-        "that identifies which property it came from.  "
-        "Useful for reading display labels such as a calculator result, "
-        "status bar text, or the current value of any control."
+        "that identifies which property it came from."
     ),
 )
 def uia_get_text(
-    target: dict[str, Any],
+    target: dict[str, Any] = {},  # noqa: B006
     api_key: str = "",
 ) -> dict[str, Any]:
     """
@@ -737,7 +850,7 @@ def uia_get_text(
         Selector describing which element to read.  Accepts all standard
         ``by`` strategies (``name``, ``automation_id``, ``control_type``,
         ``class_name``, ``path``, ``hwnd``, ``legacy_name``, ``legacy_role``,
-        ``child_id``).  Pass ``{}`` to read the root window.
+        ``child_id``).  Pass ``{}`` or omit to read the currently-focused element.
 
     Returns
     -------
@@ -755,7 +868,7 @@ def uia_get_text(
         return auth_err
     try:
         bridge = _get_bridge()
-        text, source = bridge.get_text(target)
+        text, source = bridge.get_text(target or None)
         return {"ok": True, "text": text, "source": source}
     except UIAError as exc:
         return {"ok": False, "error": str(exc), "code": exc.code}

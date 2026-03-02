@@ -41,11 +41,18 @@ from uiax.backends.linux.util import (
     send_keys_atspi,
     send_keys_xdotool,
     set_text_content,
+    state_names,
     type_text_atspi,
     type_text_xdotool,
 )
 
 _DEPTH_DEFAULT = 3
+
+# States that are meaningful to expose to agents
+_MEANINGFUL_STATES = frozenset({
+    "checked", "focused", "selected", "pressed",
+    "armed", "expanded", "collapsed", "active", "visited",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +298,7 @@ class LinuxBridge(UIABridge):
 
                 if include:
                     d: dict[str, Any] = {
+                        "index": len(results),
                         "name": name,
                         "role": node_role,
                         "actions": actions,
@@ -301,6 +309,11 @@ class LinuxBridge(UIABridge):
                     val = get_value(node)
                     if val is not None:
                         d["value"] = str(val)
+                    s = [st for st in state_names(node) if st in _MEANINGFUL_STATES]
+                    if s:
+                        d["states"] = s
+                        if "focused" in s:
+                            d["focused"] = True
                     results.append(d)
 
                 # Traverse children regardless of whether this node matched
@@ -449,7 +462,7 @@ class LinuxBridge(UIABridge):
     ) -> None:
         mouse_click_atspi(x, y, double=double, button=button)
 
-    def get_text(self, target: dict[str, Any]) -> tuple[str, str]:
+    def get_text(self, target: dict[str, Any] | None = None) -> tuple[str, str]:
         """
         Return the human-readable text of an AT-SPI accessible element.
 
@@ -459,8 +472,32 @@ class LinuxBridge(UIABridge):
            elements — this is what GNOME Calculator exposes for its result).
         2. AT-SPI ``Value`` interface (numeric or range value).
         3. Accessible ``name`` (human-readable label).
+
+        If *target* is ``None`` or an empty dict ``{}``, the tree is walked
+        to find the currently-focused element first; if none is found the
+        window root is used.
         """
-        acc = self._find(target)
+        if not target:
+            # Focus fallback: walk tree for the focused element
+            root = self._get_root()
+            acc = None
+            stack = [root]
+            while stack:
+                node = stack.pop()
+                try:
+                    if "focused" in state_names(node):
+                        acc = node
+                        break
+                    for i in range(node.childCount - 1, -1, -1):
+                        child = node.getChildAtIndex(i)
+                        if child is not None:
+                            stack.append(child)
+                except Exception:
+                    pass
+            if acc is None:
+                acc = root
+        else:
+            acc = self._find(target)
 
         # 1. Text interface
         text = get_text_content(acc)
