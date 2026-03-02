@@ -55,22 +55,21 @@ mcp = FastMCP(
     "uiax-automation",
     instructions=(
         "UI Automation MCP server (Linux AT-SPI2 / Windows UIA). "
-        "Workflow: "
-        "(1) call process_list to find the target application window, "
-        "(2) call select_window to attach to it, "
-        "(3) call uia_find_all to get a FLAT LIST of every named/interactive "
-        "element in the window — this is the most reliable way to discover "
-        "buttons, inputs, and controls, especially in GTK4/Electron apps where "
-        "uia_inspect at a fixed depth returns an empty or truncated tree, "
-        "(4) call uia_invoke with {'by': 'name', 'value': '<element name>'} to "
-        "click a button or activate a control discovered via uia_find_all. "
-        "Only fall back to uia_inspect when you need structural/hierarchical data "
-        "for a specific subtree. "
-        "NEVER use send_keys or type_text to drive buttons that are visible in "
-        "uia_find_all — always prefer uia_invoke on named elements. "
-        "Use send_keys / uia_send_keys only for keyboard shortcuts and "
-        "special-key sequences (Ctrl+S, Alt+F4, arrow keys, etc.). "
-        "Use type_text only for typing into text input fields."
+        "Standard workflow:\n"
+        "1. process_list — find the target application window\n"
+        "2. select_window — attach to it by hwnd or window_title\n"
+        "3. uia_find_all — get every named/interactive element as a flat list "
+        "(ALWAYS do this before invoking; GTK4/Electron trees are too deep for "
+        "uia_inspect at default depth)\n"
+        "4. uia_invoke(name='Button Name') — click a button found in step 3\n"
+        "5. uia_find_all(has_actions=False) — re-run to read display labels/values\n"
+        "\n"
+        "Key rules:\n"
+        "- uia_invoke takes name='...' directly: uia_invoke(name='7') NOT "
+        "uia_invoke(target={'by':'name','value':'7'})\n"
+        "- NEVER use send_keys/type_text to click buttons visible in uia_find_all\n"
+        "- send_keys is ONLY for keyboard shortcuts (Ctrl+S, Alt+F4, arrow keys)\n"
+        "- type_text is ONLY for typing into text input fields"
     ),
     host=_host,
     port=_port,
@@ -235,17 +234,15 @@ def select_window(
     name="uia_inspect",
     description=(
         "Inspect the UI Automation element tree of the active target window. "
-        "Returns a JSON snapshot of the matched element and its children up to "
-        "'depth' levels (default 3). "
+        "Pass name='ElementName' to inspect a specific element, or omit all "
+        "parameters to get the root window at depth=3. "
         "NOTE: GTK4 and Electron apps nest widgets 10-15 levels deep, so the "
         "root tree at depth=3 will appear empty or show only structural panels. "
-        "If the tree looks shallow or empty, switch to uia_find_all instead — "
-        "it walks the full tree regardless of depth and returns all named elements "
-        "as a flat list. Use uia_inspect only when you need hierarchical structure "
-        "for a specific known subtree."
+        "If the tree looks shallow or empty, use uia_find_all instead."
     ),
 )
 def uia_inspect(
+    name: str = "",
     target: dict[str, Any] = {},  # noqa: B006
     api_key: str = "",
 ) -> dict[str, Any]:
@@ -254,28 +251,26 @@ def uia_inspect(
 
     Parameters
     ----------
+    name : str
+        Shortcut: find an element by exact name and inspect it.
+        Equivalent to target={"by": "name", "value": name}.
     target : dict
-        Selector describing which element to inspect.  Supported keys:
+        Full selector dict (used when name is not set).  Supported keys:
 
-        ``by``    – selector strategy: ``"name"``, ``"automation_id"``,
-                    ``"control_type"``, ``"class_name"``, ``"path"``,
-                    ``"legacy_name"``, ``"legacy_role"``, ``"child_id"``,
-                    ``"hwnd"``
+        ``by``    – selector strategy: ``"name"``, ``"role"``, ``"name_substring"``,
+                    ``"automation_id"``, ``"control_type"``, ``"class_name"``,
+                    ``"path"``, ``"legacy_name"``, ``"legacy_role"``, ``"hwnd"``
         ``value`` – value for the chosen strategy
         ``depth`` – how many levels of children to expand (default 3)
         ``index`` – zero-based index for multiple matches (default 0)
 
         Pass an empty dict ``{}`` to return the root window.
-
-    Returns
-    -------
-    dict
-        ``{"ok": true, "element": {...}}`` on success or
-        ``{"ok": false, "error": "...", "code": "..."}`` on failure.
     """
     auth_err = _check_auth(api_key)
     if auth_err:
         return auth_err
+    if name and not target:
+        target = {"by": "name", "value": name}
     try:
         bridge = _get_bridge()
         element = bridge.inspect(target)
@@ -362,12 +357,15 @@ def uia_find_all(
 @mcp.tool(
     name="uia_invoke",
     description=(
-        "Invoke (click / activate) a UI Automation element in the target window. "
-        "The element must support the Invoke or Toggle pattern."
+        "Click or activate a UI element by name. "
+        "Use name='Button Name' with the exact name from uia_find_all. "
+        "Example: uia_invoke(name='7') clicks the '7' button. "
+        "For advanced selectors pass target={'by':'role','value':'button'} instead."
     ),
 )
 def uia_invoke(
-    target: dict[str, Any],
+    name: str = "",
+    target: dict[str, Any] = {},  # noqa: B006
     api_key: str = "",
 ) -> dict[str, Any]:
     """
@@ -375,12 +373,20 @@ def uia_invoke(
 
     Parameters
     ----------
+    name : str
+        Shortcut: invoke the element with this exact name.
+        Equivalent to target={"by": "name", "value": name}.
+        Use names from uia_find_all output.
     target : dict
-        Selector describing which element to invoke.
+        Full selector dict (used when name is not set).
     """
     auth_err = _check_auth(api_key)
     if auth_err:
         return auth_err
+    if name and not target:
+        target = {"by": "name", "value": name}
+    if not target:
+        return {"ok": False, "error": "Provide name='...' or target={...}", "code": "INVALID_ARGS"}
     try:
         bridge = _get_bridge()
         bridge.invoke(target)
