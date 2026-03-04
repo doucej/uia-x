@@ -335,7 +335,10 @@ def uia_inspect(
         "Example: uia_find_all(has_actions=false) includes display labels to read values. "
         "Example: uia_find_all(roles=['push button','toggle button']) shows only buttons. "
         "Filter by role with roles=['button'] or include display labels with "
-        "has_actions=false to read the current value shown on screen."
+        "has_actions=false to read the current value shown on screen. "
+        "Use name_contains='save' to search by name (case-insensitive substring). "
+        "Results are paginated: limit (default 50) and offset control paging. "
+        "Response includes total, count, offset, has_more for navigation."
     ),
 )
 def uia_find_all(
@@ -343,6 +346,9 @@ def uia_find_all(
     has_actions: bool = True,
     named_only: bool = True,
     target: dict[str, Any] = {},  # noqa: B006  # optional subtree root
+    name_contains: str = "",
+    limit: int = 50,
+    offset: int = 0,
     api_key: str = "",
 ) -> dict[str, Any]:
     """
@@ -362,12 +368,25 @@ def uia_find_all(
     target : dict
         Optional selector for a subtree root — same format as uia_inspect.
         Omit (or pass ``{}``) to search the whole window.
+    name_contains : str
+        Case-insensitive substring filter on element names.  Only elements
+        whose name contains this string are returned.  Empty string
+        (default) disables the filter.
+    limit : int
+        Maximum number of elements to return per page (default 50).
+    offset : int
+        Number of matching elements to skip (default 0).  Use with *limit*
+        to paginate through large result sets.
 
     Returns
     -------
     dict
-        ``{"ok": true, "count": N, "elements": [{"name": ..., "role": ...,
-        "actions": [...], "text": ..., "value": ...}, ...]}``
+        ``{"ok": true, "total": M, "count": N, "offset": 0,
+        "has_more": false, "elements": [...]}``
+
+        *total* is the full number of matching elements; *count* is how
+        many are in this page; *has_more* indicates whether further pages
+        exist.
     """
     auth_err = _check_auth(api_key)
     if auth_err:
@@ -380,7 +399,21 @@ def uia_find_all(
             "named_only": named_only,
             "root": target or None,
         })
-        return {"ok": True, "count": len(items), "elements": items}
+        # Server-side name search
+        if name_contains:
+            _q = name_contains.lower()
+            items = [e for e in items if _q in e.get("name", "").lower()]
+        total = len(items)
+        # Pagination
+        page = items[offset : offset + limit]
+        return {
+            "ok": True,
+            "total": total,
+            "count": len(page),
+            "offset": offset,
+            "has_more": offset + limit < total,
+            "elements": page,
+        }
     except UIAError as exc:
         return {"ok": False, "error": str(exc), "code": exc.code}
     except Exception as exc:  # noqa: BLE001
@@ -816,7 +849,7 @@ def uia_read_display(
             if item.get("focused"):
                 return 0
             role = item.get("role", "")
-            if role in ("label", "text", "static text", "entry", "editable text"):
+            if role in ("label", "text", "static text", "static", "entry", "editable text"):
                 return 1
             return 2
 

@@ -191,9 +191,9 @@ def get_bridge(backend: str = "real") -> UIABridge:
         return MacOSBridge()
 
     # Default: Windows UIA backend
-    from server.real_bridge import RealUIABridge  # noqa: PLC0415
+    from server.win_bridge import WinUIABridge  # noqa: PLC0415
 
-    return RealUIABridge()
+    return WinUIABridge()
 
 
 def _is_linux() -> bool:

@@ -1,0 +1,17 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "uia_read_display",
+  "description": "Read all visible text/values currently shown in the window. Returns display-like elements sorted by relevance (focused first).",
+  "type": "object",
+  "properties": {
+    "api_key": {
+      "type": "string",
+      "description": "API key for authentication."
+    }
+  },
+  "required": [],
+  "additionalProperties": false,
+  "examples": [
+    {}
+  ]
+}

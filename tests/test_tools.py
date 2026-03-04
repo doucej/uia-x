@@ -467,3 +467,121 @@ class TestGetTextOptionalTarget:
         text, source = bridge.get_text({"by": "name", "value": "Save"})
         assert text == "Save"
         assert source == "name"
+
+
+# ---------------------------------------------------------------------------
+# uia_find_all server-side pagination / search (agent-ux improvement)
+# ---------------------------------------------------------------------------
+
+
+class TestFindAllPagination:
+    """Tests for server-side pagination, name search, and response envelope."""
+
+    def test_pagination_default_limit(self, bridge: MockUIABridge):
+        """Default limit=50 returns at most 50 elements, with total/has_more."""
+        from unittest.mock import patch
+
+        from server.server import uia_find_all
+
+        with patch("server.server._get_bridge", return_value=bridge), \
+             patch("server.server._check_auth", return_value=None):
+            result = uia_find_all()
+        assert result["ok"] is True
+        assert "total" in result
+        assert "count" in result
+        assert "offset" in result
+        assert "has_more" in result
+        assert result["offset"] == 0
+        assert result["count"] <= 50
+
+    def test_pagination_limit_works(self, bridge: MockUIABridge):
+        """Setting limit=3 returns at most 3 elements."""
+        from unittest.mock import patch
+
+        from server.server import uia_find_all
+
+        with patch("server.server._get_bridge", return_value=bridge), \
+             patch("server.server._check_auth", return_value=None):
+            result = uia_find_all(limit=3)
+        assert result["ok"] is True
+        assert result["count"] <= 3
+        assert len(result["elements"]) <= 3
+
+    def test_pagination_offset_skips(self, bridge: MockUIABridge):
+        """Offset skips leading elements."""
+        from unittest.mock import patch
+
+        from server.server import uia_find_all
+
+        with patch("server.server._get_bridge", return_value=bridge), \
+             patch("server.server._check_auth", return_value=None):
+            full = uia_find_all(limit=1000)
+            page2 = uia_find_all(limit=2, offset=2)
+        assert page2["offset"] == 2
+        if full["total"] > 2:
+            assert page2["elements"][0] == full["elements"][2]
+
+    def test_pagination_has_more_flag(self, bridge: MockUIABridge):
+        """has_more is True when more elements exist beyond the page."""
+        from unittest.mock import patch
+
+        from server.server import uia_find_all
+
+        with patch("server.server._get_bridge", return_value=bridge), \
+             patch("server.server._check_auth", return_value=None):
+            result = uia_find_all(limit=1)
+        if result["total"] > 1:
+            assert result["has_more"] is True
+
+    def test_pagination_no_more_at_end(self, bridge: MockUIABridge):
+        """has_more is False when all elements fit on the page."""
+        from unittest.mock import patch
+
+        from server.server import uia_find_all
+
+        with patch("server.server._get_bridge", return_value=bridge), \
+             patch("server.server._check_auth", return_value=None):
+            result = uia_find_all(limit=10000)
+        assert result["has_more"] is False
+        assert result["count"] == result["total"]
+
+    def test_name_contains_filters(self, bridge: MockUIABridge):
+        """name_contains filters elements by case-insensitive substring."""
+        from unittest.mock import patch
+
+        from server.server import uia_find_all
+
+        with patch("server.server._get_bridge", return_value=bridge), \
+             patch("server.server._check_auth", return_value=None):
+            result = uia_find_all(name_contains="save", has_actions=True)
+        assert result["ok"] is True
+        for el in result["elements"]:
+            assert "save" in el["name"].lower()
+
+    def test_name_contains_empty_returns_all(self, bridge: MockUIABridge):
+        """Empty name_contains does not filter anything."""
+        from unittest.mock import patch
+
+        from server.server import uia_find_all
+
+        with patch("server.server._get_bridge", return_value=bridge), \
+             patch("server.server._check_auth", return_value=None):
+            with_filter = uia_find_all(name_contains="", limit=10000)
+            without_filter = uia_find_all(limit=10000)
+        assert with_filter["total"] == without_filter["total"]
+
+    def test_name_contains_with_pagination(self, bridge: MockUIABridge):
+        """name_contains and pagination work together correctly."""
+        from unittest.mock import patch
+
+        from server.server import uia_find_all
+
+        with patch("server.server._get_bridge", return_value=bridge), \
+             patch("server.server._check_auth", return_value=None):
+            # Get all matching
+            full = uia_find_all(name_contains="save", limit=10000)
+            # Get first page only
+            page1 = uia_find_all(name_contains="save", limit=1)
+        assert page1["total"] == full["total"]
+        if full["total"] > 0:
+            assert page1["elements"][0] == full["elements"][0]
