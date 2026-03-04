@@ -43,6 +43,7 @@ from uiax.backends.macos.util import (
     require_axapi,
     role_name,
     send_keys_quartz,
+    state_names,
     type_text_quartz,
 )
 
@@ -244,6 +245,69 @@ class MacOSBridge(UIABridge):
     # ------------------------------------------------------------------
     # UIABridge implementation
     # ------------------------------------------------------------------
+
+    # States considered meaningful enough to surface in find_all output
+    _MEANINGFUL_STATES = frozenset({
+        "focused", "checked", "selected", "expanded", "collapsed", "disabled",
+    })
+
+    def find_all(self, filter: dict[str, Any]) -> list[dict[str, Any]]:
+        """
+        DFS the full AXAPI tree and return every named/interactive element
+        as a flat list.  Mirrors the Linux and Windows find_all() behaviour.
+        """
+        named_only = bool(filter.get("named_only", True))
+        must_have_actions = bool(filter.get("has_actions", True))
+        roles_filter = [r.lower() for r in (filter.get("roles") or [])]
+        root_target = filter.get("root") or {}
+
+        root = self._find(root_target) if root_target else self._get_root()
+
+        results: list[dict[str, Any]] = []
+        name_counts: dict[str, int] = {}
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            try:
+                name = get_title(node) or get_description(node) or ""
+                node_role = role_name(node)
+                actions = ax_action_names(node)
+
+                include = True
+                if named_only and not name:
+                    include = False
+                if roles_filter and node_role not in roles_filter:
+                    include = False
+                if must_have_actions and not actions:
+                    include = False
+
+                if include:
+                    per_name_idx = name_counts.get(name, 0)
+                    name_counts[name] = per_name_idx + 1
+                    d: dict[str, Any] = {
+                        "index": per_name_idx,
+                        "name": name,
+                        "role": node_role,
+                        "actions": actions,
+                    }
+                    val = get_value(node)
+                    if val is not None:
+                        d["value"] = str(val)
+                        d["text"] = str(val)
+                    s = [st for st in state_names(node) if st in self._MEANINGFUL_STATES]
+                    if s:
+                        d["states"] = s
+                        if "focused" in s:
+                            d["focused"] = True
+                    results.append(d)
+
+                # Traverse children regardless of whether this node matched
+                for child in reversed(get_children(node)):
+                    stack.append(child)
+            except Exception:  # noqa: BLE001
+                pass
+
+        return results
 
     def inspect(self, target: dict[str, Any]) -> dict[str, Any]:
         depth = int(target.get("depth", _DEPTH_DEFAULT)) if target else _DEPTH_DEFAULT
