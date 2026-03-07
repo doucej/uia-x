@@ -1,0 +1,58 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "uia_find_all",
+  "description": "Discover all interactive UI elements in the attached window. Returns a paginated, filterable flat list.",
+  "type": "object",
+  "properties": {
+    "api_key": {
+      "type": "string",
+      "description": "API key for authentication."
+    },
+    "roles": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": [],
+      "description": "Restrict results to these AT-SPI/UIA roles, e.g. [\"push button\", \"check box\"]. Empty list returns all."
+    },
+    "has_actions": {
+      "type": "boolean",
+      "default": true,
+      "description": "When true (default), only return elements with at least one invokable action."
+    },
+    "named_only": {
+      "type": "boolean",
+      "default": true,
+      "description": "When true (default), skip elements without a name."
+    },
+    "target": {
+      "$ref": "target.json",
+      "description": "Optional selector for a subtree root. Omit or pass {} to search the whole window."
+    },
+    "name_contains": {
+      "type": "string",
+      "default": "",
+      "description": "Case-insensitive substring filter on element names. Empty string disables the filter."
+    },
+    "limit": {
+      "type": "integer",
+      "default": 50,
+      "minimum": 1,
+      "description": "Maximum number of elements to return per page."
+    },
+    "offset": {
+      "type": "integer",
+      "default": 0,
+      "minimum": 0,
+      "description": "Number of matching elements to skip. Use with limit to paginate."
+    }
+  },
+  "required": [],
+  "additionalProperties": false,
+  "examples": [
+    {},
+    { "roles": ["button"], "limit": 20 },
+    { "has_actions": false, "named_only": false },
+    { "name_contains": "save", "limit": 10 },
+    { "roles": ["push button"], "offset": 50, "limit": 50 }
+  ]
+}

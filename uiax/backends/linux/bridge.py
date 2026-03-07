@@ -41,11 +41,29 @@ from uiax.backends.linux.util import (
     send_keys_atspi,
     send_keys_xdotool,
     set_text_content,
+    state_names,
     type_text_atspi,
     type_text_xdotool,
 )
 
 _DEPTH_DEFAULT = 3
+
+# States that are meaningful to expose to agents
+_MEANINGFUL_STATES = frozenset({
+    "checked", "focused", "selected", "pressed",
+    "armed", "expanded", "collapsed", "active", "visited",
+})
+
+# Actions that indicate a text/label widget (clipboard handling) rather than a
+# real interactive UI element.  An element whose entire action set consists of
+# only these is treated as non-interactive for the purposes of has_actions=True.
+_CLIPBOARD_ONLY_ACTIONS = frozenset({
+    "clipboard.copy", "clipboard.paste", "clipboard.cut",
+    "clipboard.selectall", "clipboard.select-all",
+    "selection.select-all", "selection.delete",
+    "link.open", "link.copy",
+    "menu.popup",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -249,9 +267,18 @@ class LinuxBridge(UIABridge):
             "legacy_role": "role",         # MSAA role → AT-SPI role
         }
         by = strategy_remap.get(by, by)
+        role_filter = str(target.get("role", "")).lower()
+        # When searching by name with no explicit role constraint, prefer
+        # interactive elements (buttons, menu items, …) over passive display
+        # elements (labels, history entries, …) that happen to share the name.
+        prefer_interactive = (by == "name" and not role_filter)
 
         try:
-            return find_accessible(root, by=by, value=value, index=index)
+            return find_accessible(
+                root, by=by, value=value, index=index,
+                role_filter=role_filter,
+                prefer_interactive=prefer_interactive,
+            )
         except (LookupError, ValueError) as exc:
             raise ElementNotFoundError(target) from exc
 
@@ -273,6 +300,10 @@ class LinuxBridge(UIABridge):
         acc = self._find(root_target) if root_target else self._get_root()
 
         results: list[dict[str, Any]] = []
+        # Tracks how many elements with the same name have been seen so far.
+        # The per-name count becomes the 'index' field, which maps 1:1 to the
+        # 'index' selector parameter in uia_invoke / _find().
+        name_counts: dict[str, int] = {}
         stack = [acc]
         while stack:
             node = stack.pop()
@@ -288,9 +319,20 @@ class LinuxBridge(UIABridge):
                     include = False
                 if must_have_actions and not actions:
                     include = False
+                # Exclude elements whose only actions are clipboard/text-management
+                # operations — they are content labels, not interactive controls.
+                if must_have_actions and actions and all(
+                    a.lower().replace(" ", "") in {x.replace("-", "").replace(".", "") for x in _CLIPBOARD_ONLY_ACTIONS}
+                    or a.lower() in _CLIPBOARD_ONLY_ACTIONS
+                    for a in actions
+                ):
+                    include = False
 
                 if include:
+                    per_name_idx = name_counts.get(name, 0)
+                    name_counts[name] = per_name_idx + 1
                     d: dict[str, Any] = {
+                        "index": per_name_idx,
                         "name": name,
                         "role": node_role,
                         "actions": actions,
@@ -301,6 +343,11 @@ class LinuxBridge(UIABridge):
                     val = get_value(node)
                     if val is not None:
                         d["value"] = str(val)
+                    s = [st for st in state_names(node) if st in _MEANINGFUL_STATES]
+                    if s:
+                        d["states"] = s
+                        if "focused" in s:
+                            d["focused"] = True
                     results.append(d)
 
                 # Traverse children regardless of whether this node matched
@@ -449,7 +496,7 @@ class LinuxBridge(UIABridge):
     ) -> None:
         mouse_click_atspi(x, y, double=double, button=button)
 
-    def get_text(self, target: dict[str, Any]) -> tuple[str, str]:
+    def get_text(self, target: dict[str, Any] | None = None) -> tuple[str, str]:
         """
         Return the human-readable text of an AT-SPI accessible element.
 
@@ -459,8 +506,32 @@ class LinuxBridge(UIABridge):
            elements — this is what GNOME Calculator exposes for its result).
         2. AT-SPI ``Value`` interface (numeric or range value).
         3. Accessible ``name`` (human-readable label).
+
+        If *target* is ``None`` or an empty dict ``{}``, the tree is walked
+        to find the currently-focused element first; if none is found the
+        window root is used.
         """
-        acc = self._find(target)
+        if not target:
+            # Focus fallback: walk tree for the focused element
+            root = self._get_root()
+            acc = None
+            stack = [root]
+            while stack:
+                node = stack.pop()
+                try:
+                    if "focused" in state_names(node):
+                        acc = node
+                        break
+                    for i in range(node.childCount - 1, -1, -1):
+                        child = node.getChildAtIndex(i)
+                        if child is not None:
+                            stack.append(child)
+                except Exception:
+                    pass
+            if acc is None:
+                acc = root
+        else:
+            acc = self._find(target)
 
         # 1. Text interface
         text = get_text_content(acc)

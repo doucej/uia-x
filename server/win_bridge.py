@@ -78,7 +78,15 @@ _SELECTOR_STRATEGIES = {
 } | _MSAA_STRATEGIES
 
 # Keys that carry plumbing metadata, not selector values.
-_META_KEYS = {"by", "value", "index", "depth"}
+_META_KEYS = {"by", "value", "index", "depth", "role"}
+
+# Windows control types (friendly_class_name()) that represent interactive controls.
+_WIN_INTERACTIVE_ROLES = frozenset({
+    "button", "checkbox", "radiobutton", "combobox", "listitem",
+    "menuitem", "edit", "richedit", "richedit20", "treeitem",
+    "tabitem", "hyperlink", "slider", "spinner", "toolbar",
+    "calendar", "timepicker",
+})
 
 # ---------------------------------------------------------------------------
 # SendKeys helpers
@@ -416,6 +424,9 @@ def _find_element(root, target: dict[str, Any]):
     if by not in attr_map:
         raise UIAError(f"Unknown selector strategy: {by!r}", code="INVALID_SELECTOR")
 
+    role_filter = str(target.get("role", "")).lower().replace(" ", "")
+    prefer_interactive = (by == "name" and not role_filter)
+
     kwarg_name, fallback_pred = attr_map[by]
     try:
         matches = root.descendants(**{kwarg_name: value})
@@ -432,6 +443,20 @@ def _find_element(root, target: dict[str, Any]):
         for elem in root.descendants():
             if _matches_msaa(elem, "legacy_name", value):
                 matches.append(elem)
+    if matches and role_filter:
+        def _win_role(e) -> str:
+            try:
+                return e.friendly_class_name().lower().replace(" ", "")
+            except Exception:
+                return ""
+        matches = [m for m in matches if _win_role(m) == role_filter]
+    elif matches and prefer_interactive:
+        def _win_role_key(e) -> int:
+            try:
+                return 0 if e.friendly_class_name().lower().replace(" ", "") in _WIN_INTERACTIVE_ROLES else 1
+            except Exception:
+                return 1
+        matches.sort(key=_win_role_key)
     if not matches:
         raise ElementNotFoundError(target)
     try:
@@ -448,6 +473,120 @@ def _find_element(root, target: dict[str, Any]):
 class WinUIABridge(UIABridge):
     """Live Windows UIA bridge using pywinauto (UIA + MSAA).⁠"""
 
+
+    def find_all(self, filter: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: A002
+        """Return a flat list of every named/interactive element in the window."""
+        root = _attach_target()
+        named_only = bool(filter.get("named_only", True))
+        must_have_actions = bool(filter.get("has_actions", True))
+        roles_filter = [r.lower() for r in (filter.get("roles") or [])]
+        root_target = filter.get("root") or {}
+        if root_target:
+            root = _find_element(root, root_target)
+
+        try:
+            all_elements = list(root.descendants())
+        except Exception:
+            all_elements = []
+
+        results: list[dict[str, Any]] = []
+        name_counts: dict[str, int] = {}
+
+        for elem in all_elements:
+            name = ""
+            try:
+                name = elem.window_text() or ""
+            except Exception:
+                pass
+
+            role = ""
+            try:
+                role = elem.friendly_class_name().lower()
+            except Exception:
+                pass
+
+            # Actions: derive from supported UIA patterns
+            actions: list[str] = []
+            try:
+                patterns = [p for p in (elem.iface_patterns or []) if p is not None]
+            except Exception:
+                patterns = []
+            if "InvokePattern" in patterns:
+                actions.append("click")
+            if "TogglePattern" in patterns:
+                actions.append("toggle")
+            if "ExpandCollapsePattern" in patterns:
+                actions.append("expand")
+            if "SelectionItemPattern" in patterns:
+                actions.append("select")
+            # Owner-drawn / MSAA-only controls
+            if not actions:
+                try:
+                    raw = elem.legacy_properties() or {}
+                    if raw.get("DefaultAction"):
+                        actions.append("do default action")
+                except Exception:
+                    pass
+
+            # Apply filters
+            if named_only and not name:
+                continue
+            if roles_filter and role not in roles_filter:
+                continue
+            if must_have_actions and not actions:
+                continue
+
+            # Value (ValuePattern / editable fields)
+            value = None
+            try:
+                v = elem.iface_value.CurrentValue
+                if v is not None:
+                    value = str(v)
+            except Exception:
+                pass
+
+            # States + focused
+            states: list[str] = []
+            focused = False
+            try:
+                raw = elem.legacy_properties() or {}
+                state = raw.get("State", 0) or 0
+                if state & _STATE_FOCUSED:
+                    focused = True
+                if state & _STATE_SELECTED:
+                    states.append("selected")
+                if state & _STATE_CHECKED:
+                    states.append("checked")
+            except Exception:
+                pass
+            try:
+                if elem.has_keyboard_focus():
+                    focused = True
+            except Exception:
+                pass
+            if focused:
+                states.append("focused")
+
+            per_name_idx = name_counts.get(name, 0)
+            name_counts[name] = per_name_idx + 1
+
+            d: dict[str, Any] = {
+                "index": per_name_idx,
+                "name": name,
+                "role": role,
+                "actions": actions,
+            }
+            if value is not None:
+                d["value"] = value
+            if name:
+                d["text"] = name
+            if states:
+                d["states"] = states
+            if focused:
+                d["focused"] = True
+            results.append(d)
+
+        return results
     def inspect(self, target: dict[str, Any]) -> dict[str, Any]:
         root = _attach_target()
         selector = {k: v for k, v in target.items() if k != "depth"} if target else {}

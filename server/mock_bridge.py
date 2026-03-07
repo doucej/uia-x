@@ -127,7 +127,52 @@ class MockUIABridge(UIABridge):
     # ------------------------------------------------------------------
 
     def find_all(self, filter: dict[str, Any]) -> list[dict[str, Any]]:
-        return []
+        named_only = bool(filter.get("named_only", True))
+        must_have_actions = bool(filter.get("has_actions", True))
+        roles_filter = [r.lower() for r in (filter.get("roles") or [])]
+
+        # Walk _from_ root_target if specified, else full tree
+        root_target = filter.get("root") or {}
+        root_elem = self._find(root_target) if root_target else self._tree.root
+
+        results: list[dict[str, Any]] = []
+        name_counts: dict[str, int] = {}
+        stack = [root_elem]
+        while stack:
+            elem = stack.pop()
+            name = elem.name or ""
+            node_role = elem.control_type.lower()
+            actions: list[str] = []
+            if elem.invokable:
+                actions.append("click")
+            if elem.legacy_invokable:
+                actions.append("do default action")
+
+            include = True
+            if named_only and not name:
+                include = False
+            if roles_filter and node_role not in roles_filter:
+                include = False
+            if must_have_actions and not actions:
+                include = False
+
+            if include:
+                per_name_idx = name_counts.get(name, 0)
+                name_counts[name] = per_name_idx + 1
+                d: dict[str, Any] = {
+                    "index": per_name_idx,
+                    "name": name,
+                    "role": node_role,
+                    "actions": actions,
+                }
+                if elem.value:
+                    d["value"] = elem.value
+                results.append(d)
+
+            for child in reversed(elem.children):
+                stack.append(child)
+
+        return results
 
     def inspect(self, target: dict[str, Any]) -> dict[str, Any]:
         depth = int(target.get("depth", 3)) if target else 3
@@ -173,13 +218,14 @@ class MockUIABridge(UIABridge):
             {"x": x, "y": y, "double": double, "button": button}
         )
 
-    def get_text(self, target: dict[str, Any]) -> tuple[str, str]:
+    def get_text(self, target: dict[str, Any] | None = None) -> tuple[str, str]:
         """
         Return the human-readable text of a mock element.
 
         Priority: UIA ``value`` → MSAA ``legacy_value`` → accessible ``name``.
+        When *target* is ``None`` or an empty dict, returns the root element's text.
         """
-        element = self._find(target)
+        element = self._find(target or {})
         if element.value:
             return element.value, "value"
         if element.legacy_value:

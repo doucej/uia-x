@@ -29,6 +29,18 @@ from uiax.backends.linux.util import (
 # Node data class
 # ---------------------------------------------------------------------------
 
+# AT-SPI roles that indicate an element is interactive (a control the user
+# can activate), as opposed to a passive display element (label, text, etc.).
+# When multiple elements share the same accessible name, interactive ones are
+# preferred by find_accessible so that uia_invoke(name='=') hits the button
+# rather than a history label also named '='.
+_INTERACTIVE_ROLES = frozenset({
+    "button", "push button", "toggle button", "check box", "radio button",
+    "combo box", "list item", "menu item", "menu", "spin button",
+    "slider", "scroll bar", "entry", "password text", "text",
+    "tree item", "table cell", "page tab", "link",
+})
+
 
 @dataclass
 class Node:
@@ -214,6 +226,8 @@ def find_accessible(
     by: str = "name",
     value: str = "",
     index: int = 0,
+    role_filter: str = "",
+    prefer_interactive: bool = False,
 ) -> Any:
     """
     Locate an accessible descendant matching the given selector.
@@ -229,6 +243,16 @@ def find_accessible(
         Value to match against.
     index : int
         Zero-based index among matches.
+    role_filter : str
+        Optional additional role constraint.  When non-empty, only elements
+        whose AT-SPI role matches this string (case-insensitive) are counted
+        toward *index*.  Useful when multiple element types share a name
+        (e.g. a digit button ``'8'`` and a history label ``'8'``).
+    prefer_interactive : bool
+        When True and no *role_filter* is given, elements with interactive
+        roles (button, check box, menu item, …) are sorted before passive
+        display elements (label, static text, …) so that ``index=0`` returns
+        the actionable control rather than a same-named content label.
 
     Returns
     -------
@@ -258,14 +282,28 @@ def find_accessible(
     if predicate is None:
         raise ValueError(f"Unknown selector strategy: {by!r}")
 
+    if role_filter:
+        role_constraint = role_filter.lower()
+        base_pred = predicate
+        predicate = lambda acc: base_pred(acc) and role_name(acc) == role_constraint  # noqa: E731
+
     matches = _collect_matches(root, predicate)
     if not matches:
-        raise LookupError(f"No accessible matched by={by!r} value={value!r}")
+        detail = f" role={role_filter!r}" if role_filter else ""
+        raise LookupError(f"No accessible matched by={by!r} value={value!r}{detail}")
+
+    # Re-order so interactive elements come first (stable sort preserves DFS
+    # order within each tier), but only when the caller hasn't already applied
+    # an explicit role constraint.
+    if prefer_interactive and not role_filter:
+        matches.sort(key=lambda acc: 0 if role_name(acc) in _INTERACTIVE_ROLES else 1)
+
     try:
         return matches[index]
     except IndexError:
+        detail = f" role={role_filter!r}" if role_filter else ""
         raise LookupError(
-            f"Only {len(matches)} match(es) for by={by!r} value={value!r}, "
+            f"Only {len(matches)} match(es) for by={by!r} value={value!r}{detail}, "
             f"but index={index} was requested."
         ) from None
 

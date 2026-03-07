@@ -156,6 +156,21 @@ def build_element_dict(element: Any, depth: int = 3) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Interactive role set (used by prefer_interactive)
+# ---------------------------------------------------------------------------
+
+_MACOS_INTERACTIVE_ROLES = frozenset({
+    "button", "radio button", "check box", "pop up button", "menu button",
+    "text field", "text area",
+    "slider", "scroll bar", "combo box",
+    "disclosure triangle", "link",
+    "menu item", "menu",
+    "tab", "cell", "row",
+    "color well", "value indicator",
+})
+
+
+# ---------------------------------------------------------------------------
 # Find element by criteria
 # ---------------------------------------------------------------------------
 
@@ -166,6 +181,8 @@ def find_element(
     by: str = "name",
     value: str = "",
     index: int = 0,
+    role_filter: str = "",
+    prefer_interactive: bool = False,
 ) -> Any:
     """
     Locate an AXUIElement descendant matching the given selector.
@@ -215,6 +232,10 @@ def find_element(
         raise ValueError(f"Unknown selector strategy: {by!r}")
 
     matches = _collect_matches(root, predicate)
+    if role_filter:
+        matches = [m for m in matches if role_name(m) == role_filter]
+    elif prefer_interactive:
+        matches.sort(key=lambda m: 0 if role_name(m) in _MACOS_INTERACTIVE_ROLES else 1)
     if not matches:
         raise LookupError(f"No element matched by={by!r} value={value!r}")
     try:
