@@ -1646,3 +1646,127 @@ uia_invoke({"name": "File"})
 ```
 
 ---
+
+## 25. Full UI Tree (depth=3, probes 5-7 confirmed)
+
+### 25.1 Complete Win32 Window Hierarchy
+
+```
+QFRAME "Quicken Classic Premier - ... - [Current View]"
+├── QW_BAG_TOOLBAR
+│   └── QW_MAIN_TOOLBAR
+│       ├── [Static] (various toolbar icons)
+│       └── QC_button "More"
+├── ToolbarWindow32  (navigation/search toolbar)
+│   ├── QC_button  (back/forward nav)
+│   ├── [Static]
+│   ├── QWPanel "Panel"  (search bar container)
+│   │   ├── QWIconDisplay, QC_button, Edit (search input), QWIconDisplay
+│   ├── QC_button × 10  (toolbar actions, no text)
+│   └── QWComboBox (account selector)
+├── ToolbarWindow32  (menu bar — NOTE: menu items are MSAA-only, not Win32 child HWNDs)
+├── MDIClient  (main content workspace)
+│   ├── QWMDI "Home"       (always present)
+│   ├── QWMDI "Spending"   (added when SPENDING clicked)
+│   ├── QWMDI "Mobile & Web"
+│   └── ...more QWMDI panes per tab
+├── HwndWrapper "RenderAppBanner"  (Electron/WebView2 component)
+├── HwndWrapper "MCPAppBanner"     (Electron/WebView2 component)
+└── QWNavigator  (left sidebar nav)
+    ├── QC_button "HOME"
+    ├── QC_button "SPENDING"
+    ├── QC_button "BILLS & INCOME"
+    ├── QC_button "PLANNING"
+    ├── QC_button "INVESTING"
+    ├── QC_button "PROPERTY & DEBT"
+    ├── QC_button "MOBILE & WEB"
+    ├── QC_button "REPORTS & GRAPHS"
+    ├── [Static] (separator)
+    ├── QC_button "Dashboard"
+    ├── QC_button × N  (unnamed sidebar items)
+    ├── QC_button "Update now"
+    ├── QC_button "ACCOUNTS"
+    ├── QC_button × N  (account list items — use uia_inspect depth to get names)
+    ├── QWNavBtnTray
+    │   ├── QWAcctBarHolder  (account bar)
+    │   ├── QC_button "Net Worth"
+    │   └── QC_button "Credit Score"
+    ├── QSideBar "QSideBar"
+    │   ├── QC_button, [Static], pane, pane
+    │   └── HwndWrapper "LaunchPad"  (Electron/WebView2)
+    └── [Static]
+```
+
+### 25.2 Navigation — Tab → QWMDI Mapping
+
+Each navigation click creates a **new QWMDI child** in MDIClient (or switches to existing):
+
+| Nav Button | QWMDI Title | Notes |
+|-----------|-------------|-------|
+| HOME | "Home" | Always present |
+| SPENDING | "Spending" | Created on first click |
+| BILLS & INCOME | "Bills & Income" | ~15s first load |
+| PLANNING | "Planning" | — |
+| INVESTING | "Investing" | — |
+| MOBILE & WEB | "Mobile & Web" | Always present (WebView) |
+
+**Detection pattern**: After invoking a nav button, check that `uia_inspect(depth=1)`
+shows the expected QWMDI title in `MDIClient` children.
+
+### 25.3 Updated Tool Performance (probes 5-7)
+
+| Tool | Time | Notes |
+|------|------|-------|
+| `uia_find_all(roles=["button"], named_only=True)` | **4.9–6.6s** | Win32 path |
+| `uia_inspect(depth=2)` | **2.0–3.6s** | Win32 `_win32_inspect_tree` |
+| `uia_inspect(depth=3)` | **2.0s** | Win32 path (no COM at all) |
+| `uia_invoke(hwnd=QC_button_hwnd)` | **3.1–8.7s** | UIA/MSAA via `_win32_element_from_hwnd` |
+| `uia_invoke(hwnd=native_button_hwnd)` | **<1s** | BM_CLICK direct |
+
+> **Note**: `uia_invoke(hwnd=QC_button)` uses `_win32_element_from_hwnd` (O(1) UIA wrap)
+> then tries UIA InvokePattern → MSAA DoDefaultAction. ~3-9s (COM/MSAA path).
+> BM_CLICK is only used for native Win32 `button` class controls.
+
+### 25.4 Menu Bar Access
+
+The Quicken menu bar is a **standard Win32 menu** — menu items are NOT separate child
+HWNDs. They are MSAA-accessible but only as virtual elements. To access menu items:
+
+```python
+# Method 1: UIA name-based invoke (MSAA bridge, ~25s)
+uia_invoke(name="File")  # opens File menu
+
+# Method 2: keyboard shortcut (most reliable, <1s)
+uia_send_keys(keys="%f")  # Alt+F opens File menu
+```
+
+### 25.5 Fixed Bugs (probes 5-7 session)
+
+| Fix | Commit | Impact |
+|-----|--------|--------|
+| `uia_invoke(hwnd=...)` top-level param | e830b09 | Direct HWND invoke, no name scan |
+| `uia_inspect` Win32 fast path | e830b09 | 158s → 3.6s (44× speedup) |
+| `uia_inspect` depth as top-level param | e830b09 | `uia_inspect(depth=2)` works directly |
+| QC_button invoke uses UIA/MSAA not BM_CLICK | ebdf3cf | Navigation confirmed working |
+
+### 25.6 Best Practice Recipe (updated)
+
+```python
+# FAST Quicken automation workflow:
+
+# 1. Connect (one-time)
+select_window(process_name="qw.exe")   # ~4s
+
+# 2. Discover all named buttons with HWNDs (one-time scan)
+fa = uia_find_all(has_actions=True, named_only=True, include_hwnd=True, limit=50)
+# Returns 12+ nav buttons in ~5s. Cache the hwnd values.
+
+# 3. Inspect tree (fast, no COM)
+uia_inspect(depth=3)   # ~2s — full structural layout
+
+# 4. Navigate by HWND (no rescan)
+uia_invoke(hwnd="0x400a4")   # SPENDING — ~8s (MSAA), then check QWMDI title
+
+# 5. Find account register controls
+uia_inspect(target={"hwnd": "0x3018e"}, depth=3)  # MDIClient subtree
+```
