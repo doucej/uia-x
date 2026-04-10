@@ -1531,46 +1531,118 @@ result = uia.uia_read_display()
 
 *Last updated: UIA-X capability matrix confirmed — full transaction entry, navigation, and state reading via UIA-X with active RDP*
 
-1. type_text('3/28/2026')   # date
-2. uia_send_keys('{TAB}')
-3. type_text('Test Payee')  # payee
-4. uia_send_keys('{TAB}')
-5. type_text('100.00')       # amount
-6. uia_send_keys('{TAB}')
-7. type_text('Food')         # category
-8. uia_send_keys('{ENTER}')  # save
-`
+---
 
-### 21.6 Remaining UIA-X Gaps (GitHub Issues Filed)
+## 24. UIA-X MCP Server — Confirmed Live Results (branch: dev/agent-fixes)
 
-| Issue | Title |
-|-------|-------|
-| #9 | select_window picks wrong window when multiple windows share process_name |
-| #10 | uia_mouse_click silent failure on DPI mismatch |
-| #11 | DPI scale factor not exposed by select_window / process_list |
-| #12 | uia_invoke returns ok:true but menu popup doesn't open |
-| #13 | uia_find_all(roles=['button']) misses custom-class buttons (ControlType=Pane) |
-| #14 | Missing wait_for_element / wait_for_condition primitive |
-| #15 | uia_mouse_click vs mouse_click behave differently on custom controls |
-| #16 | Need send_message/post_message primitive for Win32 interaction |
+> All timings measured against live Quicken Classic Premier on this machine.
+> Server run via: `python -m uiax.server` with `UIAX_BACKEND=real`.
 
-### 21.7 Recommended Tool Priority
+### 24.1 Tool Performance (after Win32 fast-path fix)
 
-1. UIA-X mouse_click (SendInput) — best general click when RDP active
-2. UIA-X uia_legacy_invoke — QC_button (pane role) controls
-3. Win32 SendMessageW(BM_CLICK) — QWListViewer sidebar items, headless
-4. Win32 PostMessageW(WM_COMMAND, id) — menu-equivalent actions
-5. Win32 PostMessageW(WM_KEYDOWN, VK_ESCAPE) — dismiss #32770 dialogs
-6. Win32 PostMessageW(WM_CLOSE) — close QWinPopup report windows
-7. UIA-X type_text — text entry when RDP active
-8. Win32 PostMessageW(WM_CHAR, ch) — text entry without RDP (limited)
+| Tool | Time | Result |
+|------|------|--------|
+| `process_list` | 3.9s | 6 visible windows including QFRAME |
+| `select_window(process_name="qw.exe")` | 3.2s | ok=True, hwnd=0x401f2 |
+| `check_window_state(hwnd)` | 10.5s | ok=True, enabled=True |
+| `uia_find_all(roles=["button"])` | **3.2s** | 12 buttons (Win32 path) |
+| `uia_find_all(has_actions=True)` | **3.2s** | 12 buttons |
+| `uia_invoke(name="File")` | 25.3s | ok=True (UIA fallback path) |
 
-### 21.8 Known Limitations (No Workaround)
+> ⚡ `uia_find_all` was **205 seconds** before the Win32 fast-path fix (64× speedup).
 
-- Register rows (QWClass_TransactionList) — fully opaque to UIA
-- Investment dialog fields — custom QWinDlg; must use ctrl_id mapping
-- Edit mode is sticky — only hardware input (RDP) exits txlist edit mode
-- Menus — Quicken uses custom MSAA menus; uia_invoke doesn't open them
-- DPI mismatch — uia_mouse_click silently misses on logical/physical coord confusion
+### 24.2 Confirmed Navigation Buttons (Win32 fast-path, QC_button class)
+
+```
+HOME                    SPENDING              BILLS & INCOME
+PLANNING                MOBILE & WEB          Dashboard
+Update now              ACCOUNTS              All Transactions
+Banking                 Net Worth             Credit Score
+```
+
+All 12 returned as `role=button`, `actions=['click']`, found in **3.2s**.
+
+### 24.3 `select_window` — Updated Guidance
+
+`process_name="qw.exe"` now works reliably (process_manager ranks QFRAME by visible area,
+filtering out the 1×1 `QWFly` helper window):
+
+```python
+# WORKS — process_manager picks the largest window (QFRAME, not QWFly)
+sw = mcp.call("select_window", {"process_name": "qw.exe"})
+# Returns: {"ok": True, "window": {"hwnd": 262642, "class_name": "QFRAME",
+#           "title": "Quicken Classic Premier - ...", "dpi_scale": 1.0}}
+```
+
+### 24.4 Win32 Class → Role Mapping (Quicken-specific)
+
+| Win32 Class | UIA-X role |
+|-------------|-----------|
+| `QC_button` | `button` |
+| `QWComboBox` | `combobox` |
+| `QWPanel` | `pane` |
+| `QWNavigator` | `pane` |
+| `QWListViewer` | `list` |
+| `QFRAME` | `window` |
+| `QW_MAIN_TOOLBAR` | `toolbar` |
+| `QW_BAG_TOOLBAR` | `toolbar` |
+
+### 24.5 Invoke Patterns
+
+| Target | Method | Time | Notes |
+|--------|--------|------|-------|
+| `uia_invoke({"name": "File"})` | UIA name scan | ~25s | Slow — traverses MSAA bridge |
+| `uia_invoke({"hwnd": "0x..."})` | Win32 BM_CLICK | <1s | Fast — direct Win32 message |
+| `uia_invoke({"name": "HOME"})` | Win32 fast-path if cached | ~3s | Uses Win32 button lookup |
+
+**Best practice**: prefer `{"hwnd": "0x..."}` targets where HWND is known.
+
+### 24.6 Known Performance Bottlenecks (remaining)
+
+| Operation | Cost | Cause |
+|-----------|------|-------|
+| `uia_invoke(name="X")` first call | ~25s | UIA `descendants(title=X)` via MSAA bridge |
+| `check_window_state` | ~10s | executor + COM thread startup overhead |
+| UIA-based element lookup | 10-15s/type | Quicken's MSAA UIA compatibility bridge is O(n) |
+
+**Mitigation**: cache HWNDs from first `uia_find_all` and use `{"hwnd": "0x..."}` for all subsequent invokes.
+
+### 24.7 GitHub Issues — Resolution Status (dev/agent-fixes)
+
+| Issue | Title | Status |
+|-------|-------|--------|
+| #9 | `select_window` picks wrong window when multiple share process_name | ✅ FIXED — area ranking |
+| #10 | `uia_mouse_click` silent failure on DPI mismatch | ✅ FIXED — DPI scale returned |
+| #11 | DPI scale factor not exposed | ✅ FIXED — `dpi_scale` in `select_window` response |
+| #12 | `uia_invoke` returns ok:true but menu popup doesn't open | ✅ FIXED — 7-strategy invoke chain |
+| #13 | `uia_find_all` misses custom-class buttons | ✅ FIXED — Win32 class→role mapping |
+| #14 | Missing `wait_for_element` primitive | ✅ FIXED — `uia_wait_for_element` added |
+| #15 | Stale element handle not detected | ✅ FIXED — `stale_handle` error code |
+| #16 | Need `send_message`/`post_message` primitive | ✅ FIXED — `uia_send_message` added |
+| Pagination | `uia_find_all` pagination | ✅ FIXED — `offset`/`limit` params |
+
+### 24.8 Startup Recipe (MCP server against live Quicken)
+
+```bash
+# 1. Start server
+cd Z:\uiax_checkout\uia-x
+set UIAX_BACKEND=real
+set UIAX_AUTH=none
+set MCP_TRANSPORT=streamable-http
+set MCP_PORT=8765
+python -m uiax.server
+
+# 2. Connect and select Quicken
+select_window(process_name="qw.exe")
+
+# 3. Find buttons fast (Win32 path, ~3s)
+uia_find_all(roles=["button"], named_only=True, limit=20)
+
+# 4. Invoke by HWND (fast, <1s)
+uia_invoke({"hwnd": "0x401f2"})     # example
+
+# 5. Invoke by name (UIA path, ~25s first time)
+uia_invoke({"name": "File"})
+```
 
 ---
