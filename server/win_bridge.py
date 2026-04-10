@@ -32,7 +32,6 @@ from server.uia_bridge import (
 
 _PYWINAUTO_IMPORT_ERROR: str | None = None
 try:
-    from pywinauto import Desktop
     from pywinauto.controls.uiawrapper import UIAWrapper
 
     _PYWINAUTO_AVAILABLE = True
@@ -88,6 +87,272 @@ _WIN_INTERACTIVE_ROLES = frozenset({
     "calendar", "timepicker",
 })
 
+# MSAA ROLE_SYSTEM_PUSHBUTTON = 43 (0x2B). Controls with this MSAA role
+# should match a roles=["button"] filter even when their UIA ControlType is
+# Pane or Custom (e.g. Quicken's QC_button class).
+_MSAA_PUSHBUTTON_ROLE = 0x2B
+_BUTTON_ROLE_ALIASES = frozenset({
+    "button", "push button", "pushbutton", "toolbarbutton",
+})
+
+# UIA control types for interactive elements.  Querying by individual control
+# type creates a COM PropertyCondition, so the UIA provider filters results
+# server-side — vastly faster than root.descendants() with no condition.
+_INTERACTIVE_CONTROL_TYPES: tuple[str, ...] = (
+    "Button", "MenuItem", "CheckBox", "RadioButton",
+    "Edit", "ComboBox", "ListItem", "TreeItem",
+    "Tab", "TabItem", "Hyperlink", "Slider", "Spinner",
+    "SplitButton", "Menu", "ToolBar",
+)
+_DISPLAY_CONTROL_TYPES: tuple[str, ...] = (
+    "Text", "Image", "Document", "DataItem",
+    "Header", "HeaderItem", "Custom",
+)
+
+
+def _fetch_typed_descendants(root, include_display: bool = False):
+    """Return all interactive (and optionally display) descendants using
+    per-type COM property conditions instead of a single unfiltered FindAll.
+
+    Each call to root.descendants(control_type=ct) issues a
+    FindAll(TreeScope.Subtree, PropertyCondition(ControlType, ct)) to the UIA
+    provider, which is O(matching_elements) not O(all_elements).
+    """
+    types = _INTERACTIVE_CONTROL_TYPES
+    if include_display:
+        types = types + _DISPLAY_CONTROL_TYPES
+    results: list = []
+    for ct in types:
+        try:
+            results.extend(root.descendants(control_type=ct))
+        except Exception:
+            pass
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Win32-native fast element enumeration (bypasses UIA COM layer entirely)
+# ---------------------------------------------------------------------------
+
+# Maps Win32 class names (lowercase) to UIA-like role strings.
+_WIN32_CLASS_TO_ROLE: dict[str, str] = {
+    # Standard Win32 controls
+    "button": "button",
+    "edit": "edit",
+    "static": "text",
+    "listbox": "list",
+    "combobox": "combobox",
+    "comboboxex32": "combobox",
+    "scrollbar": "scrollbar",
+    "syslistview32": "list",
+    "listview": "list",
+    "systreeview32": "tree",
+    "treeview": "tree",
+    "systabcontrol32": "tab",
+    "tabcontrol": "tab",
+    "toolbarwindow32": "toolbar",
+    "rebar": "toolbar",
+    "msctls_statusbar32": "statusbar",
+    "msctls_trackbar32": "slider",
+    "msctls_updown32": "spinner",
+    "msctls_progress32": "progressbar",
+    "richedit20w": "edit",
+    "richedit20a": "edit",
+    "richedit50w": "edit",
+    "rich edit": "edit",
+    "sysmonthcal32": "calendar",
+    "sysdatetimepick32": "timepicker",
+    "tooltips_class32": "tooltip",
+    "sysipaddress32": "edit",
+    "sysanimate32": "image",
+    "syspager": "toolbar",
+    "header": "header",
+    "sysheader32": "header",
+    # Quicken-specific custom window classes (observed via EnumChildWindows)
+    "qc_button": "button",
+    "qwcombobox": "combobox",
+    "qwpanel": "pane",
+    "qwiconDisplay".lower(): "image",
+    "qw_bag_toolbar": "toolbar",
+    "qw_main_toolbar": "toolbar",
+    "qwmenubar": "menubar",
+    "qwlistbox": "list",
+    "qwedit": "edit",
+}
+
+# Win32 class names that have interactive actions (lowercase).
+_WIN32_INTERACTIVE_CLASSES: frozenset[str] = frozenset({
+    # Standard Win32
+    "button", "edit", "listbox", "combobox", "comboboxex32",
+    "syslistview32", "listview", "systreeview32", "treeview",
+    "systabcontrol32", "tabcontrol", "toolbarwindow32",
+    "msctls_trackbar32", "msctls_updown32",
+    "richedit20w", "richedit20a", "richedit50w", "rich edit",
+    "sysmonthcal32", "sysdatetimepick32", "sysipaddress32",
+    # Quicken custom
+    "qc_button", "qwcombobox", "qwlistbox", "qwedit", "qwmenubar",
+})
+
+# GWL_STYLE / WS_TABSTOP: controls with this style are keyboard-navigable.
+_WS_TABSTOP = 0x00010000
+_GWL_STYLE = -16
+
+
+def _win32_fast_find_all(
+    hwnd: int,
+    named_only: bool = True,
+    must_have_actions: bool = True,
+    roles_filter: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Enumerate all child windows using Win32 EnumChildWindows.
+
+    This bypasses the UIA COM layer entirely, making it ~100× faster than
+    ``root.descendants(control_type=X)`` for legacy Win32 apps like Quicken
+    whose UIA provider is bridged through MSAA (slow COM round-trips).
+
+    Returns dicts compatible with the ``find_all`` response schema, including
+    ``hwnd`` / ``hwnd_hex`` fields so callers can later invoke elements by
+    handle rather than re-scanning the tree.
+    """
+    import ctypes  # noqa: PLC0415
+    import ctypes.wintypes  # noqa: PLC0415
+
+    user32 = ctypes.windll.user32
+    _roles_set = set(roles_filter) if roles_filter else None
+
+    results: list[dict[str, Any]] = []
+    name_counts: dict[str, int] = {}
+
+    # WM_GETTEXT with abort-if-hung timeout avoids blocking on slow/unresponsive
+    # child windows (e.g. Quicken custom controls with busy message pumps).
+    _WM_GETTEXT = 0x000D
+    _SMTO_ABORTIFHUNG = 0x0002
+    _TEXT_BUFSIZE = 512
+
+    EnumChildProc = ctypes.WINFUNCTYPE(  # noqa: N806
+        ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
+    )
+
+    # Pre-compute: does the roles filter include any "button" aliases?
+    _want_buttons = _roles_set is not None and any(
+        r in _BUTTON_ROLE_ALIASES for r in _roles_set
+    )
+
+    def _enum_cb(child_hwnd: int, _: int) -> bool:  # noqa: ANN001
+        try:
+            if not user32.IsWindowVisible(child_hwnd):
+                return True
+
+            # --- class name (kernel data, no message sent) ---
+            cls_buf = ctypes.create_unicode_buffer(128)
+            user32.GetClassNameW(child_hwnd, cls_buf, 128)
+            cls = cls_buf.value.lower()
+
+            role = _WIN32_CLASS_TO_ROLE.get(cls, "custom")
+
+            # --- role filter (early exit before any SendMessage calls) ---
+            if _roles_set and role not in _roles_set:
+                # "button" aliases also match qc_button and similar custom buttons
+                if not (_want_buttons and role == "button"):
+                    return True
+
+            # --- window text via SendMessageTimeout (non-blocking, 50 ms cap) ---
+            tbuf = ctypes.create_unicode_buffer(_TEXT_BUFSIZE)
+            msg_result = ctypes.c_size_t(0)
+            ret = user32.SendMessageTimeoutW(
+                child_hwnd,
+                _WM_GETTEXT,
+                _TEXT_BUFSIZE,
+                tbuf,
+                _SMTO_ABORTIFHUNG,
+                50,
+                ctypes.byref(msg_result),
+            )
+            text = tbuf.value if (ret and msg_result.value > 0) else ""
+
+            if named_only and not text:
+                return True
+
+            # --- bounding rect (kernel data, no message sent) ---
+            rc = ctypes.wintypes.RECT()
+            user32.GetWindowRect(child_hwnd, ctypes.byref(rc))
+            if rc.right - rc.left <= 0 or rc.bottom - rc.top <= 0:
+                return True
+            rect = {"left": rc.left, "top": rc.top, "right": rc.right, "bottom": rc.bottom}
+
+            enabled = bool(user32.IsWindowEnabled(child_hwnd))
+
+            # --- interactivity: class membership OR WS_TABSTOP style ---
+            is_interactive = cls in _WIN32_INTERACTIVE_CLASSES
+            if not is_interactive:
+                style = user32.GetWindowLongW(child_hwnd, _GWL_STYLE)
+                is_interactive = bool(style & _WS_TABSTOP)
+
+            # --- derive actions from class ---
+            actions: list[str] = []
+            if is_interactive:
+                if cls in ("button", "qc_button"):
+                    actions = ["click"]
+                elif cls in ("edit", "richedit20w", "richedit20a", "richedit50w",
+                             "rich edit", "sysipaddress32", "qwedit"):
+                    actions = ["type"]
+                elif cls in ("listbox", "combobox", "comboboxex32", "qwcombobox",
+                             "qwlistbox", "syslistview32", "listview",
+                             "systreeview32", "treeview",
+                             "systabcontrol32", "tabcontrol"):
+                    actions = ["select"]
+                elif cls in ("qwmenubar",):
+                    actions = ["click"]
+                else:
+                    actions = ["click"]
+
+            if must_have_actions and not actions:
+                return True
+
+            per_name_idx = name_counts.get(text, 0)
+            name_counts[text] = per_name_idx + 1
+
+            d: dict[str, Any] = {
+                "index": per_name_idx,
+                "name": text,
+                "role": role,
+                "class_name": cls,
+                "hwnd": child_hwnd,
+                "hwnd_hex": hex(child_hwnd),
+                "enabled": enabled,
+                "rect": rect,
+                "actions": actions,
+            }
+            if text:
+                d["text"] = text
+            results.append(d)
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+    cb = EnumChildProc(_enum_cb)
+    user32.EnumChildWindows(hwnd, cb, 0)
+    return results
+
+
+def _win32_element_from_hwnd(hwnd: int):
+    """Wrap a raw Win32 HWND as a pywinauto UIAWrapper without scanning descendants.
+
+    Uses pywinauto's internal IUIA singleton and UIAElementInfo so no desktop
+    enumeration is needed — this is O(1).
+    """
+    try:
+        import comtypes  # noqa: PLC0415
+        comtypes.CoInitialize()
+        from pywinauto.uia_defines import IUIA  # noqa: PLC0415
+        from pywinauto.controls.uiawrapper import UIAWrapper  # noqa: PLC0415
+        from pywinauto.uia_element_info import UIAElementInfo  # noqa: PLC0415
+
+        raw_elem = IUIA().iuia.ElementFromHandle(hwnd)
+        return UIAWrapper(UIAElementInfo(raw_elem))
+    except Exception:  # noqa: BLE001
+        return None
+
 # ---------------------------------------------------------------------------
 # SendKeys helpers
 # ---------------------------------------------------------------------------
@@ -130,40 +395,33 @@ def _attach_target():
     Return the pywinauto wrapper for the currently-attached window.
 
     Uses the ``ProcessManager`` singleton to determine the target HWND.
+    Connects directly via HWND to avoid slow full-desktop enumeration.
     """
     _require_pywinauto()
     from server.process_manager import get_process_manager  # noqa: PLC0415
+    import pywinauto  # noqa: PLC0415
+
+    # Ensure COM is initialised for this thread (safe to call multiple times).
+    try:
+        import comtypes  # noqa: PLC0415
+        comtypes.CoInitialize()
+    except Exception:
+        pass
 
     pm = get_process_manager()
     attached = pm.attached
     if attached is None:
         raise TargetNotFoundError("Use select_window to attach to a target first.")
 
-    desktop = Desktop(backend="uia")
-
-    # Try by HWND first (most precise)
+    # Connect directly by handle — avoids enumerating every window on the desktop.
     try:
-        wins = desktop.windows(handle=attached.hwnd)
-        if wins:
-            return wins[0]
-    except Exception:
-        pass
-
-    # Fallback: by class name
-    if attached.class_name:
-        wins = desktop.windows(class_name=attached.class_name)
-        if wins:
-            return wins[0]
-
-    # Fallback: by title
-    if attached.title:
-        wins = desktop.windows(title_re=f".*{attached.title}.*")
-        if wins:
-            return wins[0]
-
-    raise TargetNotFoundError(
-        f"Window hwnd={hex(attached.hwnd)} title={attached.title!r} is no longer available."
-    )
+        app = pywinauto.Application(backend="uia").connect(handle=attached.hwnd)
+        return app.window(handle=attached.hwnd)
+    except Exception as exc:
+        raise TargetNotFoundError(
+            f"Window hwnd={hex(attached.hwnd)} title={attached.title!r} "
+            f"is no longer available: {exc}"
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -388,14 +646,21 @@ def _find_element(root, target: dict[str, Any]):
         return current
 
     if by == "automation_id":
-        all_desc = root.descendants()
-        matches = []
-        for elem in all_desc:
-            try:
-                if elem.automation_id() == value:
-                    matches.append(elem)
-            except Exception:
-                pass
+        # Fast path: create a COM property condition for automation_id.
+        try:
+            matches = root.descendants(auto_id=value)
+        except Exception:
+            matches = []
+        if not matches:
+            # Fallback: iterate typed descendants (auto_id pywinauto kwarg may vary)
+            all_desc = _fetch_typed_descendants(root, include_display=True)
+            matches = []
+            for elem in all_desc:
+                try:
+                    if elem.automation_id() == value:
+                        matches.append(elem)
+                except Exception:
+                    pass
         if not matches:
             raise ElementNotFoundError(target)
         try:
@@ -403,8 +668,30 @@ def _find_element(root, target: dict[str, Any]):
         except IndexError:
             raise ElementNotFoundError(target) from None
 
+    if by == "hwnd":
+        # Fast path: wrap the HWND directly without scanning descendants (O(1)).
+        _require_pywinauto()
+        try:
+            target_hwnd = (
+                int(value, 16)
+                if isinstance(value, str) and value.startswith("0x")
+                else int(value)
+            )
+        except (ValueError, TypeError) as exc:
+            raise UIAError(f"Invalid hwnd value: {value!r}", code="INVALID_SELECTOR") from exc
+        elem = _win32_element_from_hwnd(target_hwnd)
+        if elem is not None:
+            return elem
+        # Fallback: scan descendants
+        all_desc = _fetch_typed_descendants(root, include_display=True)
+        for candidate in all_desc:
+            if _matches_msaa(candidate, "hwnd", value):
+                return candidate
+        raise ElementNotFoundError(target)
+
     if by in _MSAA_STRATEGIES:
-        all_desc = root.descendants()
+        # MSAA attributes cannot be filtered at the COM level; iterate typed descendants.
+        all_desc = _fetch_typed_descendants(root, include_display=True)
         matches = []
         for elem in all_desc:
             if _matches_msaa(elem, by, value):
@@ -433,14 +720,14 @@ def _find_element(root, target: dict[str, Any]):
     except Exception:
         matches = []
     if not matches:
-        for elem in root.descendants():
+        for elem in _fetch_typed_descendants(root, include_display=True):
             try:
                 if fallback_pred(elem, value):
                     matches.append(elem)
             except Exception:
                 pass
     if not matches and by == "name":
-        for elem in root.descendants():
+        for elem in _fetch_typed_descendants(root, include_display=True):
             if _matches_msaa(elem, "legacy_name", value):
                 matches.append(elem)
     if matches and role_filter:
@@ -475,19 +762,54 @@ class WinUIABridge(UIABridge):
 
 
     def find_all(self, filter: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: A002
-        """Return a flat list of every named/interactive element in the window."""
-        root = _attach_target()
+        """Return a flat list of every named/interactive element in the window.
+
+        Strategy
+        --------
+        1. **Win32-native fast path** (when no sub-element root is specified):
+           Use ``EnumChildWindows`` to enumerate all child HWNDs directly —
+           this bypasses the UIA COM layer entirely and is ~100× faster than
+           ``root.descendants(control_type=X)`` for legacy Win32 apps like
+           Quicken whose UIA tree is bridged through MSAA.
+
+        2. **UIA/MSAA fallback**: used when a root sub-element is specified
+           (the Win32 path only knows the top-level HWND) or when the Win32
+           path returns no results (pure UIA / modern apps).
+        """
         named_only = bool(filter.get("named_only", True))
         must_have_actions = bool(filter.get("has_actions", True))
         roles_filter = [r.lower() for r in (filter.get("roles") or [])]
         root_target = filter.get("root") or {}
+
+        # ------------------------------------------------------------------
+        # Win32-native fast path (top-level HWND only, no sub-element root)
+        # ------------------------------------------------------------------
+        if not root_target:
+            from server.process_manager import get_process_manager  # noqa: PLC0415
+            pm = get_process_manager()
+            if pm.attached:
+                try:
+                    win32_results = _win32_fast_find_all(
+                        pm.attached.hwnd,
+                        named_only=named_only,
+                        must_have_actions=must_have_actions,
+                        roles_filter=roles_filter or None,
+                    )
+                    if win32_results:
+                        return win32_results
+                except Exception:  # noqa: BLE001
+                    pass
+
+        # ------------------------------------------------------------------
+        # UIA / MSAA fallback (required for sub-element roots or modern apps)
+        # ------------------------------------------------------------------
+        root = _attach_target()
         if root_target:
             root = _find_element(root, root_target)
 
-        try:
-            all_elements = list(root.descendants())
-        except Exception:
-            all_elements = []
+        # Fetch elements using per-type COM property conditions — much faster than
+        # root.descendants() with no filter, which returns every element in the tree.
+        all_elements = _fetch_typed_descendants(root, include_display=not must_have_actions)
 
         results: list[dict[str, Any]] = []
         name_counts: dict[str, int] = {}
@@ -531,8 +853,28 @@ class WinUIABridge(UIABridge):
             # Apply filters
             if named_only and not name:
                 continue
-            if roles_filter and role not in roles_filter:
-                continue
+
+            # Role filter: exact match OR widened button matching.
+            # roles=["button"] also matches Pane/Custom elements that are
+            # functionally buttons (MSAA ROLE_SYSTEM_PUSHBUTTON or InvokePattern).
+            if roles_filter:
+                role_match = role in roles_filter
+                if not role_match and any(rf in _BUTTON_ROLE_ALIASES for rf in roles_filter):
+                    # Check MSAA role
+                    try:
+                        _raw_msaa = elem.legacy_properties() or {}
+                        if (_raw_msaa.get("Role") or 0) == _MSAA_PUSHBUTTON_ROLE:
+                            role_match = True
+                    except Exception:
+                        pass
+                    # Also match non-button UIA types that have InvokePattern
+                    if not role_match and "InvokePattern" in patterns and role in (
+                        "pane", "custom", "group", "image", "hyperlink",
+                    ):
+                        role_match = True
+                if not role_match:
+                    continue
+
             if must_have_actions and not actions:
                 continue
 
@@ -584,9 +926,19 @@ class WinUIABridge(UIABridge):
                 d["states"] = states
             if focused:
                 d["focused"] = True
+            # Expose MSAA role so callers can filter independently of UIA type
+            try:
+                _msaa_r = elem.legacy_properties() or {}
+                _msaa_role_int = _msaa_r.get("Role") or 0
+                if _msaa_role_int:
+                    d["msaa_role"] = _msaa_role_int
+                    d["msaa_role_text"] = _ROLE_LABEL.get(_msaa_role_int, f"role_0x{_msaa_role_int:02x}")
+            except Exception:
+                pass
             results.append(d)
 
         return results
+
     def inspect(self, target: dict[str, Any]) -> dict[str, Any]:
         root = _attach_target()
         selector = {k: v for k, v in target.items() if k != "depth"} if target else {}
@@ -595,24 +947,95 @@ class WinUIABridge(UIABridge):
         return _element_to_dict(element, depth)
 
     def invoke(self, target: dict[str, Any]) -> None:
+        # ------------------------------------------------------------------
+        # Fast path: if the target specifies an HWND directly, try Win32
+        # BM_CLICK before falling through to the slow UIA element search.
+        # ------------------------------------------------------------------
+        _raw_hwnd: int | None = None
+        if "hwnd" in target and "by" not in target:
+            try:
+                _v = target["hwnd"]
+                _raw_hwnd = int(_v, 16) if isinstance(_v, str) and _v.startswith("0x") else int(_v)
+            except (ValueError, TypeError):
+                pass
+        elif target.get("by") == "hwnd":
+            try:
+                _v2 = target.get("value", "0")
+                _raw_hwnd = int(_v2, 16) if isinstance(_v2, str) and _v2.startswith("0x") else int(_v2)
+            except (ValueError, TypeError):
+                pass
+        if _raw_hwnd is not None:
+            import ctypes  # noqa: PLC0415
+            _u32 = ctypes.windll.user32
+            try:
+                _cls_buf = ctypes.create_unicode_buffer(256)
+                _u32.GetClassNameW(_raw_hwnd, _cls_buf, 256)
+                _cls = _cls_buf.value.lower()
+            except Exception:
+                _cls = ""
+            if _cls in ("button", "toolbarwindow32") or not _cls:
+                # BM_CLICK = 0x00F5 — synchronous; works for standard buttons.
+                if _u32.SendMessageW(_raw_hwnd, 0x00F5, 0, 0) == 0 or not _cls:
+                    # Also try SetFocus + BM_CLICK for custom button-like controls.
+                    _u32.SetFocus(_raw_hwnd)
+                    _u32.SendMessageW(_raw_hwnd, 0x00F5, 0, 0)
+                return
+        # ------------------------------------------------------------------
+        # Standard UIA / MSAA path
+        # ------------------------------------------------------------------
         root = _attach_target()
         element = _find_element(root, target)
+        # Strategy 1: UIA InvokePattern
         try:
             element.invoke()
             return
         except Exception:
             pass
+        # Strategy 2: UIA TogglePattern
         try:
             element.toggle()
             return
         except Exception:
             pass
+        # Strategy 3: UIA ExpandCollapsePattern (menus/dropdowns)
+        try:
+            element.expand()
+            return
+        except Exception:
+            pass
+        # Strategy 4: MSAA LegacyIAccessiblePattern.DoDefaultAction
+        # Handles apps (e.g. Quicken QWMenuBar) that only respond to MSAA.
+        try:
+            element.iface_legacy_iaccessible.DoDefaultAction()
+            return
+        except Exception:
+            pass
+        # Strategy 5: SelectionItemPattern.Select
+        try:
+            element.iface_selection_item.Select()
+            return
+        except Exception:
+            pass
+        # Strategy 6: pywinauto click_input
         try:
             element.click_input()
             return
+        except Exception:
+            pass
+        # Strategy 7: raw coordinate click at element's bounding-box centre.
+        # Works for Quicken QWMenuBar items that ignore all UIA patterns but
+        # respond to physical WM_LBUTTONDOWN at the correct screen coordinates.
+        try:
+            _require_pywinauto()
+            from pywinauto import mouse  # noqa: PLC0415
+            r = element.rectangle()
+            cx = (r.left + r.right) // 2
+            cy = (r.top + r.bottom) // 2
+            mouse.click(coords=(cx, cy))
+            return
         except Exception as exc:
             raise PatternNotSupportedError(
-                "Invoke/Toggle", element.window_text()
+                "Invoke/Toggle/Expand/Click", element.window_text()
             ) from exc
 
     def set_value(self, target: dict[str, Any], value: str) -> None:
@@ -754,8 +1177,17 @@ class WinUIABridge(UIABridge):
         y: int,
         double: bool = False,
         button: str = "left",
+        force_sendinput: bool = False,
     ) -> None:
-        """Click at absolute screen coordinates using pywinauto.mouse."""
+        """Click at absolute screen coordinates using pywinauto.mouse (SendInput).
+
+        Parameters
+        ----------
+        force_sendinput : bool
+            Deprecated no-op — the current implementation already uses
+            SendInput under the hood.  Retained for forward compatibility
+            with callers that explicitly request raw input dispatch.
+        """
         _require_pywinauto()
         from pywinauto import mouse  # noqa: PLC0415
 
@@ -764,6 +1196,172 @@ class WinUIABridge(UIABridge):
             mouse.double_click(button=button, coords=coords)
         else:
             mouse.click(button=button, coords=coords)
+
+    def send_win32_message(
+        self,
+        hwnd: int,
+        message: int,
+        wparam: int = 0,
+        lparam: int = 0,
+        sync: bool = True,
+    ) -> int:
+        """Send or post a Win32 message to a window handle.
+
+        Parameters
+        ----------
+        hwnd : int
+            Target window handle.
+        message : int
+            Windows message constant (e.g. ``0xF5`` for BM_CLICK,
+            ``0x0010`` for WM_CLOSE, ``0x0111`` for WM_COMMAND).
+        wparam, lparam : int
+            Message parameters (default 0).
+        sync : bool
+            ``True`` (default) → ``SendMessageW`` — blocks until the
+            target processes the message.  Use for buttons and dialogs.
+            ``False`` → ``PostMessageW`` — fire-and-forget.  Use to
+            dismiss modals asynchronously.
+
+        Returns
+        -------
+        int
+            Return value from ``SendMessageW``, or 1 on success for
+            ``PostMessageW``.
+        """
+        import ctypes  # noqa: PLC0415
+
+        user32 = ctypes.windll.user32
+        if sync:
+            return user32.SendMessageW(hwnd, message, wparam, lparam)
+        user32.PostMessageW(hwnd, message, wparam, lparam)
+        return 1
+
+    def get_window_enabled_state(self, hwnd: int) -> dict[str, Any]:
+        """Check whether *hwnd* is enabled and identify any blocking overlays.
+
+        Returns a dict with ``enabled`` (bool) and, when disabled, a
+        ``blocking_windows`` list of same-process windows that may be
+        responsible (e.g. Quicken's QWinLightbox).
+        """
+        import ctypes  # noqa: PLC0415
+        import ctypes.wintypes  # noqa: PLC0415
+
+        user32 = ctypes.windll.user32
+        enabled = bool(user32.IsWindowEnabled(hwnd))
+        result: dict[str, Any] = {"hwnd": hwnd, "enabled": enabled}
+
+        if not enabled:
+            pid = ctypes.wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            target_pid = pid.value
+
+            blocking: list[dict[str, Any]] = []
+
+            def _enum_cb(h: int, _lp: Any) -> bool:
+                if h == hwnd:
+                    return True
+                p = ctypes.wintypes.DWORD()
+                user32.GetWindowThreadProcessId(h, ctypes.byref(p))
+                if p.value != target_pid:
+                    return True
+                if not user32.IsWindowVisible(h):
+                    return True
+                cls_buf = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(h, cls_buf, 256)
+                tlen = user32.GetWindowTextLengthW(h)
+                tbuf = ctypes.create_unicode_buffer(tlen + 1)
+                user32.GetWindowTextW(h, tbuf, tlen + 1)
+                blocking.append({
+                    "hwnd": h,
+                    "class_name": cls_buf.value,
+                    "title": tbuf.value,
+                })
+                return True
+
+            WNDENUMPROC = ctypes.WINFUNCTYPE(
+                ctypes.c_bool, ctypes.c_int, ctypes.POINTER(ctypes.c_int)
+            )
+            user32.EnumWindows(WNDENUMPROC(_enum_cb), 0)
+            if blocking:
+                result["blocking_windows"] = blocking
+
+        return result
+
+    def dismiss_modal_overlay(self, target_hwnd: int) -> dict[str, Any]:
+        """Close overlay windows blocking *target_hwnd* and re-enable it.
+
+        Handles the QWinLightbox (and similar) pattern where a wizard or
+        background dialog calls ``EnableWindow(parent, 0)`` and then fails
+        to re-enable it after closing.
+
+        Steps
+        -----
+        1. Check ``IsWindowEnabled(target_hwnd)`` — exit early if enabled.
+        2. Enumerate all visible same-process windows.
+        3. Send ``WM_CLOSE`` to each overlay.
+        4. If target is still disabled after closing overlays, call
+           ``EnableWindow(target_hwnd, 1)`` directly.
+
+        Returns
+        -------
+        dict
+            ``{"ok": True, "dismissed": [...], "re_enabled": bool}``
+        """
+        import ctypes  # noqa: PLC0415
+        import ctypes.wintypes  # noqa: PLC0415
+
+        WM_CLOSE = 0x0010  # noqa: N806
+        user32 = ctypes.windll.user32
+
+        if bool(user32.IsWindowEnabled(target_hwnd)):
+            return {
+                "ok": True,
+                "target_hwnd": target_hwnd,
+                "enabled": True,
+                "dismissed": [],
+                "re_enabled": False,
+            }
+
+        pid = ctypes.wintypes.DWORD()
+        user32.GetWindowThreadProcessId(target_hwnd, ctypes.byref(pid))
+        target_pid = pid.value
+
+        overlays: list[int] = []
+
+        def _enum_cb(h: int, _lp: Any) -> bool:
+            if h == target_hwnd:
+                return True
+            p = ctypes.wintypes.DWORD()
+            user32.GetWindowThreadProcessId(h, ctypes.byref(p))
+            if p.value != target_pid:
+                return True
+            overlays.append(h)
+            return True
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(
+            ctypes.c_bool, ctypes.c_int, ctypes.POINTER(ctypes.c_int)
+        )
+        user32.EnumWindows(WNDENUMPROC(_enum_cb), 0)
+
+        dismissed: list[dict[str, Any]] = []
+        for h in overlays:
+            cls_buf = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(h, cls_buf, 256)
+            user32.SendMessageW(h, WM_CLOSE, 0, 0)
+            dismissed.append({"hwnd": h, "class_name": cls_buf.value})
+
+        re_enabled = False
+        if not bool(user32.IsWindowEnabled(target_hwnd)):
+            user32.EnableWindow(target_hwnd, 1)
+            re_enabled = True
+
+        return {
+            "ok": True,
+            "target_hwnd": target_hwnd,
+            "enabled": True,
+            "dismissed": dismissed,
+            "re_enabled": re_enabled,
+        }
 
     def get_text(self, target: dict[str, Any]) -> tuple[str, str]:
         """

@@ -36,6 +36,7 @@ class WindowInfo:
     rect: dict[str, int] = field(default_factory=lambda: {
         "left": 0, "top": 0, "right": 800, "bottom": 600,
     })
+    dpi_scale: float | None = None  # Windows: GetDpiForWindow(hwnd) / 96.0
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +140,25 @@ class RealProcessManager(ProcessManager):
             rect_struct = ctypes.wintypes.RECT()
             user32.GetWindowRect(hwnd, ctypes.byref(rect_struct))
 
+            # DPI scale: GetDpiForWindow (Win10+) with fallback to GetDeviceCaps
+            dpi_scale: float | None = None
+            try:
+                dpi = user32.GetDpiForWindow(hwnd)
+                if dpi:
+                    dpi_scale = dpi / 96.0
+            except Exception:
+                pass
+            if dpi_scale is None:
+                try:
+                    dc = user32.GetDC(hwnd)
+                    if dc:
+                        dpi = ctypes.windll.gdi32.GetDeviceCaps(dc, 88)  # LOGPIXELSX
+                        if dpi:
+                            dpi_scale = dpi / 96.0
+                        user32.ReleaseDC(hwnd, dc)
+                except Exception:
+                    pass
+
             windows.append(WindowInfo(
                 hwnd=hwnd,
                 title=title,
@@ -152,6 +172,7 @@ class RealProcessManager(ProcessManager):
                     "right": rect_struct.right,
                     "bottom": rect_struct.bottom,
                 },
+                dpi_scale=dpi_scale,
             ))
             return True
 
@@ -175,6 +196,7 @@ class RealProcessManager(ProcessManager):
 
         candidates = self.list_windows(visible_only=False)
 
+        matches: list[WindowInfo] = []
         for win in candidates:
             if pid is not None and win.pid != pid:
                 continue
@@ -186,17 +208,31 @@ class RealProcessManager(ProcessManager):
                 continue
             if hwnd is not None and win.hwnd != hwnd:
                 continue
-            self._attached = win
-            return win
+            matches.append(win)
 
-        criteria = {
-            k: v for k, v in {
-                "pid": pid, "process_name": process_name,
-                "window_title": window_title, "class_name": class_name,
-                "hwnd": hwnd,
-            }.items() if v is not None
-        }
-        raise ProcessNotFoundError(f"No window matched: {criteria}")
+        if not matches:
+            criteria = {
+                k: v for k, v in {
+                    "pid": pid, "process_name": process_name,
+                    "window_title": window_title, "class_name": class_name,
+                    "hwnd": hwnd,
+                }.items() if v is not None
+            }
+            raise ProcessNotFoundError(f"No window matched: {criteria}")
+
+        # Rank candidates: prefer visible windows, then by largest area.
+        # This ensures select_window(process_name="qw.exe") picks the main
+        # QFRAME window rather than an invisible 1×1 helper like QWFly.
+        def _rank(w: WindowInfo) -> tuple:
+            area = (
+                (w.rect.get("right", 0) - w.rect.get("left", 0))
+                * (w.rect.get("bottom", 0) - w.rect.get("top", 0))
+            )
+            return (0 if w.visible else 1, -area)
+
+        matches.sort(key=_rank)
+        self._attached = matches[0]
+        return matches[0]
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +266,7 @@ class MockProcessManager(ProcessManager):
         if not any([pid, process_name, window_title, class_name, hwnd]):
             raise ProcessNotFoundError("At least one search criterion is required.")
 
+        matches: list[WindowInfo] = []
         for win in self._windows:
             if pid is not None and win.pid != pid:
                 continue
@@ -241,17 +278,29 @@ class MockProcessManager(ProcessManager):
                 continue
             if hwnd is not None and win.hwnd != hwnd:
                 continue
-            self._attached = win
-            return win
+            matches.append(win)
 
-        criteria = {
-            k: v for k, v in {
-                "pid": pid, "process_name": process_name,
-                "window_title": window_title, "class_name": class_name,
-                "hwnd": hwnd,
-            }.items() if v is not None
-        }
-        raise ProcessNotFoundError(f"No window matched: {criteria}")
+        if not matches:
+            criteria = {
+                k: v for k, v in {
+                    "pid": pid, "process_name": process_name,
+                    "window_title": window_title, "class_name": class_name,
+                    "hwnd": hwnd,
+                }.items() if v is not None
+            }
+            raise ProcessNotFoundError(f"No window matched: {criteria}")
+
+        # Prefer visible windows, then largest area (mirrors RealProcessManager).
+        def _rank(w: WindowInfo) -> tuple:
+            area = (
+                (w.rect.get("right", 0) - w.rect.get("left", 0))
+                * (w.rect.get("bottom", 0) - w.rect.get("top", 0))
+            )
+            return (0 if w.visible else 1, -area)
+
+        matches.sort(key=_rank)
+        self._attached = matches[0]
+        return matches[0]
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +426,13 @@ def _default_mock_windows() -> list[WindowInfo]:
             class_name="QWinFrame", pid=1234, process_name="qw.exe",
             visible=True,
             rect={"left": 0, "top": 0, "right": 1280, "bottom": 800},
+        ),
+        # Invisible 1×1 helper window — same process, should NOT win over QFRAME (#9)
+        WindowInfo(
+            hwnd=0xAA02, title="Flyover Help",
+            class_name="QWFly", pid=1234, process_name="qw.exe",
+            visible=False,
+            rect={"left": 0, "top": 0, "right": 1, "bottom": 1},
         ),
         WindowInfo(
             hwnd=0xBB01, title="Untitled - Notepad",

@@ -212,11 +212,38 @@ class MockUIABridge(UIABridge):
         y: int,
         double: bool = False,
         button: str = "left",
+        force_sendinput: bool = False,
     ) -> None:
         """Record the click in mouse_log (no real UI interaction in mock)."""
         self.mouse_log.append(
             {"x": x, "y": y, "double": double, "button": button}
         )
+
+    def send_win32_message(
+        self,
+        hwnd: int,
+        message: int,
+        wparam: int = 0,
+        lparam: int = 0,
+        sync: bool = True,
+    ) -> int:
+        """Record the message in mock log and return 1."""
+        self.keys_log.append(f"WIN32_MSG hwnd={hwnd} msg={message} wp={wparam} lp={lparam} sync={sync}")
+        return 1
+
+    def get_window_enabled_state(self, hwnd: int) -> dict[str, Any]:
+        """Mock: always returns enabled=True."""
+        return {"hwnd": hwnd, "enabled": True}
+
+    def dismiss_modal_overlay(self, target_hwnd: int) -> dict[str, Any]:
+        """Mock: no-op, target is always enabled in tests."""
+        return {
+            "ok": True,
+            "target_hwnd": target_hwnd,
+            "enabled": True,
+            "dismissed": [],
+            "re_enabled": False,
+        }
 
     def get_text(self, target: dict[str, Any] | None = None) -> tuple[str, str]:
         """

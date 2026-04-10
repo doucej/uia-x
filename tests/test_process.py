@@ -112,3 +112,73 @@ class TestCustomWindows:
         assert len(pm.list_windows()) == 1
         win = pm.attach(hwnd=0x9999)
         assert win.title == "My App"
+
+
+class TestWindowRanking:
+    """Issue #9 — attach() must prefer the large visible window over invisible helper."""
+
+    def test_attach_qw_returns_main_frame_not_fly_window(self, pm: MockProcessManager):
+        """QWFly (invisible 1×1 helper) must NOT win over QFRAME (main window)."""
+        win = pm.attach(process_name="qw.exe")
+        # The main Quicken window should win; QWFly is invisible and tiny
+        assert win.visible, "attach() returned an invisible window"
+        rect = win.rect
+        if rect and isinstance(rect, dict):
+            w = rect.get("right", 0) - rect.get("left", 0)
+            h = rect.get("bottom", 0) - rect.get("top", 0)
+            assert w * h > 100, f"attach() returned a tiny window with area {w * h}"
+
+    def test_attach_prefers_visible_over_invisible(self):
+        """When two windows have same process_name, visible one wins."""
+        windows = [
+            WindowInfo(
+                hwnd=0x0001, title="Invisible Helper", class_name="QWFly",
+                pid=500, process_name="qw.exe", visible=False,
+                rect={"left": 0, "top": 0, "right": 1, "bottom": 1},
+            ),
+            WindowInfo(
+                hwnd=0x0002, title="Quicken 2024", class_name="QFRAME",
+                pid=500, process_name="qw.exe", visible=True,
+                rect={"left": 100, "top": 100, "right": 1700, "bottom": 940},
+            ),
+        ]
+        pm = MockProcessManager(windows=windows)
+        win = pm.attach(process_name="qw.exe")
+        assert win.hwnd == 0x0002, f"Expected QFRAME (0x0002) but got {hex(win.hwnd)}"
+
+    def test_attach_among_equally_visible_prefers_larger(self):
+        """Among visible windows, the one with greater area wins."""
+        windows = [
+            WindowInfo(
+                hwnd=0x0010, title="Small Panel", class_name="QPANEL",
+                pid=500, process_name="qw.exe", visible=True,
+                rect={"left": 0, "top": 0, "right": 100, "bottom": 100},  # area = 10 000
+            ),
+            WindowInfo(
+                hwnd=0x0020, title="Quicken 2024", class_name="QFRAME",
+                pid=500, process_name="qw.exe", visible=True,
+                rect={"left": 0, "top": 0, "right": 1600, "bottom": 900},  # area = 1 440 000
+            ),
+        ]
+        pm = MockProcessManager(windows=windows)
+        win = pm.attach(process_name="qw.exe")
+        assert win.hwnd == 0x0020, f"Expected QFRAME (0x0020) but got {hex(win.hwnd)}"
+
+
+class TestDpiScale:
+    """Issue #10/#11 — dpi_scale field is present on WindowInfo."""
+
+    def test_windowinfo_has_dpi_scale_field(self):
+        w = WindowInfo(
+            hwnd=1, title="Test", class_name="TestClass",
+            pid=1, process_name="test.exe",
+        )
+        # Field must exist; None is acceptable when DPI is not determined
+        assert hasattr(w, "dpi_scale")
+
+    def test_dpi_scale_none_by_default(self):
+        w = WindowInfo(
+            hwnd=1, title="Test", class_name="TestClass",
+            pid=1, process_name="test.exe",
+        )
+        assert w.dpi_scale is None
