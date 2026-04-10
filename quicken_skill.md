@@ -1770,3 +1770,148 @@ uia_invoke(hwnd="0x400a4")   # SPENDING — ~8s (MSAA), then check QWMDI title
 # 5. Find account register controls
 uia_inspect(target={"hwnd": "0x3018e"}, depth=3)  # MDIClient subtree
 ```
+
+---
+
+## 26. Transaction Register (All Transactions / Account Register)
+
+### 26.1 Accessing the Register
+
+From the main Quicken window, click the **ACCOUNTS** nav button (QWNavigator area),
+then click **All Transactions** to open the full register view.
+
+```python
+# Navigate to All Transactions
+fa = uia_find_all(has_actions=True, named_only=True, include_hwnd=True, limit=100)
+btn_hwnds = {e['name']: e['hwnd'] for e in fa['elements'] if e.get('role')=='button'}
+
+# Click ACCOUNTS first if not in account view
+uia_invoke(hwnd=hex(btn_hwnds['ACCOUNTS']))   # ~4s
+
+# Then click All Transactions
+uia_invoke(hwnd=hex(btn_hwnds['All Transactions']))   # ~21s (first load)
+```
+
+After navigation, window title → `"... - [All Transactions]"`.
+
+### 26.2 TxList Structure
+
+The transaction register is built from these Win32 classes:
+
+```
+QWMDI "All Transactions" (MDI pane)
+├── [Static] × 3       — header/balance display
+│   ├── "6,912.00"     — balance amount (class=Static hwnd varies)
+│   └── "Total:"       — label
+├── QWClass_TransactionList "TxList"    — main grid (owner-drawn, no UIA children)
+│   ├── QWClass_TxToolbar "TxToolbar"  — entry row toolbar
+│   │   ├── QC_button "S&ave"          — save current transaction
+│   │   ├── QC_button "More actions"   — split, schedule, etc.
+│   │   └── QC_button "Split transaction"
+│   ├── QREdit "4/10/2026"  — date field (current entry row)
+│   ├── QREdit ""            — payee field
+│   ├── QREdit ""            — amount/memo field
+│   ├── [Static]
+│   └── QFBag                — quick-fill bag (auto-complete popup)
+│       ├── QC_button × N    — quick-fill suggestions
+├── QWScrollBar (vertical)
+└── QWScrollBar (horizontal)
+```
+
+> **Note**: Existing transactions in the list are **owner-drawn** — no Win32 child HWNDs
+> for individual rows. They are accessible via MSAA (slow) or `uia_read_display`.
+
+### 26.3 Filter Controls
+
+Located above the `TxList` (in the QWMDI pane):
+
+| Name | Class | HWND | Description |
+|------|-------|------|-------------|
+| All accounts | QWComboBox | 0x111a2 | Account filter |
+| Last 12 Months | QWComboBox | 0x111a6 | Date range |
+| Any Type | QWComboBox | 0x111aa | Transaction type |
+| All Transactions | QWComboBox | 0x111ae | View filter |
+
+Use `uia_invoke(hwnd=...)` to click a combo, then inspect the dropdown.
+
+### 26.4 Reading Transaction Fields
+
+The `QREdit` fields (date, payee, amount) in the **entry row** are readable via `uia_get_text`:
+
+```python
+# Date field shows today's date in the new-entry row
+date_val = uia_get_text(target={"hwnd": "0x1118c"})
+# → {"ok": True, "text": "4/10/2026", "source": "value"}
+
+# Payee and amount are empty until focused
+payee_val = uia_get_text(target={"hwnd": "0x1118e"})
+# → {"ok": True, "text": "", "source": "none"}
+```
+
+> The `source` field is `"value"` for QREdit because pywinauto's `get_value()` uses
+> `WM_GETTEXT` which works for custom edit classes.
+
+### 26.5 Entering a New Transaction
+
+```python
+# 1. Start new entry (goes to blank new row at bottom of register)
+#    Either click the empty row, or use Ctrl+Shift+N
+uia_send_keys(keys='^+n')    # Ctrl+Shift+N
+
+# 2. After Ctrl+Shift+N, standard 'edit' class fields appear for the new row
+#    Find them:
+fa = uia_find_all(roles=['edit'], include_hwnd=True, limit=50)
+edit_hwnds = [e['hwnd'] for e in fa['elements']]
+# Typically 2 standard 'edit' class HWNDs for payee and memo
+
+# 3. Set values via uia_set_value (uses WM_SETTEXT for custom classes)
+uia_set_value(target={"hwnd": hex(edit_hwnds[0])}, value="Grocery Store")
+
+# 4. Tab through fields with uia_send_keys
+uia_send_keys(keys='{TAB}')   # advance to next field
+
+# 5. Save the transaction
+uia_invoke(hwnd=hex(save_button_hwnd))  # "S&ave" QC_button
+# OR
+uia_send_keys(keys='{ENTER}')   # also saves
+
+# 6. Cancel without saving
+uia_send_keys(keys='{ESC}')
+```
+
+> **IMPORTANT**: Always `{ESC}` before navigating away if you don't want to save.
+
+### 26.6 Reading Existing Transactions (owner-drawn list)
+
+The transaction rows are owner-drawn — no individual HWNDs. Options:
+
+```python
+# Option A: uia_read_display — reads the visual text of the TxList
+disp = uia_read_display(target={"hwnd": "0x11184"})  # QWClass_TransactionList hwnd
+
+# Option B: MSAA via legacy_invoke / uia_legacy_invoke (very slow — 25s+)
+# Not recommended unless MSAA data is specifically needed
+
+# Option C: Window title shows account balance (Static hwnd near top of QWMDI)
+balance_text = uia_get_text(target={"hwnd": "0x11170"})
+# → "6,912.00" (total balance shown at top of register)
+```
+
+### 26.7 Transaction Register Class Inventory
+
+All new classes added to `_WIN32_CLASS_TO_ROLE` in this session:
+
+| Class | Role | Notes |
+|-------|------|-------|
+| QREdit | edit | Register entry field (date, payee, amount) |
+| QWClass_TransactionList | list | Main transaction grid (owner-drawn) |
+| QWClass_TxToolbar | toolbar | Transaction entry toolbar (Save, More, Split) |
+| QWScrollBar | scrollbar | Quicken custom scroll bar |
+| QWInChild | pane | Generic Quicken child container |
+| QWNavBtnTray | toolbar | Account bar nav tray |
+| QWAcctBarHolder | pane | Account bar holder |
+| QWNavigator | pane | Left sidebar navigator |
+| QSideBar | pane | Sidebar |
+| QWMDI | pane | MDI content pane |
+| MDIfr | pane | MDI frame |
+

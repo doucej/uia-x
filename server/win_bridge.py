@@ -178,6 +178,18 @@ _WIN32_CLASS_TO_ROLE: dict[str, str] = {
     "qwmenubar": "menubar",
     "qwlistbox": "list",
     "qwedit": "edit",
+    # Quicken transaction register classes
+    "qredit": "edit",                          # register entry field (date, payee, amount)
+    "qwclass_transactionlist": "list",         # main transaction grid
+    "qwclass_txtoolbar": "toolbar",            # transaction toolbar (Save, More actions, Split)
+    "qwscrollbar": "scrollbar",               # Quicken custom scrollbar
+    "qwinchild": "pane",                       # generic Quicken child container
+    "qwnavbtntray": "toolbar",                 # account bar nav tray
+    "qwacctbarholder": "pane",                 # account bar holder
+    "qwnavigator": "pane",                     # left sidebar navigator
+    "qsidebar": "pane",                        # sidebar
+    "qwmdi": "pane",                           # MDI content pane
+    "mdifr": "pane",                           # MDI frame
 }
 
 # Win32 class names that have interactive actions (lowercase).
@@ -191,6 +203,8 @@ _WIN32_INTERACTIVE_CLASSES: frozenset[str] = frozenset({
     "sysmonthcal32", "sysdatetimepick32", "sysipaddress32",
     # Quicken custom
     "qc_button", "qwcombobox", "qwlistbox", "qwedit", "qwmenubar",
+    # Quicken transaction register
+    "qredit", "qwclass_transactionlist", "qwcombobox",
 })
 
 # GWL_STYLE / WS_TABSTOP: controls with this style are keyboard-navigable.
@@ -1150,21 +1164,39 @@ class WinUIABridge(UIABridge):
             ) from exc
 
     def set_value(self, target: dict[str, Any], value: str) -> None:
+        import ctypes  # noqa: PLC0415
+
         root = _attach_target()
         element = _find_element(root, target)
+
+        # 1. pywinauto set_edit_text (uses WM_SETTEXT for HwndWrappers)
         try:
             element.set_edit_text(value)
             return
         except Exception:
             pass
+
+        # 2. UIA ValuePattern SetValue (works for native UIA edit controls)
         try:
             iface = element.iface_value
             iface.SetValue(value)
             return
-        except Exception as exc:
-            raise PatternNotSupportedError(
-                "Value", element.window_text()
-            ) from exc
+        except Exception:
+            pass
+
+        # 3. Win32 WM_SETTEXT fallback for custom classes (QREdit, QWEdit, etc.)
+        WM_SETTEXT = 0x000C
+        SMTO_ABORTIFHUNG = 0x0002
+        hwnd = getattr(element, "handle", None)
+        if hwnd:
+            buf = ctypes.create_unicode_buffer(value)
+            result = ctypes.windll.user32.SendMessageTimeoutW(
+                hwnd, WM_SETTEXT, 0, buf, SMTO_ABORTIFHUNG, 200, None
+            )
+            if result:
+                return
+
+        raise PatternNotSupportedError("Value", element.window_text())
 
     def send_keys(self, keys: str, target: dict[str, Any] | None = None) -> None:
         _require_pywinauto()
