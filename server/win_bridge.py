@@ -353,6 +353,81 @@ def _win32_element_from_hwnd(hwnd: int):
     except Exception:  # noqa: BLE001
         return None
 
+
+def _win32_inspect_tree(hwnd: int, depth: int) -> dict[str, Any]:
+    """Build an element tree using pure Win32 APIs (no COM/MSAA).
+
+    ~100× faster than UIA-based ``_element_to_dict`` for legacy Win32 apps
+    like Quicken whose UIA tree is bridged through slow MSAA.  Children are
+    enumerated via ``GetWindow(GW_CHILD/GW_HWNDNEXT)`` and text is read with
+    ``SendMessageTimeoutW`` (50 ms cap) to avoid blocking on busy controls.
+    """
+    import ctypes  # noqa: PLC0415
+    import ctypes.wintypes  # noqa: PLC0415
+
+    user32 = ctypes.windll.user32
+    _GW_CHILD = 5
+    _GW_HWNDNEXT = 2
+    _WM_GETTEXT = 0x000D
+    _SMTO_ABORTIFHUNG = 0x0002
+
+    cls_buf = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(hwnd, cls_buf, 256)
+    cls = cls_buf.value
+    cls_lower = cls.lower()
+
+    txt_buf = ctypes.create_unicode_buffer(512)
+    result_len = ctypes.c_ulong(0)
+    user32.SendMessageTimeoutW(
+        hwnd, _WM_GETTEXT, 512, txt_buf,
+        _SMTO_ABORTIFHUNG, 50, ctypes.byref(result_len),
+    )
+    name = txt_buf.value
+
+    rc = ctypes.wintypes.RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(rc))
+
+    is_enabled = bool(user32.IsWindowEnabled(hwnd))
+    role = _WIN32_CLASS_TO_ROLE.get(cls, _WIN32_CLASS_TO_ROLE.get(cls_lower, cls or "custom"))
+
+    actions: list[str] = []
+    if cls_lower in _WIN32_INTERACTIVE_CLASSES:
+        if cls_lower in ("button", "qc_button", "toolbarwindow32", "qwmenubar"):
+            actions = ["click"]
+        elif cls_lower in ("edit", "richedit20w", "richedit20a", "richedit50w",
+                           "rich edit", "sysipaddress32", "qwedit"):
+            actions = ["type"]
+        elif cls_lower in ("combobox", "comboboxex32", "qwcombobox", "listbox",
+                           "qwlistbox", "syslistview32", "listview",
+                           "systreeview32", "treeview", "systabcontrol32", "tabcontrol"):
+            actions = ["select"]
+        else:
+            actions = ["click"]
+
+    node: dict[str, Any] = {
+        "name": name,
+        "control_type": role,
+        "class_name": cls,
+        "hwnd": hwnd,
+        "hwnd_hex": hex(hwnd),
+        "enabled": is_enabled,
+        "rect": {"left": rc.left, "top": rc.top, "right": rc.right, "bottom": rc.bottom},
+        "children": [],
+    }
+    if actions:
+        node["actions"] = actions
+
+    if depth > 0:
+        child = user32.GetWindow(hwnd, _GW_CHILD)
+        while child:
+            try:
+                node["children"].append(_win32_inspect_tree(child, depth - 1))
+            except Exception:  # noqa: BLE001
+                pass
+            child = user32.GetWindow(child, _GW_HWNDNEXT)
+
+    return node
+
 # ---------------------------------------------------------------------------
 # SendKeys helpers
 # ---------------------------------------------------------------------------
@@ -944,6 +1019,15 @@ class WinUIABridge(UIABridge):
         selector = {k: v for k, v in target.items() if k != "depth"} if target else {}
         depth = int(target.get("depth", _DEPTH_DEFAULT)) if target else _DEPTH_DEFAULT
         element = _find_element(root, selector)
+        # Fast path: use Win32 tree enumeration when the element has a HWND.
+        # This is ~100× faster than UIA for legacy Win32 apps like Quicken
+        # whose UIA tree is bridged through slow MSAA.
+        try:
+            hwnd = element.handle
+            if hwnd and hwnd > 0:
+                return _win32_inspect_tree(hwnd, depth)
+        except Exception:  # noqa: BLE001
+            pass
         return _element_to_dict(element, depth)
 
     def invoke(self, target: dict[str, Any]) -> None:
@@ -966,20 +1050,41 @@ class WinUIABridge(UIABridge):
                 pass
         if _raw_hwnd is not None:
             import ctypes  # noqa: PLC0415
+            import ctypes.wintypes  # noqa: PLC0415
             _u32 = ctypes.windll.user32
             try:
                 _cls_buf = ctypes.create_unicode_buffer(256)
                 _u32.GetClassNameW(_raw_hwnd, _cls_buf, 256)
                 _cls = _cls_buf.value.lower()
+                _orig_cls = _cls_buf.value
             except Exception:
                 _cls = ""
-            if _cls in ("button", "toolbarwindow32") or not _cls:
+                _orig_cls = ""
+            # Check if the Win32 class maps to a button/toolbar role
+            _mapped_role = _WIN32_CLASS_TO_ROLE.get(_orig_cls, _WIN32_CLASS_TO_ROLE.get(_cls, ""))
+            _is_button_class = (
+                _cls in ("button", "toolbarwindow32")
+                or _mapped_role in ("button", "toolbar", "push button")
+                or not _cls
+            )
+            if _is_button_class:
                 # BM_CLICK = 0x00F5 — synchronous; works for standard buttons.
                 if _u32.SendMessageW(_raw_hwnd, 0x00F5, 0, 0) == 0 or not _cls:
                     # Also try SetFocus + BM_CLICK for custom button-like controls.
                     _u32.SetFocus(_raw_hwnd)
                     _u32.SendMessageW(_raw_hwnd, 0x00F5, 0, 0)
                 return
+            # For any other hwnd-targeted element (e.g. QC_button, custom controls),
+            # synthesise WM_LBUTTONDOWN/WM_LBUTTONUP at the center of the client rect.
+            _cr = ctypes.wintypes.RECT()
+            _u32.GetClientRect(_raw_hwnd, ctypes.byref(_cr))
+            _cx = (_cr.right - _cr.left) // 2
+            _cy = (_cr.bottom - _cr.top) // 2
+            _lp = ctypes.c_long((_cy << 16) | (_cx & 0xFFFF)).value
+            _u32.SetFocus(_raw_hwnd)
+            _u32.SendMessageW(_raw_hwnd, 0x0201, 0x0001, _lp)  # WM_LBUTTONDOWN
+            _u32.SendMessageW(_raw_hwnd, 0x0202, 0, _lp)       # WM_LBUTTONUP
+            return
         # ------------------------------------------------------------------
         # Standard UIA / MSAA path
         # ------------------------------------------------------------------

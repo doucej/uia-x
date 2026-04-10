@@ -330,6 +330,7 @@ def select_window(
 def uia_inspect(
     name: str = "",
     target: dict[str, Any] = {},  # noqa: B006
+    depth: int = 3,
     api_key: str = "",
 ) -> dict[str, Any]:
     """
@@ -347,16 +348,20 @@ def uia_inspect(
                     ``"automation_id"``, ``"control_type"``, ``"class_name"``,
                     ``"path"``, ``"legacy_name"``, ``"legacy_role"``, ``"hwnd"``
         ``value`` – value for the chosen strategy
-        ``depth`` – how many levels of children to expand (default 3)
+        ``depth`` – how many levels of children to expand (overridden by top-level depth param)
         ``index`` – zero-based index for multiple matches (default 0)
 
         Pass an empty dict ``{}`` to return the root window.
+    depth : int
+        How many levels of children to expand (default 3). Overrides target["depth"].
     """
     auth_err = _check_auth(api_key)
     if auth_err:
         return auth_err
     if name and not target:
         target = {"by": "name", "value": name}
+    # Inject depth into target dict (top-level param takes precedence)
+    target = {**target, "depth": depth} if target else {"depth": depth}
     try:
         bridge = _get_bridge()
         element = bridge.inspect(target)
@@ -487,9 +492,11 @@ def uia_find_all(
 @mcp.tool(
     name="uia_invoke",
     description=(
-        "Click or activate a UI element by name. "
+        "Click or activate a UI element by name or HWND. "
         "Use name='Button Name' with the exact name from uia_find_all. "
+        "Use hwnd='0x1234' (the hex hwnd from uia_find_all include_hwnd=True) for the fastest path. "
         "Example: uia_invoke(name='7') clicks the '7' button. "
+        "Example: uia_invoke(hwnd='0x40164') clicks by window handle (fastest, no scan). "
         "Example: uia_invoke(name='=') presses equals and returns the result when read_after=true. "
         "Set read_after=true to read the focused element's text immediately after invoking "
         "(useful for getting calculator results, updated labels, etc.). "
@@ -504,6 +511,7 @@ def uia_find_all(
 def uia_invoke(
     name: str = "",
     target: dict[str, Any] = {},  # noqa: B006
+    hwnd: str = "",
     read_after: bool = False,
     api_key: str = "",
 ) -> dict[str, Any]:
@@ -518,6 +526,9 @@ def uia_invoke(
         Use names from uia_find_all output.
     target : dict
         Full selector dict (used when name is not set).
+    hwnd : str
+        Hex HWND string (e.g. '0x401f2') from uia_find_all include_hwnd=True.
+        Fastest path — no element scan required. Takes precedence over name.
     read_after : bool
         When True, read the focused element's text after invoking and include
         it in the response as ``after_text`` / ``after_source``.  Useful after
@@ -526,6 +537,8 @@ def uia_invoke(
     auth_err = _check_auth(api_key)
     if auth_err:
         return auth_err
+    if hwnd and not target:
+        target = {"hwnd": hwnd}
     if name and not target:
         target = {"by": "name", "value": name}
     if not target:
