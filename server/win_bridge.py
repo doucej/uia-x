@@ -308,7 +308,7 @@ def _win32_fast_find_all(
                 if cls in ("button", "qc_button"):
                     actions = ["click"]
                 elif cls in ("edit", "richedit20w", "richedit20a", "richedit50w",
-                             "rich edit", "sysipaddress32", "qwedit"):
+                             "rich edit", "sysipaddress32", "qwedit", "qredit"):
                     actions = ["type"]
                 elif cls in ("listbox", "combobox", "comboboxex32", "qwcombobox",
                              "qwlistbox", "syslistview32", "listview",
