@@ -1060,22 +1060,28 @@ class WinUIABridge(UIABridge):
             except Exception:
                 _cls = ""
                 _orig_cls = ""
-            # Check if the Win32 class maps to a button/toolbar role
-            _mapped_role = _WIN32_CLASS_TO_ROLE.get(_orig_cls, _WIN32_CLASS_TO_ROLE.get(_cls, ""))
-            _is_button_class = (
-                _cls in ("button", "toolbarwindow32")
-                or _mapped_role in ("button", "toolbar", "push button")
-                or not _cls
-            )
-            if _is_button_class:
-                # BM_CLICK = 0x00F5 — synchronous; works for standard buttons.
+            if _cls in ("button",) or not _cls:
+                # Native Win32 BUTTON class responds to BM_CLICK (0x00F5).
                 if _u32.SendMessageW(_raw_hwnd, 0x00F5, 0, 0) == 0 or not _cls:
-                    # Also try SetFocus + BM_CLICK for custom button-like controls.
                     _u32.SetFocus(_raw_hwnd)
                     _u32.SendMessageW(_raw_hwnd, 0x00F5, 0, 0)
                 return
-            # For any other hwnd-targeted element (e.g. QC_button, custom controls),
-            # synthesise WM_LBUTTONDOWN/WM_LBUTTONUP at the center of the client rect.
+            # For custom/non-standard classes (e.g. QC_button, QWComboBox):
+            # 1) Fast O(1) UIA wrap → UIA invoke or MSAA DoDefaultAction (proven
+            #    to work for Quicken's QC_button navigation buttons).
+            _elem = _win32_element_from_hwnd(_raw_hwnd)
+            if _elem is not None:
+                try:
+                    _elem.invoke()
+                    return
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    _elem.iface_legacy_iaccessible.DoDefaultAction()
+                    return
+                except Exception:  # noqa: BLE001
+                    pass
+            # 2) Last resort: synthesise WM_LBUTTONDOWN/WM_LBUTTONUP at client center.
             _cr = ctypes.wintypes.RECT()
             _u32.GetClientRect(_raw_hwnd, ctypes.byref(_cr))
             _cx = (_cr.right - _cr.left) // 2
