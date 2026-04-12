@@ -347,6 +347,49 @@ class UIABridge(ABC):
             code="NOT_SUPPORTED",
         )
 
+    def open_reconcile(
+        self,
+        account_name: str,
+        statement_date: str,
+        ending_balance: str,
+        service_charge: str = "",
+        service_date: str = "",
+        interest_earned: str = "",
+        interest_date: str = "",
+        timeout_ms: int = 5000,
+    ) -> dict[str, Any]:
+        """
+        Open the Quicken reconcile dialog and enter statement details.
+
+        Parameters
+        ----------
+        account_name
+            Account to reconcile.
+        statement_date
+            Statement end date (e.g. "03/31/2026").
+        ending_balance
+            Statement ending balance (e.g. "1,234.00").
+        service_charge, service_date, interest_earned, interest_date
+            Optional bank-charge/interest fields.
+        timeout_ms
+            Max wait (ms) for each dialog.
+
+        Returns
+        -------
+        dict
+            ``{"ok": True, "account": str, "statement_date": str,
+               "ending_balance": str}``
+
+        Raises
+        ------
+        UIAError
+            ``NOT_SUPPORTED`` on non-Windows backends.
+        """
+        raise UIAError(
+            "open_reconcile is only available on the Windows backend.",
+            code="NOT_SUPPORTED",
+        )
+
 
 # ---------------------------------------------------------------------------
 # Factory

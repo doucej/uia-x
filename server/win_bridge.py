@@ -2166,3 +2166,219 @@ class WinUIABridge(UIABridge):
             "height": height,
             "format": "PNG",
         }
+
+    def open_reconcile(
+        self,
+        account_name: str,
+        statement_date: str,
+        ending_balance: str,
+        service_charge: str = "",
+        service_date: str = "",
+        interest_earned: str = "",
+        interest_date: str = "",
+        timeout_ms: int = 5000,
+    ) -> dict[str, Any]:
+        """Open the Quicken reconcile dialog and enter statement details.
+
+        Sends WM_COMMAND 7203 to QFRAME to open the "Choose Reconcile Account"
+        dialog, selects *account_name*, clicks OK, fills in the statement date
+        and ending balance in the "Reconcile Details" dialog, then clicks OK to
+        begin reconciliation.
+
+        Parameters
+        ----------
+        account_name
+            Account to reconcile (must match an item in the combo).
+        statement_date
+            Statement end date (e.g. "03/31/2026").
+        ending_balance
+            Statement ending balance (e.g. "1,234.00").
+        service_charge, service_date, interest_earned, interest_date
+            Optional bank-charge and interest fields.
+        timeout_ms
+            Max wait (ms) for each dialog to appear.
+
+        Returns
+        -------
+        dict
+            ``{"ok": True, "account": str, "statement_date": str,
+               "ending_balance": str}``
+        """
+        import ctypes  # noqa: PLC0415
+        import ctypes.wintypes  # noqa: PLC0415
+        import time  # noqa: PLC0415
+
+        user32 = ctypes.windll.user32
+
+        from server.process_manager import get_process_manager  # noqa: PLC0415
+        pm = get_process_manager()
+        if not pm.attached:
+            raise TargetNotFoundError("Use select_window to attach first.")
+
+        WM_COMMAND = 0x0111
+        WM_GETTEXT = 0x000D
+        WM_SETTEXT = 0x000C
+        WM_GETTEXTLENGTH = 0x000E
+        CB_GETCOUNT = 0x0146
+        CB_GETLBTEXT = 0x0148
+        CB_GETLBTEXTLEN = 0x0149
+        CB_SETCURSEL = 0x014E
+        BM_CLICK = 0x00F5
+
+        root_hwnd = pm.attached.hwnd
+
+        def _read_text(h: int) -> str:
+            tlen = user32.SendMessageW(h, WM_GETTEXTLENGTH, 0, 0)
+            if tlen <= 0:
+                return ""
+            buf = ctypes.create_unicode_buffer(tlen + 1)
+            user32.SendMessageW(h, WM_GETTEXT, len(buf), buf)
+            return buf.value
+
+        def _click_qc_button(h: int) -> None:
+            """Click a QC_button via WM_LBUTTONDOWN/WM_LBUTTONUP."""
+            rc = ctypes.wintypes.RECT()
+            user32.GetClientRect(h, ctypes.byref(rc))
+            cx = (rc.right - rc.left) // 2
+            cy = (rc.bottom - rc.top) // 2
+            lp = ctypes.c_long((cy << 16) | (cx & 0xFFFF)).value
+            user32.SetFocus(h)
+            user32.SendMessageW(h, 0x0201, 1, lp)  # WM_LBUTTONDOWN
+            user32.SendMessageW(h, 0x0202, 0, lp)  # WM_LBUTTONUP
+
+        def _wait_for_dialog(title_substr: str, timeout: float) -> int | None:
+            """Poll until a top-level dialog with matching title appears."""
+            buf = ctypes.create_unicode_buffer(256)
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                found: list[int] = []
+                def _enum(h: int, _: int) -> bool:
+                    if user32.IsWindowVisible(h):
+                        user32.GetWindowTextW(h, buf, 256)
+                        if title_substr.lower() in buf.value.lower():
+                            found.append(h)
+                    return True
+                cb = ctypes.WINFUNCTYPE(
+                    ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
+                )(_enum)
+                user32.EnumWindows(cb, 0)
+                if found:
+                    return found[0]
+                time.sleep(0.15)
+            return None
+
+        def _get_dialog_children(dlg_hwnd: int) -> list[tuple[int, str, str]]:
+            buf = ctypes.create_unicode_buffer(256)
+            items: list[tuple[int, str, str]] = []
+            def _ec(h: int, _: int) -> bool:
+                cls = ctypes.create_unicode_buffer(64)
+                user32.GetClassNameW(h, cls, 64)
+                user32.GetWindowTextW(h, buf, 256)
+                items.append((h, cls.value.lower(), buf.value))
+                return True
+            cb = ctypes.WINFUNCTYPE(
+                ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
+            )(_ec)
+            user32.EnumChildWindows(dlg_hwnd, cb, 0)
+            return items
+
+        timeout_s = timeout_ms / 1000.0
+
+        # ── Step 1: send WM_COMMAND 7203 to open Choose Reconcile Account ──
+        user32.PostMessageW(root_hwnd, WM_COMMAND, 7203, 0)
+
+        acct_dlg = _wait_for_dialog("Choose Reconcile Account", timeout_s)
+        if acct_dlg is None:
+            raise UIAError(
+                "Choose Reconcile Account dialog did not appear.",
+                code="DIALOG_NOT_FOUND",
+            )
+
+        children = _get_dialog_children(acct_dlg)
+
+        # Find the combo and select the account.
+        combo_h = next((h for h, c, _ in children if c == "qwcombobox"), None)
+        if combo_h is None:
+            raise UIAError("Account combo not found in reconcile dialog.", code="ELEMENT_NOT_FOUND")
+
+        count = user32.SendMessageW(combo_h, CB_GETCOUNT, 0, 0)
+        target_idx: int | None = None
+        for i in range(count):
+            tlen = user32.SendMessageW(combo_h, CB_GETLBTEXTLEN, i, 0)
+            tbuf = ctypes.create_unicode_buffer(tlen + 2)
+            user32.SendMessageW(combo_h, CB_GETLBTEXT, i, tbuf)
+            if tbuf.value.strip().lower() == account_name.strip().lower():
+                target_idx = i
+                break
+
+        if target_idx is None:
+            # Cancel the dialog and raise.
+            cancel_h = next((h for h, c, t in children if c == "qc_button" and t == "Cancel"), None)
+            if cancel_h:
+                _click_qc_button(cancel_h)
+            raise UIAError(
+                f"Account '{account_name}' not found in reconcile combo.",
+                code="ACCOUNT_NOT_FOUND",
+            )
+
+        user32.SendMessageW(combo_h, CB_SETCURSEL, target_idx, 0)
+
+        # Click OK.
+        ok_h = next((h for h, c, t in children if c == "qc_button" and t == "OK"), None)
+        if ok_h is None:
+            raise UIAError("OK button not found in account selection dialog.", code="ELEMENT_NOT_FOUND")
+        _click_qc_button(ok_h)
+
+        # ── Step 2: wait for Reconcile Details dialog ──
+        det_dlg = _wait_for_dialog("Reconcile Details", timeout_s)
+        if det_dlg is None:
+            raise UIAError(
+                "Reconcile Details dialog did not appear after account selection.",
+                code="DIALOG_NOT_FOUND",
+            )
+
+        det_children = _get_dialog_children(det_dlg)
+        edit_handles = [h for h, c, _ in det_children if c == "edit"]
+        # Layout order (by z-order): date, prior balance, ending balance,
+        # service_charge, service_date, service_category,
+        # interest_earned, interest_date, interest_category.
+        # Indices 0, 2 are the ones we must fill.
+        if len(edit_handles) < 3:
+            raise UIAError(
+                f"Expected ≥3 Edit fields in Reconcile Details, got {len(edit_handles)}.",
+                code="UNEXPECTED_LAYOUT",
+            )
+
+        def _set_edit(h: int, text: str) -> None:
+            if not text:
+                return
+            user32.SetFocus(h)
+            user32.SendMessageW(h, WM_SETTEXT, 0, text)
+
+        _set_edit(edit_handles[0], statement_date)   # Ending statement date
+        _set_edit(edit_handles[2], ending_balance)   # Ending balance
+        if service_charge:
+            _set_edit(edit_handles[3], service_charge)
+        if service_date:
+            _set_edit(edit_handles[4], service_date)
+        if interest_earned:
+            _set_edit(edit_handles[6], interest_earned)
+        if interest_date:
+            _set_edit(edit_handles[7], interest_date)
+
+        # Click OK to begin reconciliation.
+        det_ok_h = next(
+            (h for h, c, t in det_children if c == "qc_button" and t == "OK"), None
+        )
+        if det_ok_h is None:
+            raise UIAError("OK button not found in Reconcile Details dialog.", code="ELEMENT_NOT_FOUND")
+        _click_qc_button(det_ok_h)
+
+        time.sleep(0.5)
+
+        return {
+            "ok": True,
+            "account": account_name,
+            "statement_date": statement_date,
+            "ending_balance": ending_balance,
+        }

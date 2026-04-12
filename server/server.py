@@ -1438,6 +1438,81 @@ def capture_screenshot(
         return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
 
 
+# ===================================================================
+# Tool: open_reconcile
+# ===================================================================
+
+
+@mcp.tool(
+    name="open_reconcile",
+    description=(
+        "Open the Quicken reconcile dialog for an account and enter statement "
+        "details.  Sends WM_COMMAND 7203 to QFRAME, handles the 'Choose "
+        "Reconcile Account' dialog, selects the account, then fills in the "
+        "'Reconcile Details' dialog with the statement date and ending balance.  "
+        "After this call returns ok=true the register switches to reconcile "
+        "mode — use read_register_state to check reconcile_active=true.  "
+        "Dates must be in MM/DD/YYYY format (e.g. '03/31/2026').  "
+        "Balances are plain numbers or comma-formatted (e.g. '1234.56' or "
+        "'1,234.56').  "
+        "Only available on Windows.  "
+        "Returns: {ok, account, statement_date, ending_balance}."
+    ),
+)
+def open_reconcile(
+    account_name: str,
+    statement_date: str,
+    ending_balance: str,
+    service_charge: str = "",
+    service_date: str = "",
+    interest_earned: str = "",
+    interest_date: str = "",
+    timeout_ms: int = 5000,
+    api_key: str = "",
+) -> dict[str, Any]:
+    """
+    Open Quicken's reconcile dialog and enter statement details.
+
+    Parameters
+    ----------
+    account_name : str
+        Account to reconcile (e.g. "Checking").
+    statement_date : str
+        Statement end date in MM/DD/YYYY (e.g. "03/31/2026").
+    ending_balance : str
+        Statement ending balance (e.g. "1,234.00").
+    service_charge : str
+        Optional bank service charge amount.
+    service_date : str
+        Date for the service charge.
+    interest_earned : str
+        Optional interest earned amount.
+    interest_date : str
+        Date for the interest earned.
+    timeout_ms : int
+        Max wait (ms) for each dialog to appear (default 5000).
+    """
+    auth_err = _check_auth(api_key)
+    if auth_err:
+        return auth_err
+    try:
+        bridge = _get_bridge()
+        return bridge.open_reconcile(
+            account_name=account_name,
+            statement_date=statement_date,
+            ending_balance=ending_balance,
+            service_charge=service_charge,
+            service_date=service_date,
+            interest_earned=interest_earned,
+            interest_date=interest_date,
+            timeout_ms=timeout_ms,
+        )
+    except UIAError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------

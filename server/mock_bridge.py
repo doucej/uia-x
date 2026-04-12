@@ -304,6 +304,25 @@ class MockUIABridge(UIABridge):
             )
         return {"ok": True, "image_b64": image_b64, "width": 1, "height": 1, "format": "PNG"}
 
+    def open_reconcile(
+        self,
+        account_name: str,
+        statement_date: str,
+        ending_balance: str,
+        service_charge: str = "",
+        service_date: str = "",
+        interest_earned: str = "",
+        interest_date: str = "",
+        timeout_ms: int = 5000,
+    ) -> dict[str, Any]:
+        """Mock: always returns ok for the first mock account."""
+        return {
+            "ok": True,
+            "account": account_name,
+            "statement_date": statement_date,
+            "ending_balance": ending_balance,
+        }
+
     def get_text(self, target: dict[str, Any] | None = None) -> tuple[str, str]:
         """
         Return the human-readable text of a mock element.
