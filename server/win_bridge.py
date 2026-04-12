@@ -2287,7 +2287,56 @@ class WinUIABridge(UIABridge):
         # ── Step 1: send WM_COMMAND 7203 to open Choose Reconcile Account ──
         user32.PostMessageW(root_hwnd, WM_COMMAND, 7203, 0)
 
-        acct_dlg = _wait_for_dialog("Choose Reconcile Account", timeout_s)
+        # Wait for either the Choose Account dialog OR the "no items" notification.
+        # Poll for both in parallel since the "no uncleared items" dialog has
+        # title starting with "Quicken" (no fixed title for detection).
+        acct_dlg: int | None = None
+        already_done: bool = False
+        buf_tmp = ctypes.create_unicode_buffer(512)
+        deadline_step1 = time.monotonic() + timeout_s
+        while time.monotonic() < deadline_step1:
+            hits: list[int] = []
+            def _poll(h: int, _: int) -> bool:
+                if user32.IsWindowVisible(h):
+                    user32.GetWindowTextW(h, buf_tmp, 512)
+                    t_low = buf_tmp.value.lower()
+                    if "choose reconcile account" in t_low:
+                        hits.append(h)
+                    elif "no uncleared" in t_low or "nothing to reconcile" in t_low:
+                        hits.append(-(h))  # negative = already-done dialog
+                return True
+            cb_poll = ctypes.WINFUNCTYPE(
+                ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
+            )(_poll)
+            user32.EnumWindows(cb_poll, 0)
+            for hit in hits:
+                if hit > 0:
+                    acct_dlg = hit
+                    break
+                else:
+                    # "no uncleared items" — dismiss and report
+                    already_done = True
+                    ok_dismiss = next(
+                        (h for h, c, t in _get_dialog_children(-hit)
+                         if c == "qc_button" and t == "OK"),
+                        None,
+                    )
+                    if ok_dismiss:
+                        _click_qc_button(ok_dismiss)
+                    break
+            if acct_dlg or already_done:
+                break
+            time.sleep(0.15)
+
+        if already_done:
+            return {
+                "ok": True,
+                "account": account_name,
+                "statement_date": statement_date,
+                "ending_balance": ending_balance,
+                "note": "Reconcile already active or no uncleared items.",
+            }
+
         if acct_dlg is None:
             raise UIAError(
                 "Choose Reconcile Account dialog did not appear.",
