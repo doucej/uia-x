@@ -2113,3 +2113,116 @@ To cancel without saving:
 uia_send_keys(keys="{ESC}")
 ```
 
+---
+
+## §30 — `capture_screenshot` — Visual Access to Owner-Drawn Controls
+
+Owner-drawn controls like `QWClass_TransactionList` have no per-row HWNDs and are
+not accessible via UIA or Win32 message enumeration (#20). `capture_screenshot`
+returns the window as a base64-encoded PNG so vision-capable models can read
+transaction rows visually and compute click coordinates.
+
+```json
+// Capture the attached window
+{ "tool": "capture_screenshot" }
+// → {"ok": true, "image_b64": "...", "width": 968, "height": 691, "format": "PNG"}
+
+// Capture a specific HWND (e.g. the TxList pane)
+{ "tool": "capture_screenshot", "hwnd": 67670 }
+
+// Capture an arbitrary screen region
+{ "tool": "capture_screenshot", "region": {"left": 0, "top": 200, "right": 968, "bottom": 691} }
+```
+
+**Pre-conditions:** Pillow must be installed (`pip install pillow`). Windows only.
+
+**Workflow for marking cleared rows (gpt-oss:20b or vision model):**
+1. Call `capture_screenshot()` to get the current register view.
+2. Parse the image to identify rows by payee/amount/date.
+3. Estimate the y-coordinate of the target row (each row ≈ 22 px; first data row
+   starts at TxList_top + ~28 px below the column headers).
+4. The "C" (cleared) toggle column is at approximately x=471 px from the left
+   edge of the window (confirmed live; adjust for window position).
+5. Use `uia_mouse_click(x=..., y=...)` with physical screen coordinates to click
+   the cleared toggle for the row.
+6. Call `read_register_state()` to verify the updated cleared total.
+
+---
+
+## §31 — `open_reconcile` — Full Reconcile Dialog Automation
+
+`open_reconcile` automates the complete Quicken reconcile entry sequence:
+1. Posts `WM_COMMAND 7203` to QFRAME → opens **Choose Reconcile Account** dialog.
+2. Selects `account_name` in the account combo (CB_SETCURSEL).
+3. Clicks OK (LBUTTONDOWN/UP) → opens **Reconcile Details** dialog.
+4. Fills `statement_date` (Ending statement date) and `ending_balance` into the
+   dialog's Edit fields via WM_SETTEXT.
+5. Clicks OK → Quicken switches the register to reconcile mode.
+
+```json
+{
+  "tool": "open_reconcile",
+  "account_name": "Checking",
+  "statement_date": "03/31/2026",
+  "ending_balance": "1234.00"
+}
+// → {"ok": true, "account": "Checking", "statement_date": "03/31/2026", "ending_balance": "1234.00"}
+```
+
+**Confirm reconcile mode is active:**
+```json
+{ "tool": "read_register_state" }
+// → {"ok": true, "reconcile_active": true, "total": "1,234.00", "count": "1 Transaction", ...}
+```
+
+**Date format:** MM/DD/YYYY (e.g. `"03/31/2026"`).
+**Balance format:** plain decimal or comma-formatted (e.g. `"1234.00"` or `"1,234.00"`).
+**timeout_ms:** default 5000 ms per dialog; increase on slow machines.
+
+**Optional fields:**
+| Parameter | Dialog field |
+|---|---|
+| `service_charge` | Service charge amount |
+| `service_date` | Service charge date |
+| `interest_earned` | Interest earned amount |
+| `interest_date` | Interest earned date |
+
+---
+
+## §32 — Full Reconcile Workflow (gpt-oss:20b toy task)
+
+This is the minimal end-to-end reconcile workflow for a text-only model using
+filter+count to check totals and `capture_screenshot` for visual row identification.
+
+```
+1. select_window(class_name="QFRAME")
+2. navigate_to_account(account_name="Checking")
+3. open_reconcile(account_name="Checking", statement_date="03/31/2026", ending_balance="1234.00")
+4. read_register_state()
+   → assert reconcile_active=true
+   → note total (cleared balance) and count
+5. [For each uncleared transaction:]
+   a. set_register_filter(text="<payee or amount>")
+   b. read_register_state() → verify count=1
+   c. capture_screenshot() → identify row y-coordinate visually
+   d. uia_mouse_click(x=471, y=<row_y>) → click C toggle to mark cleared
+   e. read_register_state() → verify total moved toward statement balance
+6. When total == ending_balance: reconcile is complete.
+   (Quicken auto-prompts to finish when difference = 0.)
+```
+
+**Known blocker (#20):** Individual row HWNDs are not available. Steps 5c–5d
+require either a vision model (to parse the screenshot) or manual coordinate
+calculation. The filter approach (5a–5b) narrows to 1 transaction before clicking,
+reducing coordinate ambiguity.
+
+**Cleared total field:** The `Static` control with text like `"1,234.00"` near
+the reconcile toolbar is the running cleared balance. `read_register_state()`
+exposes this as `total`.
+
+**Completing reconcile:** When cleared total equals statement ending balance,
+Quicken shows a "Congratulations" dialog automatically. The agent should watch
+for this via `wait_for_element(name="Congratulations")` or detect it in a
+subsequent `capture_screenshot()`.
+
+
