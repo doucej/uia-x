@@ -1321,6 +1321,74 @@ def navigate_to_account_tool(
         return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
 
 
+@mcp.tool(
+    name="read_register_state",
+    description=(
+        "Read the current state of the visible transaction register: account "
+        "name, balance total, transaction count, whether a reconcile is active, "
+        "and the current search/filter text.  Does not require access to "
+        "individual transaction rows.  Windows-only."
+    ),
+)
+def read_register_state_tool(
+    api_key: str = "",
+) -> dict[str, Any]:
+    """
+    Return register state without inspecting owner-drawn transaction rows.
+
+    Returns
+    -------
+    dict
+        ``{"ok": true, "account": str, "total": str, "count": str,
+           "reconcile_active": bool, "filter_text": str}``
+    """
+    auth_err = _check_auth(api_key)
+    if auth_err:
+        return auth_err
+    try:
+        bridge = _get_bridge()
+        return bridge.read_register_state()
+    except UIAError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+
+@mcp.tool(
+    name="set_register_filter",
+    description=(
+        "Type a search term into the register search/filter box and return the "
+        "resulting transaction count.  Use this to narrow the register to "
+        "transactions matching a payee, amount, or date.  Pass an empty string "
+        "to clear the filter.  Works in both normal and reconcile register views. "
+        "Windows-only."
+    ),
+)
+def set_register_filter_tool(
+    text: str,
+    api_key: str = "",
+) -> dict[str, Any]:
+    """
+    Set the register search filter and return the transaction count.
+
+    Parameters
+    ----------
+    text : str
+        Search term (e.g. "AMAZON", "4/12/2026", "1,234.00").
+        Pass "" to clear.
+    """
+    auth_err = _check_auth(api_key)
+    if auth_err:
+        return auth_err
+    try:
+        bridge = _get_bridge()
+        return bridge.set_register_filter(text)
+    except UIAError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------

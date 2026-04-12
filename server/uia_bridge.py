@@ -275,6 +275,45 @@ class UIABridge(ABC):
             code="NOT_SUPPORTED",
         )
 
+    def read_register_state(self) -> dict[str, Any]:
+        """
+        Return the current state of the visible transaction register.
+
+        Returns
+        -------
+        dict
+            ``{"ok": True, "account": str, "total": str, "count": str,
+               "reconcile_active": bool, "filter_text": str}``
+
+        Raises
+        ------
+        UIAError
+            ``NOT_SUPPORTED`` on non-Windows backends.
+        """
+        raise UIAError(
+            "read_register_state is only available on the Windows backend.",
+            code="NOT_SUPPORTED",
+        )
+
+    def set_register_filter(self, text: str) -> dict[str, Any]:
+        """
+        Set the register search/filter box and return the resulting count.
+
+        Returns
+        -------
+        dict
+            ``{"ok": True, "filter": str, "count": str}``
+
+        Raises
+        ------
+        UIAError
+            ``NOT_SUPPORTED`` on non-Windows backends.
+        """
+        raise UIAError(
+            "set_register_filter is only available on the Windows backend.",
+            code="NOT_SUPPORTED",
+        )
+
 
 # ---------------------------------------------------------------------------
 # Factory

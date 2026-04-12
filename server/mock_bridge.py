@@ -266,6 +266,21 @@ class MockUIABridge(UIABridge):
             )
         return {"ok": True, "account": account_name, "combo_index": 0}
 
+    def read_register_state(self) -> dict[str, Any]:
+        """Mock: return a fixed register state for testing."""
+        return {
+            "ok": True,
+            "account": "Checking",
+            "total": "1,234.00",
+            "count": "1 Transaction",
+            "reconcile_active": False,
+            "filter_text": "",
+        }
+
+    def set_register_filter(self, text: str) -> dict[str, Any]:
+        """Mock: echo the filter text; always returns 1 Transaction."""
+        return {"ok": True, "filter": text, "count": "1 Transaction"}
+
     def get_text(self, target: dict[str, Any] | None = None) -> tuple[str, str]:
         """
         Return the human-readable text of a mock element.
