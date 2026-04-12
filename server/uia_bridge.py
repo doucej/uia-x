@@ -106,8 +106,16 @@ class UIABridge(ABC):
         """Invoke (click/activate) the matched element."""
 
     @abstractmethod
-    def set_value(self, target: dict[str, Any], value: str) -> None:
-        """Set the value of the matched element."""
+    def set_value(self, target: dict[str, Any], value: str) -> dict[str, Any]:
+        """
+        Set the value of the matched element and return a readback result.
+
+        Returns
+        -------
+        dict
+            ``{"ok": True, "method": str, "written": str, "readback": str,
+               "validated": bool}``
+        """
 
     @abstractmethod
     def send_keys(self, keys: str, target: dict[str, Any] | None = None) -> None:

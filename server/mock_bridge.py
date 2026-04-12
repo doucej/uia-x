@@ -185,11 +185,14 @@ class MockUIABridge(UIABridge):
             raise PatternNotSupportedError("Invoke", element.name)
         element.invoke()
 
-    def set_value(self, target: dict[str, Any], value: str) -> None:
+    def set_value(self, target: dict[str, Any], value: str) -> dict[str, Any]:
         element = self._find(target)
         if not element.value_settable:
             raise PatternNotSupportedError("Value", element.name)
         element.set_value(value)
+        rb = element.value or ""
+        return {"ok": True, "method": "mock", "written": value,
+                "readback": rb, "validated": rb == value}
 
     def send_keys(self, keys: str, target: dict[str, Any] | None = None) -> None:
         self.keys_log.append(keys)

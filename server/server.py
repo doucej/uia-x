@@ -632,7 +632,10 @@ def uia_set_value(
         return auth_err
     try:
         bridge = _get_bridge()
-        bridge.set_value(target, value)
+        result = bridge.set_value(target, value)
+        # bridge returns a dict on success; fall back for non-Windows bridges
+        if isinstance(result, dict):
+            return result
         return {"ok": True}
     except UIAError as exc:
         return {"ok": False, "error": str(exc), "code": exc.code}

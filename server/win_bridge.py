@@ -1181,16 +1181,42 @@ class WinUIABridge(UIABridge):
                 "Invoke/Toggle/Expand/Click", element.window_text()
             ) from exc
 
-    def set_value(self, target: dict[str, Any], value: str) -> None:
+    def set_value(self, target: dict[str, Any], value: str) -> dict[str, Any]:
+        """
+        Set the value of a control and return a readback dict.
+
+        Returns
+        -------
+        dict
+            ``{"ok": True, "method": str, "written": str, "readback": str,
+               "validated": bool}``
+        """
         import ctypes  # noqa: PLC0415
 
         root = _attach_target()
         element = _find_element(root, target)
+        hwnd = getattr(element, "handle", None)
+
+        WM_GETTEXT       = 0x000D
+        WM_GETTEXTLENGTH = 0x000E
+        SMTO_ABORTIFHUNG = 0x0002
+
+        def _readback(h: int | None) -> str:
+            if not h:
+                return ""
+            tlen = ctypes.windll.user32.SendMessageW(h, WM_GETTEXTLENGTH, 0, 0)
+            if tlen <= 0:
+                return ""
+            buf = ctypes.create_unicode_buffer(tlen + 1)
+            ctypes.windll.user32.SendMessageW(h, WM_GETTEXT, len(buf), buf)
+            return buf.value
 
         # 1. pywinauto set_edit_text (uses WM_SETTEXT for HwndWrappers)
         try:
             element.set_edit_text(value)
-            return
+            rb = _readback(hwnd)
+            return {"ok": True, "method": "pywinauto", "written": value,
+                    "readback": rb, "validated": rb == value}
         except Exception:
             pass
 
@@ -1198,21 +1224,23 @@ class WinUIABridge(UIABridge):
         try:
             iface = element.iface_value
             iface.SetValue(value)
-            return
+            rb = _readback(hwnd)
+            return {"ok": True, "method": "uia_value_pattern", "written": value,
+                    "readback": rb, "validated": rb == value}
         except Exception:
             pass
 
         # 3. Win32 WM_SETTEXT fallback for custom classes (QREdit, QWEdit, etc.)
         WM_SETTEXT = 0x000C
-        SMTO_ABORTIFHUNG = 0x0002
-        hwnd = getattr(element, "handle", None)
         if hwnd:
             buf = ctypes.create_unicode_buffer(value)
             result = ctypes.windll.user32.SendMessageTimeoutW(
                 hwnd, WM_SETTEXT, 0, buf, SMTO_ABORTIFHUNG, 200, None
             )
             if result:
-                return
+                rb = _readback(hwnd)
+                return {"ok": True, "method": "win32_wm_settext", "written": value,
+                        "readback": rb, "validated": rb == value}
 
         raise PatternNotSupportedError("Value", element.window_text())
 
