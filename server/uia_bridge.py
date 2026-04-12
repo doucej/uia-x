@@ -314,6 +314,39 @@ class UIABridge(ABC):
             code="NOT_SUPPORTED",
         )
 
+    def capture_screenshot(
+        self,
+        hwnd: int | None = None,
+        region: dict[str, int] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Capture a screenshot of a window or screen region as a base64 PNG.
+
+        Parameters
+        ----------
+        hwnd
+            Window handle to capture.  Uses the attached window if ``None``
+            and no *region* is given.
+        region
+            Absolute screen rect ``{left, top, right, bottom}`` to capture.
+
+        Returns
+        -------
+        dict
+            ``{"ok": True, "image_b64": str, "width": int, "height": int,
+               "format": "PNG"}``
+
+        Raises
+        ------
+        UIAError
+            ``NOT_SUPPORTED`` on non-Windows backends.
+            ``DEPENDENCY_MISSING`` if Pillow is not installed.
+        """
+        raise UIAError(
+            "capture_screenshot is only available on the Windows backend.",
+            code="NOT_SUPPORTED",
+        )
+
 
 # ---------------------------------------------------------------------------
 # Factory

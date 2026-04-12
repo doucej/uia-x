@@ -281,6 +281,29 @@ class MockUIABridge(UIABridge):
         """Mock: echo the filter text; always returns 1 Transaction."""
         return {"ok": True, "filter": text, "count": "1 Transaction"}
 
+    def capture_screenshot(
+        self,
+        hwnd: int | None = None,
+        region: dict[str, int] | None = None,
+    ) -> dict[str, Any]:
+        """Mock: return a 1×1 transparent PNG for unit tests."""
+        import base64  # noqa: PLC0415
+        import io  # noqa: PLC0415
+
+        try:
+            from PIL import Image  # noqa: PLC0415
+            img = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            image_b64 = base64.b64encode(buf.getvalue()).decode()
+        except ImportError:
+            # Pillow not installed: return a known minimal 1×1 transparent PNG.
+            image_b64 = (
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+                "YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+            )
+        return {"ok": True, "image_b64": image_b64, "width": 1, "height": 1, "format": "PNG"}
+
     def get_text(self, target: dict[str, Any] | None = None) -> tuple[str, str]:
         """
         Return the human-readable text of a mock element.

@@ -1389,6 +1389,55 @@ def set_register_filter_tool(
         return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
 
 
+# ===================================================================
+# Tool: capture_screenshot
+# ===================================================================
+
+
+@mcp.tool(
+    name="capture_screenshot",
+    description=(
+        "Capture a screenshot of a window or screen region and return it as "
+        "a base64-encoded PNG.  "
+        "When hwnd is provided, uses PrintWindow to capture the window even if "
+        "partially occluded.  "
+        "When region {left,top,right,bottom} is provided, captures that screen "
+        "rectangle via BitBlt.  "
+        "Omit both to capture the currently-attached window.  "
+        "Use this to inspect owner-drawn controls (e.g. Quicken transaction "
+        "register rows) that have no UIA element tree.  "
+        "Only available on Windows; requires Pillow (pip install pillow).  "
+        "Returns: {ok, image_b64, width, height, format='PNG'}."
+    ),
+)
+def capture_screenshot(
+    hwnd: int | None = None,
+    region: dict[str, int] | None = None,
+    api_key: str = "",
+) -> dict[str, Any]:
+    """
+    Capture a window or screen region as a base64 PNG.
+
+    Parameters
+    ----------
+    hwnd : int, optional
+        Window handle to capture.  Defaults to the attached window.
+    region : dict, optional
+        ``{"left": int, "top": int, "right": int, "bottom": int}``
+        Screen coordinates to capture.  Overrides *hwnd* when provided.
+    """
+    auth_err = _check_auth(api_key)
+    if auth_err:
+        return auth_err
+    try:
+        bridge = _get_bridge()
+        return bridge.capture_screenshot(hwnd=hwnd, region=region)
+    except UIAError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------

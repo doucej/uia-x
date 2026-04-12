@@ -2052,3 +2052,117 @@ class WinUIABridge(UIABridge):
                         break
 
         return {"ok": True, "filter": text, "count": count_static}
+
+    def capture_screenshot(
+        self,
+        hwnd: int | None = None,
+        region: dict[str, int] | None = None,
+    ) -> dict[str, Any]:
+        """Capture a screenshot of a window or screen region.
+
+        Uses ``PrintWindow`` for a specific HWND (captures even when partially
+        occluded) or ``BitBlt`` from the screen DC for a region/fullscreen.
+
+        Parameters
+        ----------
+        hwnd
+            Window handle to capture.  Uses the attached window if ``None``
+            and no *region* is given.
+        region
+            Absolute screen rect ``{left, top, right, bottom}`` to capture.
+            When provided, *hwnd* is ignored.
+
+        Returns
+        -------
+        dict
+            ``{"ok": True, "image_b64": str, "width": int, "height": int,
+               "format": "PNG"}``
+        """
+        import base64  # noqa: PLC0415
+        import ctypes  # noqa: PLC0415
+        import ctypes.wintypes  # noqa: PLC0415
+        import io  # noqa: PLC0415
+
+        try:
+            from PIL import Image  # noqa: PLC0415
+        except ImportError as exc:
+            raise UIAError(
+                "Pillow is required for capture_screenshot. "
+                "Install it with: pip install pillow",
+                code="DEPENDENCY_MISSING",
+            ) from exc
+
+        gdi32 = ctypes.windll.gdi32
+        user32 = ctypes.windll.user32
+
+        from server.process_manager import get_process_manager  # noqa: PLC0415
+        pm = get_process_manager()
+
+        if region is not None:
+            # Capture an arbitrary screen region via BitBlt from the screen DC.
+            left = region["left"]
+            top = region["top"]
+            right = region["right"]
+            bottom = region["bottom"]
+            width = right - left
+            height = bottom - top
+            screen_dc = user32.GetDC(None)
+            mem_dc = gdi32.CreateCompatibleDC(screen_dc)
+            bmp = gdi32.CreateCompatibleBitmap(screen_dc, width, height)
+            gdi32.SelectObject(mem_dc, bmp)
+            SRCCOPY = 0x00CC0020
+            gdi32.BitBlt(mem_dc, 0, 0, width, height, screen_dc, left, top, SRCCOPY)
+            bmp_h = bmp
+        else:
+            # Capture a specific HWND (or the attached window).
+            if hwnd is None:
+                if not pm.attached:
+                    raise TargetNotFoundError("Use select_window to attach first.")
+                hwnd = pm.attached.hwnd
+            rc = ctypes.wintypes.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(rc))
+            width = rc.right - rc.left
+            height = rc.bottom - rc.top
+            hwnd_dc = user32.GetDC(hwnd)
+            mem_dc = gdi32.CreateCompatibleDC(hwnd_dc)
+            bmp = gdi32.CreateCompatibleBitmap(hwnd_dc, width, height)
+            gdi32.SelectObject(mem_dc, bmp)
+            # PrintWindow captures the window even if it's behind other windows.
+            PW_RENDERFULLCONTENT = 0x00000002
+            user32.PrintWindow(hwnd, mem_dc, PW_RENDERFULLCONTENT)
+            bmp_h = bmp
+            user32.ReleaseDC(hwnd, hwnd_dc)
+            screen_dc = None  # used only in region path
+
+        # Convert HBITMAP to PIL Image via BITMAPINFOHEADER + GetDIBits.
+        BITMAPINFOHEADER_SIZE = 40
+        bmi = (ctypes.c_byte * (BITMAPINFOHEADER_SIZE + 4 * 256))()
+        ctypes.c_long.from_buffer(bmi, 0).value = BITMAPINFOHEADER_SIZE  # biSize
+        ctypes.c_long.from_buffer(bmi, 4).value = width                  # biWidth
+        ctypes.c_long.from_buffer(bmi, 8).value = -height                # biHeight (top-down)
+        ctypes.c_short.from_buffer(bmi, 12).value = 1                    # biPlanes
+        ctypes.c_short.from_buffer(bmi, 14).value = 32                   # biBitCount (BGRA)
+        ctypes.c_long.from_buffer(bmi, 16).value = 0                     # biCompression BI_RGB
+
+        buf = (ctypes.c_byte * (width * height * 4))()
+        gdi32.GetDIBits(mem_dc, bmp_h, 0, height, buf, bmi, 0)
+
+        # Cleanup GDI resources.
+        gdi32.DeleteObject(bmp_h)
+        gdi32.DeleteDC(mem_dc)
+        if region is not None:
+            user32.ReleaseDC(None, screen_dc)
+
+        # Build PIL image from BGRA raw bytes, convert to PNG.
+        img = Image.frombuffer("RGBA", (width, height), bytes(buf), "raw", "BGRA", 0, 1)
+        png_buf = io.BytesIO()
+        img.save(png_buf, format="PNG", optimize=True)
+        image_b64 = base64.b64encode(png_buf.getvalue()).decode()
+
+        return {
+            "ok": True,
+            "image_b64": image_b64,
+            "width": width,
+            "height": height,
+            "format": "PNG",
+        }
