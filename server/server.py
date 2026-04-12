@@ -1253,142 +1253,6 @@ def dismiss_modal_overlay_tool(
         return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
 
 
-@mcp.tool(
-    name="list_accounts",
-    description=(
-        "List all accounts visible in the current register view's account "
-        "selector combobox.  Navigate to a register view (e.g. click SPENDING "
-        "or ACCOUNTS) before calling this tool so the toolbar combobox is "
-        "present.  Returns account names that can be passed to "
-        "navigate_to_account.  Windows-only."
-    ),
-)
-def list_accounts_tool(
-    api_key: str = "",
-) -> dict[str, Any]:
-    """
-    Return all accounts from the 'All accounts' register combobox.
-
-    Returns
-    -------
-    dict
-        ``{"ok": true, "accounts": [{"name": str, "combo_index": int}, ...]}``
-    """
-    auth_err = _check_auth(api_key)
-    if auth_err:
-        return auth_err
-    try:
-        bridge = _get_bridge()
-        accounts = bridge.list_accounts()
-        return {"ok": True, "count": len(accounts), "accounts": accounts}
-    except UIAError as exc:
-        return {"ok": False, "error": str(exc), "code": exc.code}
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
-
-
-@mcp.tool(
-    name="navigate_to_account",
-    description=(
-        "Navigate the register view to a specific account by selecting it in "
-        "the 'All accounts' toolbar combobox.  Call list_accounts first to see "
-        "available account names.  After navigation the register shows only "
-        "transactions for the selected account.  Windows-only."
-    ),
-)
-def navigate_to_account_tool(
-    account_name: str,
-    api_key: str = "",
-) -> dict[str, Any]:
-    """
-    Select *account_name* in the register account combobox.
-
-    Parameters
-    ----------
-    account_name : str
-        Exact account name as returned by list_accounts (case-insensitive).
-    """
-    auth_err = _check_auth(api_key)
-    if auth_err:
-        return auth_err
-    try:
-        bridge = _get_bridge()
-        result = bridge.navigate_to_account(account_name)
-        return result
-    except UIAError as exc:
-        return {"ok": False, "error": str(exc), "code": exc.code}
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
-
-
-@mcp.tool(
-    name="read_register_state",
-    description=(
-        "Read the current state of the visible transaction register: account "
-        "name, balance total, transaction count, whether a reconcile is active, "
-        "and the current search/filter text.  Does not require access to "
-        "individual transaction rows.  Windows-only."
-    ),
-)
-def read_register_state_tool(
-    api_key: str = "",
-) -> dict[str, Any]:
-    """
-    Return register state without inspecting owner-drawn transaction rows.
-
-    Returns
-    -------
-    dict
-        ``{"ok": true, "account": str, "total": str, "count": str,
-           "reconcile_active": bool, "filter_text": str}``
-    """
-    auth_err = _check_auth(api_key)
-    if auth_err:
-        return auth_err
-    try:
-        bridge = _get_bridge()
-        return bridge.read_register_state()
-    except UIAError as exc:
-        return {"ok": False, "error": str(exc), "code": exc.code}
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
-
-
-@mcp.tool(
-    name="set_register_filter",
-    description=(
-        "Type a search term into the register search/filter box and return the "
-        "resulting transaction count.  Use this to narrow the register to "
-        "transactions matching a payee, amount, or date.  Pass an empty string "
-        "to clear the filter.  Works in both normal and reconcile register views. "
-        "Windows-only."
-    ),
-)
-def set_register_filter_tool(
-    text: str,
-    api_key: str = "",
-) -> dict[str, Any]:
-    """
-    Set the register search filter and return the transaction count.
-
-    Parameters
-    ----------
-    text : str
-        Search term (e.g. "AMAZON", "4/12/2026", "1,234.00").
-        Pass "" to clear.
-    """
-    auth_err = _check_auth(api_key)
-    if auth_err:
-        return auth_err
-    try:
-        bridge = _get_bridge()
-        return bridge.set_register_filter(text)
-    except UIAError as exc:
-        return {"ok": False, "error": str(exc), "code": exc.code}
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
-
-
 # ===================================================================
 # Tool: capture_screenshot
 # ===================================================================
@@ -1438,79 +1302,23 @@ def capture_screenshot(
         return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
 
 
-# ===================================================================
-# Tool: open_reconcile
-# ===================================================================
+# ---------------------------------------------------------------------------
+# Skill plugin loading
+# ---------------------------------------------------------------------------
 
-
-@mcp.tool(
-    name="open_reconcile",
-    description=(
-        "Open the Quicken reconcile dialog for an account and enter statement "
-        "details.  Sends WM_COMMAND 7203 to QFRAME, handles the 'Choose "
-        "Reconcile Account' dialog, selects the account, then fills in the "
-        "'Reconcile Details' dialog with the statement date and ending balance.  "
-        "After this call returns ok=true the register switches to reconcile "
-        "mode — use read_register_state to check reconcile_active=true.  "
-        "Dates must be in MM/DD/YYYY format (e.g. '03/31/2026').  "
-        "Balances are plain numbers or comma-formatted (e.g. '1234.56' or "
-        "'1,234.56').  "
-        "Only available on Windows.  "
-        "Returns: {ok, account, statement_date, ending_balance}."
-    ),
-)
-def open_reconcile(
-    account_name: str,
-    statement_date: str,
-    ending_balance: str,
-    service_charge: str = "",
-    service_date: str = "",
-    interest_earned: str = "",
-    interest_date: str = "",
-    timeout_ms: int = 5000,
-    api_key: str = "",
-) -> dict[str, Any]:
-    """
-    Open Quicken's reconcile dialog and enter statement details.
-
-    Parameters
-    ----------
-    account_name : str
-        Account to reconcile (e.g. "Checking").
-    statement_date : str
-        Statement end date in MM/DD/YYYY (e.g. "03/31/2026").
-    ending_balance : str
-        Statement ending balance (e.g. "1,234.00").
-    service_charge : str
-        Optional bank service charge amount.
-    service_date : str
-        Date for the service charge.
-    interest_earned : str
-        Optional interest earned amount.
-    interest_date : str
-        Date for the interest earned.
-    timeout_ms : int
-        Max wait (ms) for each dialog to appear (default 5000).
-    """
-    auth_err = _check_auth(api_key)
-    if auth_err:
-        return auth_err
+def _load_skill_plugins() -> None:
+    """Discover and load skill plugins from the ``skills/`` package."""
     try:
-        bridge = _get_bridge()
-        return bridge.open_reconcile(
-            account_name=account_name,
-            statement_date=statement_date,
-            ending_balance=ending_balance,
-            service_charge=service_charge,
-            service_date=service_date,
-            interest_earned=interest_earned,
-            interest_date=interest_date,
-            timeout_ms=timeout_ms,
-        )
-    except UIAError as exc:
-        return {"ok": False, "error": str(exc), "code": exc.code}
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+        from skills import load_skills  # noqa: PLC0415
+        loaded = load_skills(mcp, get_bridge=_get_bridge, check_auth=_check_auth)
+        if loaded:
+            names = [s.name for s in loaded]
+            print(f"[uiax] loaded skills: {', '.join(names)}", file=__import__('sys').stderr)
+    except Exception:
+        import traceback  # noqa: PLC0415
+        traceback.print_exc()
+
+_load_skill_plugins()
 
 
 # ---------------------------------------------------------------------------

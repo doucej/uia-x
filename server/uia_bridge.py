@@ -235,85 +235,6 @@ class UIABridge(ABC):
             code="NOT_SUPPORTED",
         )
 
-    def list_accounts(self) -> list[dict[str, Any]]:
-        """
-        Return all accounts visible in the current register's account selector.
-
-        Returns
-        -------
-        list of dict
-            Each entry has at least ``{"name": str}``.
-
-        Raises
-        ------
-        UIAError
-            ``NOT_SUPPORTED`` on non-Windows backends.
-            ``ACCOUNT_COMBO_NOT_FOUND`` if no account selector is visible.
-        """
-        raise UIAError(
-            "list_accounts is only available on the Windows backend.",
-            code="NOT_SUPPORTED",
-        )
-
-    def navigate_to_account(self, account_name: str) -> dict[str, Any]:
-        """
-        Navigate the register view to *account_name*.
-
-        Returns
-        -------
-        dict
-            ``{"ok": True, "account": str}``
-
-        Raises
-        ------
-        UIAError
-            ``NOT_SUPPORTED`` on non-Windows backends.
-            ``ACCOUNT_NOT_FOUND`` if the name is not in the account list.
-        """
-        raise UIAError(
-            "navigate_to_account is only available on the Windows backend.",
-            code="NOT_SUPPORTED",
-        )
-
-    def read_register_state(self) -> dict[str, Any]:
-        """
-        Return the current state of the visible transaction register.
-
-        Returns
-        -------
-        dict
-            ``{"ok": True, "account": str, "total": str, "count": str,
-               "reconcile_active": bool, "filter_text": str}``
-
-        Raises
-        ------
-        UIAError
-            ``NOT_SUPPORTED`` on non-Windows backends.
-        """
-        raise UIAError(
-            "read_register_state is only available on the Windows backend.",
-            code="NOT_SUPPORTED",
-        )
-
-    def set_register_filter(self, text: str) -> dict[str, Any]:
-        """
-        Set the register search/filter box and return the resulting count.
-
-        Returns
-        -------
-        dict
-            ``{"ok": True, "filter": str, "count": str}``
-
-        Raises
-        ------
-        UIAError
-            ``NOT_SUPPORTED`` on non-Windows backends.
-        """
-        raise UIAError(
-            "set_register_filter is only available on the Windows backend.",
-            code="NOT_SUPPORTED",
-        )
-
     def capture_screenshot(
         self,
         hwnd: int | None = None,
@@ -344,49 +265,6 @@ class UIABridge(ABC):
         """
         raise UIAError(
             "capture_screenshot is only available on the Windows backend.",
-            code="NOT_SUPPORTED",
-        )
-
-    def open_reconcile(
-        self,
-        account_name: str,
-        statement_date: str,
-        ending_balance: str,
-        service_charge: str = "",
-        service_date: str = "",
-        interest_earned: str = "",
-        interest_date: str = "",
-        timeout_ms: int = 5000,
-    ) -> dict[str, Any]:
-        """
-        Open the Quicken reconcile dialog and enter statement details.
-
-        Parameters
-        ----------
-        account_name
-            Account to reconcile.
-        statement_date
-            Statement end date (e.g. "03/31/2026").
-        ending_balance
-            Statement ending balance (e.g. "1,234.00").
-        service_charge, service_date, interest_earned, interest_date
-            Optional bank-charge/interest fields.
-        timeout_ms
-            Max wait (ms) for each dialog.
-
-        Returns
-        -------
-        dict
-            ``{"ok": True, "account": str, "statement_date": str,
-               "ending_balance": str}``
-
-        Raises
-        ------
-        UIAError
-            ``NOT_SUPPORTED`` on non-Windows backends.
-        """
-        raise UIAError(
-            "open_reconcile is only available on the Windows backend.",
             code="NOT_SUPPORTED",
         )
 

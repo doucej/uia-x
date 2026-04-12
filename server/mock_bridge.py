@@ -248,39 +248,6 @@ class MockUIABridge(UIABridge):
             "re_enabled": False,
         }
 
-    def list_accounts(self) -> list[dict[str, Any]]:
-        """Mock: return a minimal fixed account list for test purposes."""
-        return [
-            {"name": "Checking", "combo_index": 1, "combo_hwnd": "0x0"},
-            {"name": "Savings", "combo_index": 2, "combo_hwnd": "0x0"},
-        ]
-
-    def navigate_to_account(self, account_name: str) -> dict[str, Any]:
-        """Mock: succeed for known mock accounts, raise for unknown."""
-        known = {a["name"].lower() for a in self.list_accounts()}
-        if account_name.lower() not in known:
-            from server.uia_bridge import UIAError  # noqa: PLC0415
-            raise UIAError(
-                f"Account {account_name!r} not found in mock.",
-                code="ACCOUNT_NOT_FOUND",
-            )
-        return {"ok": True, "account": account_name, "combo_index": 0}
-
-    def read_register_state(self) -> dict[str, Any]:
-        """Mock: return a fixed register state for testing."""
-        return {
-            "ok": True,
-            "account": "Checking",
-            "total": "1,234.00",
-            "count": "1 Transaction",
-            "reconcile_active": False,
-            "filter_text": "",
-        }
-
-    def set_register_filter(self, text: str) -> dict[str, Any]:
-        """Mock: echo the filter text; always returns 1 Transaction."""
-        return {"ok": True, "filter": text, "count": "1 Transaction"}
-
     def capture_screenshot(
         self,
         hwnd: int | None = None,
@@ -303,25 +270,6 @@ class MockUIABridge(UIABridge):
                 "YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
             )
         return {"ok": True, "image_b64": image_b64, "width": 1, "height": 1, "format": "PNG"}
-
-    def open_reconcile(
-        self,
-        account_name: str,
-        statement_date: str,
-        ending_balance: str,
-        service_charge: str = "",
-        service_date: str = "",
-        interest_earned: str = "",
-        interest_date: str = "",
-        timeout_ms: int = 5000,
-    ) -> dict[str, Any]:
-        """Mock: always returns ok for the first mock account."""
-        return {
-            "ok": True,
-            "account": account_name,
-            "statement_date": statement_date,
-            "ending_balance": ending_balance,
-        }
 
     def get_text(self, target: dict[str, Any] | None = None) -> tuple[str, str]:
         """
