@@ -131,8 +131,12 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
     """
     Navigate the register view to a specific account.
 
-    Selects *account_name* in the "All accounts" toolbar combobox using
-    ``CB_SETCURSEL`` + ``WM_COMMAND(CBN_SELCHANGE)``.
+    Strategy:
+    1. Check if there is already a QWMDI child whose account combo shows
+       the target account.  If so, just bring it to the foreground.
+    2. Otherwise, select *account_name* in the active register's combobox
+       using ``CB_SETCURSEL`` + ``WM_COMMAND(CBN_SELCHANGE)`` and bring
+       the resulting MDI child to the foreground.
 
     Parameters
     ----------
@@ -147,15 +151,82 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
         ``{"ok": True, "account": str, "combo_index": int}``
     """
     import ctypes  # noqa: PLC0415
+    import ctypes.wintypes  # noqa: PLC0415
+    import time  # noqa: PLC0415
 
+    CB_GETCURSEL = 0x0147
+    CB_GETLBTEXT = 0x0148
+    CB_GETLBTEXTLEN = 0x0149
     CB_SETCURSEL = 0x014E
     CBN_SELCHANGE = 1
     WM_COMMAND = 0x0111
 
     user32 = ctypes.windll.user32
 
-    accounts = list_accounts(bridge)
+    from server.process_manager import get_process_manager  # noqa: PLC0415
+    pm = get_process_manager()
+    if not pm.attached:
+        raise TargetNotFoundError("Use select_window to attach first.")
+    root_hwnd = pm.attached.hwnd
     name_lower = account_name.lower()
+
+    EnumCB = ctypes.WINFUNCTYPE(
+        ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
+    )
+
+    def _combo_text(h: int) -> str:
+        idx = user32.SendMessageW(h, CB_GETCURSEL, 0, 0)
+        if idx < 0:
+            return ""
+        tl = user32.SendMessageW(h, CB_GETLBTEXTLEN, idx, 0)
+        if tl <= 0:
+            return ""
+        buf = ctypes.create_unicode_buffer(tl + 1)
+        user32.SendMessageW(h, CB_GETLBTEXT, idx, buf)
+        return buf.value
+
+    # ------------------------------------------------------------------
+    # Phase 1: Check if there's already a QWMDI child showing this acct.
+    # If so, bring it to front — no combo manipulation needed.
+    # ------------------------------------------------------------------
+    existing_mdi = None
+    existing_idx = -1
+
+    def _find_existing(h: int, _: int) -> bool:
+        nonlocal existing_mdi, existing_idx
+        cls = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(h, cls, 64)
+        if cls.value != "QWMDI" or not user32.IsWindowVisible(h):
+            return True
+        # Check first visible QWComboBox in this MDI
+        def _check_combo(ch: int, _: int) -> bool:
+            nonlocal existing_mdi, existing_idx
+            cc = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(ch, cc, 64)
+            if (cc.value.lower() == "qwcombobox"
+                    and user32.IsWindowVisible(ch)):
+                txt = _combo_text(ch)
+                if txt.lower() == name_lower:
+                    existing_mdi = h
+                    existing_idx = user32.SendMessageW(ch, CB_GETCURSEL, 0, 0)
+                    return False  # stop inner enumeration
+            return True
+        user32.EnumChildWindows(h, EnumCB(_check_combo), 0)
+        if existing_mdi:
+            return False  # stop outer enumeration
+        return True
+
+    user32.EnumChildWindows(root_hwnd, EnumCB(_find_existing), 0)
+
+    if existing_mdi:
+        user32.BringWindowToTop(existing_mdi)
+        user32.SetFocus(existing_mdi)
+        return {"ok": True, "account": account_name, "combo_index": existing_idx}
+
+    # ------------------------------------------------------------------
+    # Phase 2: No existing MDI — use the account combo to navigate.
+    # ------------------------------------------------------------------
+    accounts = list_accounts(bridge)
     match = next(
         (a for a in accounts if a["name"].lower() == name_lower),
         None,
@@ -175,6 +246,38 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
     ctrl_id = user32.GetDlgCtrlID(combo_h)
     wparam = (CBN_SELCHANGE << 16) | (ctrl_id & 0xFFFF)
     user32.SendMessageW(parent, WM_COMMAND, wparam, combo_h)
+
+    # Give Quicken time to process the account switch
+    time.sleep(0.8)
+
+    # Bring the target account's MDI child to the foreground
+    target_mdi = None
+
+    def _find_mdi(h: int, _: int) -> bool:
+        nonlocal target_mdi
+        cls = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(h, cls, 64)
+        if cls.value != "QWMDI" or not user32.IsWindowVisible(h):
+            return True
+        def _check_combo(ch: int, _: int) -> bool:
+            nonlocal target_mdi
+            cc = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(ch, cc, 64)
+            if (cc.value.lower() == "qwcombobox"
+                    and user32.IsWindowVisible(ch)):
+                if _combo_text(ch).lower() == name_lower:
+                    target_mdi = h
+                    return False
+            return True
+        user32.EnumChildWindows(h, EnumCB(_check_combo), 0)
+        if target_mdi:
+            return False
+        return True
+
+    user32.EnumChildWindows(root_hwnd, EnumCB(_find_mdi), 0)
+    if target_mdi:
+        user32.BringWindowToTop(target_mdi)
+        user32.SetFocus(target_mdi)
 
     return {"ok": True, "account": match["name"], "combo_index": idx}
 
@@ -251,9 +354,15 @@ def read_register_state(bridge: Any) -> dict[str, Any]:
 
     user32.EnumChildWindows(root_hwnd, EnumCB(_cb), 0)
 
+    # Find ALL visible TxList controls and pick the one in the topmost
+    # (active) MDI child.  Quicken may have multiple QWMDI children open
+    # (e.g. one per account with reconcile in progress).
+    # EnumChildWindows enumerates in z-order (topmost first), so the first
+    # visible TxList belongs to the active/foreground MDI child.
     txlist_h = next(
-        (h for h, c, _ in all_ctrls if c == "qwclass_transactionlist"
-         and user32.IsWindowVisible(h)), None
+        (h for h, c, _ in all_ctrls
+         if c == "qwclass_transactionlist" and user32.IsWindowVisible(h)),
+        None,
     )
     if txlist_h is None:
         raise UIAError("No visible TxList found.", code="REGISTER_NOT_FOUND")
