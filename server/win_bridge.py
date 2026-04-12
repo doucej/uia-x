@@ -217,6 +217,7 @@ def _win32_fast_find_all(
     named_only: bool = True,
     must_have_actions: bool = True,
     roles_filter: list[str] | None = None,
+    limit: int = 0,
 ) -> list[dict[str, Any]]:
     """Enumerate all child windows using Win32 EnumChildWindows.
 
@@ -340,6 +341,9 @@ def _win32_fast_find_all(
             if text:
                 d["text"] = text
             results.append(d)
+            # Honour limit: returning False stops EnumChildWindows early
+            if limit > 0 and len(results) >= limit:
+                return False
         except Exception:  # noqa: BLE001
             pass
         return True
@@ -855,11 +859,10 @@ class WinUIABridge(UIABridge):
 
         Strategy
         --------
-        1. **Win32-native fast path** (when no sub-element root is specified):
-           Use ``EnumChildWindows`` to enumerate all child HWNDs directly —
-           this bypasses the UIA COM layer entirely and is ~100× faster than
-           ``root.descendants(control_type=X)`` for legacy Win32 apps like
-           Quicken whose UIA tree is bridged through MSAA.
+        1. **Win32-native fast path** (when root has an hwnd key, or no root):
+           Use ``EnumChildWindows`` to enumerate child HWNDs starting from the
+           given HWND — bypasses UIA COM entirely, ~100× faster for legacy Win32
+           apps like Quicken.  Works for both full-window and scoped sub-tree roots.
 
         2. **UIA/MSAA fallback**: used when a root sub-element is specified
            (the Win32 path only knows the top-level HWND) or when the Win32
@@ -869,20 +872,35 @@ class WinUIABridge(UIABridge):
         must_have_actions = bool(filter.get("has_actions", True))
         roles_filter = [r.lower() for r in (filter.get("roles") or [])]
         root_target = filter.get("root") or {}
+        limit = int(filter.get("limit") or 0)
 
         # ------------------------------------------------------------------
-        # Win32-native fast path (top-level HWND only, no sub-element root)
+        # Win32-native fast path — works for both full-window and scoped-HWND
+        # roots.  EnumChildWindows accepts any HWND as its starting point so
+        # we can scope the search to a sub-tree without any UIA COM overhead.
         # ------------------------------------------------------------------
-        if not root_target:
-            from server.process_manager import get_process_manager  # noqa: PLC0415
-            pm = get_process_manager()
-            if pm.attached:
+        from server.process_manager import get_process_manager  # noqa: PLC0415
+        pm = get_process_manager()
+        if pm.attached:
+            # Determine which HWND to enumerate from
+            root_hwnd: int | None = None
+            if not root_target:
+                root_hwnd = pm.attached.hwnd
+            elif "hwnd" in root_target:
+                # Caller scoped the search to a specific sub-window
+                try:
+                    raw = root_target["hwnd"]
+                    root_hwnd = int(raw, 16) if isinstance(raw, str) else int(raw)
+                except (ValueError, TypeError):
+                    pass
+            if root_hwnd is not None:
                 try:
                     win32_results = _win32_fast_find_all(
-                        pm.attached.hwnd,
+                        root_hwnd,
                         named_only=named_only,
                         must_have_actions=must_have_actions,
                         roles_filter=roles_filter or None,
+                        limit=limit,
                     )
                     if win32_results:
                         return win32_results
@@ -890,7 +908,7 @@ class WinUIABridge(UIABridge):
                     pass
 
         # ------------------------------------------------------------------
-        # UIA / MSAA fallback (required for sub-element roots or modern apps)
+        # UIA / MSAA fallback (required when root has no hwnd, or modern apps)
         # ------------------------------------------------------------------
         root = _attach_target()
         if root_target:

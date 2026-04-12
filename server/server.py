@@ -462,6 +462,9 @@ def uia_find_all(
             "has_actions": has_actions,
             "named_only": named_only,
             "root": target or None,
+            # Pass a stop-after hint so the Win32 fast path can early-exit via
+            # EnumChildWindows returning False.  limit=0 means "no cap".
+            "limit": (limit + offset) if limit > 0 else 0,
         })
         # Server-side name search
         if name_contains:
@@ -513,6 +516,7 @@ def uia_invoke(
     target: dict[str, Any] = {},  # noqa: B006
     hwnd: str = "",
     read_after: bool = False,
+    timeout_ms: int = 0,
     api_key: str = "",
 ) -> dict[str, Any]:
     """
@@ -533,6 +537,11 @@ def uia_invoke(
         When True, read the focused element's text after invoking and include
         it in the response as ``after_text`` / ``after_source``.  Useful after
         pressing = or Enter to capture the calculator result in one round-trip.
+    timeout_ms : int
+        When > 0, poll for a window title/state change for up to this many
+        milliseconds after invoking.  Useful for slow-loading views (e.g.
+        Quicken BILLS & INCOME takes 15-25 s to fully load).  Returns
+        ``settled=true`` when a change is detected, ``settled=false`` on timeout.
     """
     auth_err = _check_auth(api_key)
     if auth_err:
@@ -545,8 +554,37 @@ def uia_invoke(
         return {"ok": False, "error": "Provide name='...' or target={...}", "code": "INVALID_ARGS"}
     try:
         bridge = _get_bridge()
+
+        # Capture pre-invoke state for change detection when timeout_ms > 0
+        pre_title = ""
+        if timeout_ms > 0:
+            try:
+                state = bridge.check_state()
+                pre_title = state.get("title", "") if isinstance(state, dict) else ""
+            except Exception:  # noqa: BLE001
+                pass
+
         bridge.invoke(target)
         result: dict[str, Any] = {"ok": True}
+
+        if timeout_ms > 0:
+            import time as _time
+            deadline = _time.monotonic() + timeout_ms / 1000.0
+            settled = False
+            while _time.monotonic() < deadline:
+                _time.sleep(0.25)
+                try:
+                    state = bridge.check_state()
+                    cur_title = state.get("title", "") if isinstance(state, dict) else ""
+                    if cur_title != pre_title:
+                        settled = True
+                        result["after_title"] = cur_title
+                        break
+                except Exception:  # noqa: BLE001
+                    break
+            result["settled"] = settled
+            result["elapsed_ms"] = round((_time.monotonic() - (deadline - timeout_ms / 1000.0)) * 1000)
+
         if read_after:
             try:
                 after_text, after_source = bridge.get_text(None)
