@@ -1915,3 +1915,201 @@ All new classes added to `_WIN32_CLASS_TO_ROLE` in this session:
 | QWMDI | pane | MDI content pane |
 | MDIfr | pane | MDI frame |
 
+---
+
+## 27. Account Navigation — list_accounts / navigate_to_account
+
+### 27.1 Background
+
+Individual account sidebar buttons (in `qwacctbarholder`) are **owner-drawn** and
+cannot be read via `WM_GETTEXT`. However, the register toolbar's "All accounts"
+`QWComboBox` exposes all account names via standard `CB_GETLBTEXT`. This is the
+reliable path for both listing and navigating to accounts.
+
+### 27.2 Tool Usage
+
+```python
+# List all accounts
+accounts = list_accounts()
+# → {"ok": True, "count": 5, "accounts": [
+#      {"name": "All accounts", "combo_index": 0, "combo_hwnd": "0x107f6"},
+#      {"name": "All Checking", "combo_index": 1, "combo_hwnd": "0x107f6"},
+#      {"name": "All Savings",  "combo_index": 2, "combo_hwnd": "0x107f6"},
+#      {"name": "Checking",     "combo_index": 5, "combo_hwnd": "0x107f6"},
+#      {"name": "Savings",      "combo_index": 6, "combo_hwnd": "0x107f6"},
+#   ]}
+
+# Navigate to a specific account
+navigate_to_account("Checking")
+# → {"ok": True, "account": "Checking", "combo_index": 5}
+```
+
+### 27.3 Pre-conditions
+
+- Must be attached to QFRAME: `select_window(class_name="QFRAME")`
+- Must be in a **register view** (SPENDING, BILLS & INCOME, or All Transactions)
+  so the toolbar comboboxes are visible. If `list_accounts` fails with
+  `ACCOUNT_COMBO_NOT_FOUND`, navigate to SPENDING first:
+  ```python
+  uia_invoke(target={"class_name": "qc_button", "name": "SPENDING"})
+  ```
+
+### 27.4 Combobox items filtered
+
+The combobox includes non-account items that are filtered out:
+- `"QCombo_Separator"` — visual separator
+- `"Custom..."` — opens a multi-account selection dialog (must NOT select)
+- Empty strings
+
+### 27.5 After navigate_to_account
+
+- The register immediately updates to show only transactions for that account
+- The combobox label changes to the account name
+- Window title may NOT change (it stays `[Spending]` or `[All Transactions]`)
+- Balance Static controls update to reflect the account balance
+- Use `uia_find_all(named_only=True)` to find the balance Static near the TxList
+
+---
+
+## 28. Reconcile Register — Inline Layout
+
+### 28.1 Structure
+
+In Quicken, reconciliation happens **inline** in the register pane (not a separate
+top-level window). When a reconcile is in progress, the "All Transactions" QWMDI
+gains additional controls in its header area.
+
+```
+QWMDI "All Transactions"  hwnd varies
+├── Static (hidden)        — normal register header (hidden during reconcile)
+├── [Reconcile header bar] y≈186-218
+│   ├── Edit               hwnd=0x10888  — search/filter box
+│   ├── QC_button "C"      hwnd=0x1088a  — toggle cleared status on selected row
+│   ├── QC_button (unnamed) × 2         — filter/view buttons
+│   ├── QWComboBox × 4     hwnd=0x10892-0x1089e  — filter combos
+│   └── QC_button "Reset"  hwnd=0x108a2  — reset all cleared marks
+├── QWClass_TransactionList "TxList"  y=218-596  — transaction grid
+│   └── (owner-drawn rows — no individual HWNDs for existing transactions)
+├── Static "Total:"        y≈617
+├── Static "1,234.00"      y≈617  — current cleared total
+├── Static "Ending Balance:" (hidden unless reconcile balance dialog is open)
+├── QWScrollBar (vertical)
+└── QWScrollBar (horizontal)
+```
+
+### 28.2 Starting Reconcile (WM_COMMAND)
+
+```python
+# From any register view, send WM_COMMAND 7203 to QFRAME to open
+# "Reconcile Account" dialog.
+# IMPORTANT: SendMessage blocks while the dialog is open — use threading.
+import threading
+WM_COMMAND = 0x0111
+def open_reconcile():
+    ctypes.windll.user32.SendMessageW(qframe_hwnd, WM_COMMAND, 7203, 0)
+t = threading.Thread(target=open_reconcile, daemon=True)
+t.start()
+time.sleep(1.5)  # dialog should now be open
+```
+
+### 28.3 Reconcile Account Selection Dialog (class=#32770)
+
+Opens a "Choose Account" dialog before showing reconcile details:
+
+| Field | Class | cmd_id | Notes |
+|-------|-------|--------|-------|
+| Account combo | QWComboBox | 102 | CB_GETLBTEXT lists accounts alphabetically |
+| OK | QC_button | 32767 | |
+| Cancel | QC_button | 32766 | |
+
+### 28.4 Reconcile Details Dialog (class=#32770)
+
+| cid | Field | Notes |
+|-----|-------|-------|
+| 482 | Statement date | Pre-filled with today |
+| 484 | Previous balance | Pre-filled |
+| 486 | Ending balance | **Must fill from statement** |
+| 488 | Service charge | Optional |
+| 492 | Interest earned | Optional |
+
+After filling and clicking OK, the register enters reconcile mode (see 28.1).
+
+### 28.5 Marking Transactions Cleared
+
+The "C" button (hwnd=0x1088a) at `(471,191)` toggles the cleared status of the
+**selected** transaction row. Because rows are owner-drawn, there is no direct
+HWND to click per row. Workflow:
+
+```python
+# 1. Use the Search/filter Edit (hwnd=0x10888) to locate a transaction
+uia_set_value(target={"hwnd": "0x10888"}, value="AMAZON")
+
+# 2. Click in the TxList at the row's y-coordinate (requires screenshot + OCR
+#    to determine row positions — blocked by issue #20)
+
+# 3. Once a row is selected, click "C" to mark cleared
+uia_invoke(target={"hwnd": "0x1088a", "class_name": "qc_button", "name": "C"})
+```
+
+> **Blocker (issue #20)**: Individual transaction rows are owner-drawn — no HWNDs.
+> The agent cannot programmatically read payee/date/amount from the register.
+> This is the primary blocker for autonomous reconcile. Options:
+> - Use `uia_read_display` on the TxList HWND (reads visual text)
+> - Use MSAA fallback (very slow)
+> - Screen-capture + OCR (out of scope for initial implementation)
+
+### 28.6 Reconcile Workflow (current best path for gpt-oss:20b)
+
+```
+1. select_window(class_name="QFRAME")
+2. navigate_to_account("Checking")
+3. [Manual or threading] Open reconcile via WM_COMMAND 7203
+4. Fill statement ending balance in Reconcile Details dialog
+5. For each statement transaction:
+   a. Use search box (Edit at y≈191) to filter by payee/amount
+   b. Visually identify matching row (currently requires OCR / uia_read_display)
+   c. Click "C" button to mark cleared
+6. Compare "Total:" running sum vs statement ending balance
+7. Click "Finish Now" (button appears in reconcile header when difference = 0)
+```
+
+### 28.7 Balance Static Controls
+
+| Static hwnd (example) | Content |
+|------------------------|---------|
+| 0x10860 | Current cleared total (e.g., "1,234.00") |
+| 0x10868 | Label "Total:" |
+| 0x10866 | "Ending Balance:" (hidden — only visible in balance dialog) |
+| 0x1086c | Transaction count (e.g., "1 Transaction") |
+
+Read via `uia_get_text(target={"hwnd": "0x10860"})` — note HWNDs change each launch.
+
+---
+
+## 29. QREdit Write Validation (confirmed working)
+
+The `uia_set_value` tool now returns a **read-back dict** after writing:
+
+```python
+result = uia_set_value(
+    target={"hwnd": "0x107ec"},  # QREdit date field
+    value="12/31/2099"
+)
+# → {"ok": True, "method": "win32_wm_settext", "written": "12/31/2099",
+#    "readback": "12/31/2099", "validated": True}
+```
+
+Always check `result["validated"]` before proceeding. If `False`, the write was
+accepted by Win32 but Quicken's field validation may have reformatted the value
+(e.g., date normalisation).
+
+After writing to a QREdit field, send `{TAB}` to confirm entry:
+```python
+uia_send_keys(keys="{TAB}")
+```
+
+To cancel without saving:
+```python
+uia_send_keys(keys="{ESC}")
+```
+
