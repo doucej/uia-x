@@ -245,6 +245,24 @@ class MockUIABridge(UIABridge):
             "re_enabled": False,
         }
 
+    def list_accounts(self) -> list[dict[str, Any]]:
+        """Mock: return a minimal fixed account list for test purposes."""
+        return [
+            {"name": "Checking", "combo_index": 1, "combo_hwnd": "0x0"},
+            {"name": "Savings", "combo_index": 2, "combo_hwnd": "0x0"},
+        ]
+
+    def navigate_to_account(self, account_name: str) -> dict[str, Any]:
+        """Mock: succeed for known mock accounts, raise for unknown."""
+        known = {a["name"].lower() for a in self.list_accounts()}
+        if account_name.lower() not in known:
+            from server.uia_bridge import UIAError  # noqa: PLC0415
+            raise UIAError(
+                f"Account {account_name!r} not found in mock.",
+                code="ACCOUNT_NOT_FOUND",
+            )
+        return {"ok": True, "account": account_name, "combo_index": 0}
+
     def get_text(self, target: dict[str, Any] | None = None) -> tuple[str, str]:
         """
         Return the human-readable text of a mock element.

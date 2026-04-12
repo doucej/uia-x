@@ -1250,6 +1250,74 @@ def dismiss_modal_overlay_tool(
         return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
 
 
+@mcp.tool(
+    name="list_accounts",
+    description=(
+        "List all accounts visible in the current register view's account "
+        "selector combobox.  Navigate to a register view (e.g. click SPENDING "
+        "or ACCOUNTS) before calling this tool so the toolbar combobox is "
+        "present.  Returns account names that can be passed to "
+        "navigate_to_account.  Windows-only."
+    ),
+)
+def list_accounts_tool(
+    api_key: str = "",
+) -> dict[str, Any]:
+    """
+    Return all accounts from the 'All accounts' register combobox.
+
+    Returns
+    -------
+    dict
+        ``{"ok": true, "accounts": [{"name": str, "combo_index": int}, ...]}``
+    """
+    auth_err = _check_auth(api_key)
+    if auth_err:
+        return auth_err
+    try:
+        bridge = _get_bridge()
+        accounts = bridge.list_accounts()
+        return {"ok": True, "count": len(accounts), "accounts": accounts}
+    except UIAError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+
+@mcp.tool(
+    name="navigate_to_account",
+    description=(
+        "Navigate the register view to a specific account by selecting it in "
+        "the 'All accounts' toolbar combobox.  Call list_accounts first to see "
+        "available account names.  After navigation the register shows only "
+        "transactions for the selected account.  Windows-only."
+    ),
+)
+def navigate_to_account_tool(
+    account_name: str,
+    api_key: str = "",
+) -> dict[str, Any]:
+    """
+    Select *account_name* in the register account combobox.
+
+    Parameters
+    ----------
+    account_name : str
+        Exact account name as returned by list_accounts (case-insensitive).
+    """
+    auth_err = _check_auth(api_key)
+    if auth_err:
+        return auth_err
+    try:
+        bridge = _get_bridge()
+        result = bridge.navigate_to_account(account_name)
+        return result
+    except UIAError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------

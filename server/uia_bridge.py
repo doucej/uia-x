@@ -227,6 +227,46 @@ class UIABridge(ABC):
             code="NOT_SUPPORTED",
         )
 
+    def list_accounts(self) -> list[dict[str, Any]]:
+        """
+        Return all accounts visible in the current register's account selector.
+
+        Returns
+        -------
+        list of dict
+            Each entry has at least ``{"name": str}``.
+
+        Raises
+        ------
+        UIAError
+            ``NOT_SUPPORTED`` on non-Windows backends.
+            ``ACCOUNT_COMBO_NOT_FOUND`` if no account selector is visible.
+        """
+        raise UIAError(
+            "list_accounts is only available on the Windows backend.",
+            code="NOT_SUPPORTED",
+        )
+
+    def navigate_to_account(self, account_name: str) -> dict[str, Any]:
+        """
+        Navigate the register view to *account_name*.
+
+        Returns
+        -------
+        dict
+            ``{"ok": True, "account": str}``
+
+        Raises
+        ------
+        UIAError
+            ``NOT_SUPPORTED`` on non-Windows backends.
+            ``ACCOUNT_NOT_FOUND`` if the name is not in the account list.
+        """
+        raise UIAError(
+            "navigate_to_account is only available on the Windows backend.",
+            code="NOT_SUPPORTED",
+        )
+
 
 # ---------------------------------------------------------------------------
 # Factory

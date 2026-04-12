@@ -1577,3 +1577,169 @@ class WinUIABridge(UIABridge):
             pass
 
         return "", "none"
+
+    # ---------------------------------------------------------------------------
+    # Account navigation (Quicken-specific, Win32 combobox path)
+    # ---------------------------------------------------------------------------
+
+    _SKIP_ACCT_ITEMS = frozenset({"custom...", "qcombo_separator", ""})
+
+    def list_accounts(self) -> list[dict[str, Any]]:
+        """
+        Return all accounts visible in the 'All accounts' register combobox.
+
+        Strategy
+        --------
+        1. Find all ``qwcombobox`` controls in the current window.
+        2. Locate the one named "All accounts" (or the leftmost one that
+           contains non-date, non-type items).
+        3. Read its item list via ``CB_GETLBTEXT``.
+        4. Filter out separators, "Custom...", and empty strings.
+
+        Returns
+        -------
+        list of dict
+            Each entry has ``{"name": str, "combo_index": int}``.
+
+        Raises
+        ------
+        UIAError
+            If no account combobox can be located.
+        """
+        CB_GETCOUNT    = 0x0146
+        CB_GETLBTEXT   = 0x0148
+        CB_GETLBTEXTLEN= 0x0149
+        WM_GETTEXT     = 0x000D
+
+        import ctypes  # noqa: PLC0415
+
+        user32 = ctypes.windll.user32
+
+        from server.process_manager import get_process_manager  # noqa: PLC0415
+        pm = get_process_manager()
+        if not pm.attached:
+            raise TargetNotFoundError("Use select_window to attach to a target first.")
+
+        # Find all qwcombobox controls (platform-native: fast Win32 path)
+        all_els = self.find_all({
+            "roles": [], "has_actions": False, "named_only": False, "root": None,
+        })
+        combos = [e for e in all_els if e.get("class_name", "").lower() == "qwcombobox"]
+
+        # Prefer one explicitly named "All accounts"
+        def _hwnd_int(e: dict) -> int:
+            raw = e.get("hwnd", 0)
+            return int(raw, 16) if isinstance(raw, str) else int(raw)
+
+        def _get_items(h: int) -> list[str]:
+            count = user32.SendMessageW(h, CB_GETCOUNT, 0, 0)
+            out: list[str] = []
+            for i in range(min(count, 500)):
+                tlen = user32.SendMessageW(h, CB_GETLBTEXTLEN, i, 0)
+                if tlen <= 0:
+                    out.append("")
+                    continue
+                buf = ctypes.create_unicode_buffer(tlen + 1)
+                user32.SendMessageW(h, CB_GETLBTEXT, i, buf)
+                out.append(buf.value)
+            return out
+
+        acct_combo_h: int | None = None
+        for cb in combos:
+            nm = (cb.get("name") or "").lower()
+            if "account" in nm:
+                acct_combo_h = _hwnd_int(cb)
+                break
+
+        # Fallback: use leftmost combo that has non-date items
+        if acct_combo_h is None:
+            import ctypes.wintypes  # noqa: PLC0415
+            def _combo_x(e: dict) -> int:
+                r = ctypes.wintypes.RECT()
+                user32.GetWindowRect(_hwnd_int(e), ctypes.byref(r))
+                return r.left
+            for cb in sorted(combos, key=_combo_x):
+                items = _get_items(_hwnd_int(cb))
+                non_temporal = [
+                    it for it in items if it and not any(
+                        x in it.lower() for x in (
+                            "month", "year", "week", "day", "today",
+                            "quarter", "type", "income", "expense",
+                            "transfer", "all date",
+                        )
+                    )
+                ]
+                if len(non_temporal) > 1:
+                    acct_combo_h = _hwnd_int(cb)
+                    break
+
+        if acct_combo_h is None:
+            raise UIAError(
+                "No account combobox found. Navigate to a register view (e.g. SPENDING) first.",
+                code="ACCOUNT_COMBO_NOT_FOUND",
+            )
+
+        raw_items = _get_items(acct_combo_h)
+        result = []
+        for idx, name in enumerate(raw_items):
+            if name.lower() in self._SKIP_ACCT_ITEMS:
+                continue
+            result.append({"name": name, "combo_index": idx, "combo_hwnd": hex(acct_combo_h)})
+        return result
+
+    def navigate_to_account(self, account_name: str) -> dict[str, Any]:
+        """
+        Navigate the register view to a specific account.
+
+        Selects *account_name* in the "All accounts" toolbar combobox using
+        ``CB_SETCURSEL`` + ``WM_COMMAND(CBN_SELCHANGE)`` — no mouse interaction
+        required.
+
+        Parameters
+        ----------
+        account_name : str
+            Exact account name as returned by ``list_accounts()``.
+            Comparison is case-insensitive.
+
+        Returns
+        -------
+        dict
+            ``{"ok": True, "account": str, "combo_index": int}``
+
+        Raises
+        ------
+        UIAError
+            ``ACCOUNT_NOT_FOUND`` if the account name is not in the list.
+            ``ACCOUNT_COMBO_NOT_FOUND`` if no combobox can be located.
+        """
+        import ctypes  # noqa: PLC0415
+
+        CB_SETCURSEL  = 0x014E
+        CBN_SELCHANGE = 1
+        WM_COMMAND    = 0x0111
+
+        user32 = ctypes.windll.user32
+
+        accounts = self.list_accounts()
+        name_lower = account_name.lower()
+        match = next(
+            (a for a in accounts if a["name"].lower() == name_lower),
+            None,
+        )
+        if match is None:
+            available = [a["name"] for a in accounts]
+            raise UIAError(
+                f"Account {account_name!r} not found. Available: {available}",
+                code="ACCOUNT_NOT_FOUND",
+            )
+
+        combo_h = int(match["combo_hwnd"], 16)
+        idx = match["combo_index"]
+
+        user32.SendMessageW(combo_h, CB_SETCURSEL, idx, 0)
+        parent = user32.GetParent(combo_h)
+        ctrl_id = user32.GetDlgCtrlID(combo_h)
+        wparam = (CBN_SELCHANGE << 16) | (ctrl_id & 0xFFFF)
+        user32.SendMessageW(parent, WM_COMMAND, wparam, combo_h)
+
+        return {"ok": True, "account": match["name"], "combo_index": idx}
