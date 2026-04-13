@@ -248,58 +248,121 @@ gdi32.DeleteDC(mDC); user32.ReleaseDC(hwnd, hwndDC); gdi32.DeleteObject(bmp)
   - 198688: numeric fields (Payment/Deposit, Amount)
   - **HWND numbers are stable within a session but change across restarts**
 
-### Field Tab Order (Checking register)
+### Field Tab Order (Checking/Savings register — VERIFIED)
 | Tab pos | Field | QREdit HWND | Screen X | Width |
 |---------|-------|-------------|----------|-------|
-| 1 | Date | 198672 | ~279 | 65 |
-| 2 | Check # | 198672 | ~363 | 29 |
-| 3 | Payee | 198672 | ~411 | 244 |
-| 4 | Memo | 198672 | ~658 | 244 |
-| 5 | Category | 198672 | ~905 | 243 |
-| 6 | Payment/Deposit | 198688 | ~1279 | 53 |
-| 7 | Amount | 198688 | ~1351 | 53 |
-→ Tab from Amount wraps through 3 invisible fields back to Date
+| 0 | Date | text (0x1087c) | ~281 | 65 |
+| 1 | Account | text (0x1087c) | ~365 | 58 |
+| 2 | Check # | text (0x1087c) | ~442 | 29 |
+| 3 | Payee | text (0x1087c) | ~490 | 40 |
+| 4 | Memo | text (0x1087c) | ~566 | 73 |
+| 5 | Category | text (0x1087c) | ~642 | 73 |
+| 6 | Payment | numeric (0x10880) | ~738 | 53 |
+| 7 | Deposit | numeric (0x10880) | ~846 | 53 |
+| 8 | Amount | numeric (0x10880) | ~918 | 53 |
+| 9 | Save btn | QC_button | ~1053 | — |
+| 10 | More actions btn | QC_button | ~1076 | — |
+| 11 | Split txn btn | QC_button | ~1099 | — |
+→ Tab from Split wraps back to Date (pos 0)
+
+> **CRITICAL**: When focus moves from text fields (tabs 0–5) to numeric fields
+> (tabs 6–8), the focused HWND changes from 0x1087c to 0x10880. You **must**
+> post Tab/WM_CHAR to the currently focused control, not a hardcoded HWND.
+> Use `AttachThreadInput` + `GetFocus()` to track which control has focus.
+
+#### Memorized Payee Behavior
+When typing a payee that matches Quicken's memorized transaction list, Quicken
+auto-configures the row. If memorized as deposit: **Payment field (tab 6) is
+removed from tab order**. If memorized as payment: **Deposit field (tab 7) is
+removed**. Deleted transactions still leave memorized payee entries.
+**Workaround**: use fresh payee names or click directly on the column.
+
+#### Account Field Quirk
+After entering a transaction with a non-today date, the next empty row may
+have an **empty Account field**. Tab will not advance past an empty Account.
+**Fix**: check Account text after tabbing from Date; if empty, type the account name.
 
 ### Navigate between fields
 ```python
-VK_TAB = 0x09; WM_KEYDOWN = 0x0100
-# MUST use PostMessage (not SendMessage) — SendMessage blocks forever
-user32.PostMessageW(txlist, WM_KEYDOWN, VK_TAB, 1|(0x0F<<16))
-time.sleep(0.15)  # wait for field to reposition
+# MUST post Tab to the FOCUSED control, not a hardcoded HWND.
+# Tabs 0-5 use text QREdit; tabs 6-8 use numeric QREdit.
+import ctypes
+user32 = ctypes.windll.user32
+
+# Attach thread input to get reliable GetFocus()
+tid = ctypes.windll.kernel32.GetCurrentThreadId()
+qtid = user32.GetWindowThreadProcessId(QW, None)
+user32.AttachThreadInput(tid, qtid, True)
+
+focused = user32.GetFocus()
+user32.PostMessageW(focused, 0x0100, 0x09, 0)  # WM_KEYDOWN Tab
+time.sleep(0.02)
+user32.PostMessageW(focused, 0x0101, 0x09, 0)  # WM_KEYUP Tab
+time.sleep(0.4)  # wait for field to reposition
 ```
 
 ### Set text in current field
 ```python
-WM_SETTEXT = 0x000C
-user32.SendMessageW(qredit_hwnd, WM_SETTEXT, 0, ctypes.c_wchar_p("value"))
-# For text fields: qredit_hwnd = 198672
-# For numeric fields: qredit_hwnd = 198688
+# Type via WM_CHAR to whichever QREdit has focus
+focused = user32.GetFocus()
+for ch in "value":
+    user32.PostMessageW(focused, 0x0102, ord(ch), 0)  # WM_CHAR
+    time.sleep(0.03)
 ```
 
-### Full transaction entry recipe
+### Full transaction entry recipe (focus-aware)
 ```python
-txlist = 198488  # QWClass_TransactionList
-qredit_txt = 198672; qredit_num = 198688
-WM_KEYDOWN=0x0100; WM_SETTEXT=0x000C; VK_TAB=0x09; VK_RETURN=0x0D
+import ctypes, ctypes.wintypes, time
+user32 = ctypes.windll.user32
+QW = user32.FindWindowW('QFRAME', None)
 
-def tab(): user32.PostMessageW(txlist, WM_KEYDOWN, VK_TAB, 1|(0x0F<<16)); time.sleep(0.15)
-def settext(h, v): user32.SendMessageW(h, WM_SETTEXT, 0, ctypes.c_wchar_p(v))
+# Attach for focus tracking
+tid = ctypes.windll.kernel32.GetCurrentThreadId()
+qtid = user32.GetWindowThreadProcessId(QW, None)
+user32.AttachThreadInput(tid, qtid, True)
 
-# Start: focus is on Date field (new row auto-selected after last Enter)
-tab()          # → Check#
-tab()          # → Payee
-settext(qredit_txt, "Test Payee")
-tab()          # → Memo
-settext(qredit_txt, "Test Memo")
-tab()          # → Category (skip: leave blank)
-tab()          # → Payment/Deposit
-settext(qredit_num, "10.00")
-tab()          # → Amount (auto-populated usually; or set explicitly)
-settext(qredit_num, "10.00")
+def get_focused():
+    h = user32.GetFocus()
+    r = ctypes.wintypes.RECT()
+    user32.GetWindowRect(h, ctypes.byref(r))
+    return h, r.left
 
-# SAVE: Enter on numeric QREdit commits the transaction
-user32.PostMessageW(qredit_num, WM_KEYDOWN, VK_RETURN, 1|(0x1C<<16))
-time.sleep(0.8)  # wait for save
+def tab():
+    h = user32.GetFocus()
+    user32.PostMessageW(h, 0x0100, 0x09, 0)
+    time.sleep(0.02)
+    user32.PostMessageW(h, 0x0101, 0x09, 0)
+    time.sleep(0.4)
+
+def type_text(text):
+    h = user32.GetFocus()
+    for ch in text:
+        user32.PostMessageW(h, 0x0102, ord(ch), 0)
+        time.sleep(0.03)
+
+# Ctrl+End → Date field of new empty row
+user32.keybd_event(0x11, 0, 0, 0)
+user32.keybd_event(0x23, 0, 0, 0); time.sleep(0.02)
+user32.keybd_event(0x23, 0, 2, 0)
+user32.keybd_event(0x11, 0, 2, 0); time.sleep(0.5)
+
+# Tab 0: Date (type if needed)
+tab()          # → Tab 1: Account (check if empty; type account name if so)
+tab()          # → Tab 2: Check#
+tab()          # → Tab 3: Payee
+type_text("Test Payee")
+tab()          # → Tab 4: Memo
+tab()          # → Tab 5: Category
+tab()          # → Tab 6: Payment (HWND changes to numeric QREdit here!)
+type_text("100")
+tab()          # → Tab 7: Deposit (skip)
+tab()          # → Tab 8: Amount (auto-calculated)
+tab()          # → Tab 9: Save button
+h = user32.GetFocus()
+user32.PostMessageW(h, 0x0100, 0x0D, 0)  # Enter to save
+time.sleep(1.5)
+
+user32.AttachThreadInput(tid, qtid, False)
 ```
 
 ### Cancel/discard an unsaved row
@@ -1968,6 +2031,21 @@ The combobox includes non-account items that are filtered out:
 - Window title may NOT change (it stays `[Spending]` or `[All Transactions]`)
 - Balance Static controls update to reflect the account balance
 - Use `uia_find_all(named_only=True)` to find the balance Static near the TxList
+
+### 27.6 Verified Combobox Items (All Transactions view)
+| Index | Item | Notes |
+|-------|------|-------|
+| 0 | All accounts | Default |
+| 1 | All Checking | Group |
+| 2 | All Savings | Group |
+| 3 | Custom... | Opens dialog — never select |
+| 4 | QCombo_Separator | Visual separator |
+| 5 | Checking | Individual account |
+| 6 | Savings | Individual account |
+
+**Keyboard shortcut**: `Ctrl+A` opens the Account List dialog (Tools > Account List).
+From there, double-click an account name to open its register.
+To close: send `WM_CLOSE` to the `QWinPopup` window titled "Account List".
 
 ---
 
