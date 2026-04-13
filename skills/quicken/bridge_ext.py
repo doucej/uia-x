@@ -18,6 +18,65 @@ from server.uia_bridge import UIAError, TargetNotFoundError
 _SKIP_ACCT_ITEMS = frozenset({"custom...", "qcombo_separator", ""})
 
 
+def _send_msg(hwnd: int, msg: int, wp: int, lp: int) -> int:
+    """Thin wrapper around ``SendMessageW`` with proper 64-bit argtypes."""
+    import ctypes  # noqa: PLC0415
+
+    _fn = ctypes.windll.user32.SendMessageW
+    if not hasattr(_fn, "_typed"):
+        import ctypes.wintypes  # noqa: PLC0415
+
+        _fn.argtypes = [
+            ctypes.wintypes.HWND,
+            ctypes.wintypes.UINT,
+            ctypes.wintypes.WPARAM,
+            ctypes.wintypes.LPARAM,
+        ]
+        _fn.restype = ctypes.wintypes.LPARAM
+        _fn._typed = True  # type: ignore[attr-defined]
+    return _fn(hwnd, msg, wp, lp)
+
+
+def _combo_get_items(hwnd: int) -> list[str]:
+    """Read all items from a Win32 combobox via CB_GETCOUNT/CB_GETLBTEXT."""
+    import ctypes  # noqa: PLC0415
+
+    CB_GETCOUNT = 0x0146
+    CB_GETLBTEXT = 0x0148
+    CB_GETLBTEXTLEN = 0x0149
+
+    count = _send_msg(hwnd, CB_GETCOUNT, 0, 0)
+    out: list[str] = []
+    for i in range(min(count, 500)):
+        tlen = _send_msg(hwnd, CB_GETLBTEXTLEN, i, 0)
+        if tlen <= 0:
+            out.append("")
+            continue
+        buf = ctypes.create_unicode_buffer(tlen + 1)
+        _send_msg(hwnd, CB_GETLBTEXT, i, ctypes.addressof(buf))
+        out.append(buf.value)
+    return out
+
+
+def _combo_cur_text(hwnd: int) -> str:
+    """Read the currently selected item text from a Win32 combobox."""
+    import ctypes  # noqa: PLC0415
+
+    CB_GETCURSEL = 0x0147
+    CB_GETLBTEXT = 0x0148
+    CB_GETLBTEXTLEN = 0x0149
+
+    idx = _send_msg(hwnd, CB_GETCURSEL, 0, 0)
+    if idx < 0:
+        return ""
+    tl = _send_msg(hwnd, CB_GETLBTEXTLEN, idx, 0)
+    if tl <= 0:
+        return ""
+    buf = ctypes.create_unicode_buffer(tl + 1)
+    _send_msg(hwnd, CB_GETLBTEXT, idx, ctypes.addressof(buf))
+    return buf.value
+
+
 def list_accounts(bridge: Any) -> list[dict[str, Any]]:
     """
     Return all accounts visible in the 'All accounts' register combobox.
@@ -45,10 +104,6 @@ def list_accounts(bridge: Any) -> list[dict[str, Any]]:
     UIAError
         If no account combobox can be located.
     """
-    CB_GETCOUNT = 0x0146
-    CB_GETLBTEXT = 0x0148
-    CB_GETLBTEXTLEN = 0x0149
-
     import ctypes  # noqa: PLC0415
 
     user32 = ctypes.windll.user32
@@ -68,19 +123,6 @@ def list_accounts(bridge: Any) -> list[dict[str, Any]]:
         raw = e.get("hwnd", 0)
         return int(raw, 16) if isinstance(raw, str) else int(raw)
 
-    def _get_items(h: int) -> list[str]:
-        count = user32.SendMessageW(h, CB_GETCOUNT, 0, 0)
-        out: list[str] = []
-        for i in range(min(count, 500)):
-            tlen = user32.SendMessageW(h, CB_GETLBTEXTLEN, i, 0)
-            if tlen <= 0:
-                out.append("")
-                continue
-            buf = ctypes.create_unicode_buffer(tlen + 1)
-            user32.SendMessageW(h, CB_GETLBTEXT, i, buf)
-            out.append(buf.value)
-        return out
-
     acct_combo_h: int | None = None
     for cb in combos:
         nm = (cb.get("name") or "").lower()
@@ -98,7 +140,7 @@ def list_accounts(bridge: Any) -> list[dict[str, Any]]:
             return r.left
 
         for cb in sorted(combos, key=_combo_x):
-            items = _get_items(_hwnd_int(cb))
+            items = _combo_get_items(_hwnd_int(cb))
             non_temporal = [
                 it for it in items if it and not any(
                     x in it.lower() for x in (
@@ -118,7 +160,7 @@ def list_accounts(bridge: Any) -> list[dict[str, Any]]:
             code="ACCOUNT_COMBO_NOT_FOUND",
         )
 
-    raw_items = _get_items(acct_combo_h)
+    raw_items = _combo_get_items(acct_combo_h)
     result = []
     for idx, name in enumerate(raw_items):
         if name.lower() in _SKIP_ACCT_ITEMS:
@@ -154,10 +196,8 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
     import ctypes.wintypes  # noqa: PLC0415
     import time  # noqa: PLC0415
 
-    CB_GETCURSEL = 0x0147
-    CB_GETLBTEXT = 0x0148
-    CB_GETLBTEXTLEN = 0x0149
     CB_SETCURSEL = 0x014E
+    CB_GETCURSEL = 0x0147
     CBN_SELCHANGE = 1
     WM_COMMAND = 0x0111
 
@@ -173,17 +213,6 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
     EnumCB = ctypes.WINFUNCTYPE(
         ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
     )
-
-    def _combo_text(h: int) -> str:
-        idx = user32.SendMessageW(h, CB_GETCURSEL, 0, 0)
-        if idx < 0:
-            return ""
-        tl = user32.SendMessageW(h, CB_GETLBTEXTLEN, idx, 0)
-        if tl <= 0:
-            return ""
-        buf = ctypes.create_unicode_buffer(tl + 1)
-        user32.SendMessageW(h, CB_GETLBTEXT, idx, buf)
-        return buf.value
 
     # ------------------------------------------------------------------
     # Phase 1: Check if there's already a QWMDI child showing this acct.
@@ -205,10 +234,10 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
             user32.GetClassNameW(ch, cc, 64)
             if (cc.value.lower() == "qwcombobox"
                     and user32.IsWindowVisible(ch)):
-                txt = _combo_text(ch)
+                txt = _combo_cur_text(ch)
                 if txt.lower() == name_lower:
                     existing_mdi = h
-                    existing_idx = user32.SendMessageW(ch, CB_GETCURSEL, 0, 0)
+                    existing_idx = _send_msg(ch, CB_GETCURSEL, 0, 0)
                     return False  # stop inner enumeration
             return True
         user32.EnumChildWindows(h, EnumCB(_check_combo), 0)
@@ -241,11 +270,11 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
     combo_h = int(match["combo_hwnd"], 16)
     idx = match["combo_index"]
 
-    user32.SendMessageW(combo_h, CB_SETCURSEL, idx, 0)
+    _send_msg(combo_h, CB_SETCURSEL, idx, 0)
     parent = user32.GetParent(combo_h)
     ctrl_id = user32.GetDlgCtrlID(combo_h)
     wparam = (CBN_SELCHANGE << 16) | (ctrl_id & 0xFFFF)
-    user32.SendMessageW(parent, WM_COMMAND, wparam, combo_h)
+    _send_msg(parent, WM_COMMAND, wparam, combo_h)
 
     # Give Quicken time to process the account switch
     time.sleep(0.8)
@@ -265,7 +294,7 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
             user32.GetClassNameW(ch, cc, 64)
             if (cc.value.lower() == "qwcombobox"
                     and user32.IsWindowVisible(ch)):
-                if _combo_text(ch).lower() == name_lower:
+                if _combo_cur_text(ch).lower() == name_lower:
                     target_mdi = h
                     return False
             return True
@@ -306,9 +335,6 @@ def read_register_state(bridge: Any) -> dict[str, Any]:
 
     WM_GETTEXT = 0x000D
     WM_GETTEXTLENGTH = 0x000E
-    CB_GETCURSEL = 0x0147
-    CB_GETLBTEXT = 0x0148
-    CB_GETLBTEXTLEN = 0x0149
 
     user32 = ctypes.windll.user32
 
@@ -320,22 +346,11 @@ def read_register_state(bridge: Any) -> dict[str, Any]:
     root_hwnd = pm.attached.hwnd
 
     def _read_text(h: int) -> str:
-        tlen = user32.SendMessageW(h, WM_GETTEXTLENGTH, 0, 0)
+        tlen = _send_msg(h, WM_GETTEXTLENGTH, 0, 0)
         if tlen <= 0:
             return ""
         buf = ctypes.create_unicode_buffer(tlen + 1)
-        user32.SendMessageW(h, WM_GETTEXT, len(buf), buf)
-        return buf.value
-
-    def _combo_cur(h: int) -> str:
-        idx = user32.SendMessageW(h, CB_GETCURSEL, 0, 0)
-        if idx < 0:
-            return ""
-        tlen = user32.SendMessageW(h, CB_GETLBTEXTLEN, idx, 0)
-        if tlen <= 0:
-            return ""
-        buf = ctypes.create_unicode_buffer(tlen + 1)
-        user32.SendMessageW(h, CB_GETLBTEXT, idx, buf)
+        _send_msg(h, WM_GETTEXT, len(buf), ctypes.addressof(buf))
         return buf.value
 
     # Enumerate all children to find TxList, balance Static, count Static,
@@ -405,7 +420,7 @@ def read_register_state(bridge: Any) -> dict[str, Any]:
         (h for h, c, t in mdi_children
          if c == "qwcombobox" and user32.IsWindowVisible(h)), None
     )
-    current_account = _combo_cur(acct_combo_h) if acct_combo_h else ""
+    current_account = _combo_cur_text(acct_combo_h) if acct_combo_h else ""
 
     # Reconcile active? "C" button and "Reset" button both visible in header
     c_btn_visible = any(
@@ -439,6 +454,207 @@ def read_register_state(bridge: Any) -> dict[str, Any]:
         "reconcile_active": reconcile_active,
         "filter_text": filter_text,
     }
+
+
+def read_register_rows(
+    bridge: Any,
+    max_rows: int = 50,
+) -> dict[str, Any]:
+    """
+    Read individual transaction rows from the visible register.
+
+    Navigates using keyboard (Ctrl+Home, Tab, Down) and reads each field
+    via ``GetFocus()`` + ``WM_GETTEXT``.  Uses x-position of the focused
+    ``QREdit`` to distinguish Payment (x ≈ 738) from Deposit (x ≈ 846),
+    since Quicken skips the unused column from the tab order.
+
+    Parameters
+    ----------
+    bridge
+        A ``WinUIABridge`` instance (unused directly but ensures attachment).
+    max_rows : int
+        Maximum number of rows to read (default 50).
+
+    Returns
+    -------
+    dict
+        ``{"ok": True, "rows": [...], "count": int}`` where each row is
+        ``{"date", "payee", "category", "payment", "deposit"}``.
+    """
+    import ctypes  # noqa: PLC0415
+    import ctypes.wintypes  # noqa: PLC0415
+    import time as _time  # noqa: PLC0415
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+
+    _SendMsg = user32.SendMessageW
+    _SendMsg.argtypes = [
+        ctypes.wintypes.HWND, ctypes.c_uint,
+        ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM,
+    ]
+    _SendMsg.restype = ctypes.wintypes.LPARAM
+    _PostMsg = user32.PostMessageW
+    _PostMsg.argtypes = [
+        ctypes.wintypes.HWND, ctypes.c_uint,
+        ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM,
+    ]
+
+    from server.process_manager import get_process_manager  # noqa: PLC0415
+    pm = get_process_manager()
+    if not pm.attached:
+        raise TargetNotFoundError("Use select_window to attach first.")
+
+    root_hwnd = pm.attached.hwnd
+    user32.SetForegroundWindow(root_hwnd)
+    _time.sleep(0.3)
+
+    tid = kernel32.GetCurrentThreadId()
+    qtid = user32.GetWindowThreadProcessId(root_hwnd, None)
+    user32.AttachThreadInput(tid, qtid, True)
+
+    def _kbe(vk: int, flags: int = 0) -> None:
+        user32.keybd_event(vk, 0, flags, 0)
+
+    def _press(vk: int, delay: float = 0.1) -> None:
+        _kbe(vk)
+        _time.sleep(0.02)
+        _kbe(vk, 2)
+        _time.sleep(delay)
+
+    def _ctrl(vk: int) -> None:
+        _kbe(0x11)
+        _time.sleep(0.02)
+        _press(vk, 0.05)
+        _kbe(0x11, 2)
+        _time.sleep(0.3)
+
+    def _get_focused() -> tuple[int, str, int, int]:
+        """Return (hwnd, text, x_left, y_top) of focused control."""
+        h = user32.GetFocus()
+        r = ctypes.wintypes.RECT()
+        user32.GetWindowRect(h, ctypes.byref(r))
+        tlen = _SendMsg(h, 0x000E, 0, 0)  # WM_GETTEXTLENGTH
+        buf = ctypes.create_unicode_buffer(tlen + 1)
+        _SendMsg(h, 0x000D, tlen + 1, ctypes.addressof(buf))  # WM_GETTEXT
+        return h, buf.value, r.left, r.top
+
+    def _tab() -> None:
+        h = user32.GetFocus()
+        _PostMsg(h, 0x0100, 0x09, 0)
+        _time.sleep(0.02)
+        _PostMsg(h, 0x0101, 0x09, 0)
+        _time.sleep(0.35)
+
+    try:
+        # Clear state
+        for _ in range(3):
+            _press(0x1B, 0.15)  # Escape
+
+        # Ctrl+Home → Date field of first row
+        _ctrl(0x24)
+        _time.sleep(0.5)
+
+        # Try to get expected row count from register state
+        expected_count: int | None = None
+        try:
+            state = read_register_state(bridge)
+            count_str = state.get("count", "")
+            # Parse "N Transaction(s)" format
+            parts = count_str.split()
+            if parts and parts[0].isdigit():
+                expected_count = int(parts[0])
+        except Exception:
+            pass
+
+        effective_max = min(max_rows, expected_count) if expected_count else max_rows
+        prev_row_sig: tuple[str, ...] | None = None
+
+        rows: list[dict[str, str]] = []
+        for _ in range(effective_max):
+            date_h, date_txt, date_x, date_y = _get_focused()
+            date_hwnd = date_h
+
+            text_vals: list[str] = []
+            money_vals: list[str] = []
+
+            for _fi in range(14):
+                _tab()
+                h, txt, x, y = _get_focused()
+                cls_buf = ctypes.create_unicode_buffer(64)
+                user32.GetClassNameW(h, cls_buf, 64)
+                if cls_buf.value.lower() != "qredit":
+                    break
+                if h == date_hwnd:
+                    if money_vals:
+                        break
+                    text_vals.append(txt)
+                else:
+                    money_vals.append(txt)
+
+            if not text_vals:
+                break
+
+            # Map text fields to Payee / Category
+            n = len(text_vals)
+            if n >= 5:
+                payee = text_vals[2]
+                category = text_vals[-1]
+            elif n >= 3:
+                payee = text_vals[1]
+                category = text_vals[-1]
+            elif n == 2:
+                payee = text_vals[0]
+                category = text_vals[1]
+            else:
+                payee = text_vals[0]
+                category = ""
+
+            if not payee.strip():
+                break
+
+            # Content-based stuck detection (for registers without a count)
+            row_sig = (date_txt, payee, category, *money_vals)
+            if expected_count is None and row_sig == prev_row_sig:
+                break
+            prev_row_sig = row_sig
+
+            # Money fields: last is Amount (running balance).
+            payment = ""
+            deposit = ""
+            if len(money_vals) >= 3:
+                payment = money_vals[0]
+                deposit = money_vals[1]
+            elif len(money_vals) == 2:
+                val = money_vals[0]
+                amount_val = money_vals[1]
+                if amount_val.startswith("-"):
+                    payment = val
+                else:
+                    deposit = val
+            elif len(money_vals) == 1:
+                val = money_vals[0]
+                if val.startswith("-"):
+                    payment = val.lstrip("-")
+                else:
+                    deposit = val
+
+            rows.append({
+                "date": date_txt,
+                "payee": payee,
+                "category": category,
+                "payment": payment,
+                "deposit": deposit,
+            })
+
+            # Move to next row
+            _press(0x1B, 0.2)
+            _press(0x28, 0.3)
+            _time.sleep(0.3)
+
+        return {"ok": True, "rows": rows, "count": len(rows)}
+    finally:
+        user32.AttachThreadInput(tid, qtid, False)
 
 
 def set_register_filter(bridge: Any, text: str) -> dict[str, Any]:
@@ -476,11 +692,11 @@ def set_register_filter(bridge: Any, text: str) -> dict[str, Any]:
     root_hwnd = pm.attached.hwnd
 
     def _read_text(h: int) -> str:
-        tlen = user32.SendMessageW(h, WM_GETTEXTLENGTH, 0, 0)
+        tlen = _send_msg(h, WM_GETTEXTLENGTH, 0, 0)
         if tlen <= 0:
             return ""
         buf = ctypes.create_unicode_buffer(tlen + 1)
-        user32.SendMessageW(h, WM_GETTEXT, len(buf), buf)
+        _send_msg(h, WM_GETTEXT, len(buf), ctypes.addressof(buf))
         return buf.value
 
     # Find TxList and its parent QWMDI
@@ -537,7 +753,7 @@ def set_register_filter(bridge: Any, text: str) -> dict[str, Any]:
 
     # Write text via WM_SETTEXT and trigger change notification
     buf = ctypes.create_unicode_buffer(text)
-    user32.SendMessageW(filter_h, WM_SETTEXT, 0, buf)
+    _send_msg(filter_h, WM_SETTEXT, 0, ctypes.addressof(buf))
     # Post EN_CHANGE to parent so Quicken re-filters
     WM_COMMAND = 0x0111
     EN_CHANGE = 0x0300
@@ -627,11 +843,11 @@ def open_reconcile(
     root_hwnd = pm.attached.hwnd
 
     def _read_text(h: int) -> str:
-        tlen = user32.SendMessageW(h, WM_GETTEXTLENGTH, 0, 0)
+        tlen = _send_msg(h, WM_GETTEXTLENGTH, 0, 0)
         if tlen <= 0:
             return ""
         buf = ctypes.create_unicode_buffer(tlen + 1)
-        user32.SendMessageW(h, WM_GETTEXT, len(buf), buf)
+        _send_msg(h, WM_GETTEXT, len(buf), ctypes.addressof(buf))
         return buf.value
 
     def _click_qc_button(h: int) -> None:
@@ -642,8 +858,8 @@ def open_reconcile(
         cy = (rc.bottom - rc.top) // 2
         lp = ctypes.c_long((cy << 16) | (cx & 0xFFFF)).value
         user32.SetFocus(h)
-        user32.SendMessageW(h, 0x0201, 1, lp)  # WM_LBUTTONDOWN
-        user32.SendMessageW(h, 0x0202, 0, lp)  # WM_LBUTTONUP
+        _send_msg(h, 0x0201, 1, lp)  # WM_LBUTTONDOWN
+        _send_msg(h, 0x0202, 0, lp)  # WM_LBUTTONUP
 
     def _wait_for_dialog(title_substr: str, timeout: float) -> int | None:
         """Poll until a top-level dialog with matching title appears."""
@@ -752,12 +968,12 @@ def open_reconcile(
     if combo_h is None:
         raise UIAError("Account combo not found in reconcile dialog.", code="ELEMENT_NOT_FOUND")
 
-    count = user32.SendMessageW(combo_h, CB_GETCOUNT, 0, 0)
+    count = _send_msg(combo_h, CB_GETCOUNT, 0, 0)
     target_idx: int | None = None
     for i in range(count):
-        tlen = user32.SendMessageW(combo_h, CB_GETLBTEXTLEN, i, 0)
+        tlen = _send_msg(combo_h, CB_GETLBTEXTLEN, i, 0)
         tbuf = ctypes.create_unicode_buffer(tlen + 2)
-        user32.SendMessageW(combo_h, CB_GETLBTEXT, i, tbuf)
+        _send_msg(combo_h, CB_GETLBTEXT, i, ctypes.addressof(tbuf))
         if tbuf.value.strip().lower() == account_name.strip().lower():
             target_idx = i
             break
@@ -771,7 +987,7 @@ def open_reconcile(
             code="ACCOUNT_NOT_FOUND",
         )
 
-    user32.SendMessageW(combo_h, CB_SETCURSEL, target_idx, 0)
+    _send_msg(combo_h, CB_SETCURSEL, target_idx, 0)
 
     # Click OK.
     ok_h = next((h for h, c, t in children if c == "qc_button" and t == "OK"), None)
@@ -799,7 +1015,8 @@ def open_reconcile(
         if not text:
             return
         user32.SetFocus(h)
-        user32.SendMessageW(h, WM_SETTEXT, 0, text)
+        tbuf = ctypes.create_unicode_buffer(text)
+        _send_msg(h, WM_SETTEXT, 0, ctypes.addressof(tbuf))
 
     _set_edit(edit_handles[0], statement_date)   # Ending statement date
     _set_edit(edit_handles[2], ending_balance)   # Ending balance

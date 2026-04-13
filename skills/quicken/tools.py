@@ -94,6 +94,32 @@ def register(
             return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
 
     @mcp.tool(
+        name="read_register_rows",
+        description=(
+            "Read individual transaction rows from the visible register.  Returns "
+            "an array of {date, payee, category, payment, deposit} objects for each "
+            "transaction.  Uses keyboard navigation (Ctrl+Home, Tab, Down) so it "
+            "works with Quicken's owner-drawn grid.  Navigate to the desired account "
+            "first with navigate_to_account.  Optionally limit the number of rows "
+            "with max_rows (default 50).  Windows-only.  [Quicken skill]"
+        ),
+    )
+    def read_register_rows_tool(
+        max_rows: int = 50,
+        api_key: str = "",
+    ) -> dict[str, Any]:
+        auth_err = check_auth(api_key)
+        if auth_err:
+            return auth_err
+        try:
+            bridge = get_bridge()
+            return bridge_ext.read_register_rows(bridge, max_rows=max_rows)
+        except UIAError as exc:
+            return {"ok": False, "error": str(exc), "code": exc.code}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+    @mcp.tool(
         name="set_register_filter",
         description=(
             "Type a search term into the register search/filter box and return the "
