@@ -169,16 +169,164 @@ def list_accounts(bridge: Any) -> list[dict[str, Any]]:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Sidebar navigation helpers
+# ---------------------------------------------------------------------------
+
+def _find_sidebar_accounts(root_hwnd: int) -> list[dict[str, Any]]:
+    """Discover sidebar accounts by scanning QWAcctBarHolder ListBox items.
+
+    The Quicken sidebar has section buttons (Banking, Investing, etc.) with
+    child ``QWListViewer`` containers holding ``ListBox`` controls.  Each
+    ListBox item represents an account.  Items with height ≤ 5 px are
+    decorative separators and are skipped.
+
+    Returns a list of ``{"section", "lb_hwnd", "item_index", "screen_x",
+    "screen_y"}`` dicts (one per real item).  The ``name`` field is left
+    empty because these are owner-drawn and unreadable via LB_GETTEXT.
+    """
+    import ctypes  # noqa: PLC0415
+    import ctypes.wintypes as wt  # noqa: PLC0415
+
+    user32 = ctypes.windll.user32
+    SM = user32.SendMessageW
+    SM.argtypes = [wt.HWND, ctypes.c_uint, wt.WPARAM, wt.LPARAM]
+    SM.restype = wt.LPARAM
+
+    EnumCB = ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
+
+    # Find the QWAcctBarHolder
+    holder = None
+    def _find_holder(h: int, _: int) -> bool:
+        nonlocal holder
+        cls = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(h, cls, 64)
+        if cls.value == "QWAcctBarHolder" and user32.IsWindowVisible(h):
+            holder = h
+            return False
+        return True
+    user32.EnumChildWindows(root_hwnd, EnumCB(_find_holder), 0)
+    if not holder:
+        return []
+
+    # Collect ListBoxes parented by QWListViewer within the holder
+    items: list[dict[str, Any]] = []
+    cls_buf = ctypes.create_unicode_buffer(64)
+    txt_buf = ctypes.create_unicode_buffer(256)
+
+    def _scan_lb(h: int, _: int) -> bool:
+        user32.GetClassNameW(h, cls_buf, 64)
+        if cls_buf.value != "ListBox" or not user32.IsWindowVisible(h):
+            return True
+        parent = user32.GetParent(h)
+        user32.GetClassNameW(parent, cls_buf, 64)
+        if cls_buf.value != "QWListViewer":
+            return True
+        # Section name is the QWListViewer window text
+        user32.GetWindowTextW(parent, txt_buf, 256)
+        section = txt_buf.value
+
+        lb_rect = wt.RECT()
+        user32.GetWindowRect(h, ctypes.byref(lb_rect))
+        count = SM(h, 0x018B, 0, 0)  # LB_GETCOUNT
+        for i in range(min(count, 100)):
+            ir = wt.RECT()
+            SM(h, 0x0198, i, ctypes.addressof(ir))  # LB_GETITEMRECT
+            item_h = ir.bottom - ir.top
+            if item_h <= 5:
+                continue  # separator
+            sx = lb_rect.left + (ir.left + ir.right) // 2
+            sy = lb_rect.top + (ir.top + ir.bottom) // 2
+            items.append({
+                "section": section,
+                "lb_hwnd": h,
+                "item_index": i,
+                "screen_x": sx,
+                "screen_y": sy,
+            })
+        return True
+
+    user32.EnumChildWindows(holder, EnumCB(_scan_lb), 0)
+    return items
+
+
+def _sidebar_dblclick(root_hwnd: int, screen_x: int, screen_y: int,
+                      timeout: float = 2.0) -> str:
+    """Double-click a screen position and return the new root window title."""
+    import ctypes  # noqa: PLC0415
+    import time as _time  # noqa: PLC0415
+
+    user32 = ctypes.windll.user32
+    user32.SetForegroundWindow(root_hwnd)
+    _time.sleep(0.2)
+    user32.SetCursorPos(screen_x, screen_y)
+    _time.sleep(0.05)
+    for _ in range(2):
+        user32.mouse_event(0x0002, 0, 0, 0, 0)
+        user32.mouse_event(0x0004, 0, 0, 0, 0)
+        _time.sleep(0.05)
+    _time.sleep(timeout)
+    buf = ctypes.create_unicode_buffer(256)
+    user32.GetWindowTextW(root_hwnd, buf, 256)
+    return buf.value
+
+
+def list_sidebar_accounts(bridge: Any) -> list[dict[str, Any]]:
+    """Return sidebar accounts with their names (discovered by clicking).
+
+    Each entry has ``{"name", "section", "lb_hwnd", "item_index"}``.
+    This is a one-time discovery that physically clicks each sidebar item,
+    reads the resulting window title, then restores the original view.
+    """
+    import time as _time  # noqa: PLC0415
+    import ctypes  # noqa: PLC0415
+
+    from server.process_manager import get_process_manager  # noqa: PLC0415
+    pm = get_process_manager()
+    if not pm.attached:
+        raise TargetNotFoundError("Use select_window to attach first.")
+    root = pm.attached.hwnd
+
+    user32 = ctypes.windll.user32
+    buf = ctypes.create_unicode_buffer(256)
+
+    # Remember current view
+    user32.GetWindowTextW(root, buf, 256)
+    original_title = buf.value
+
+    sidebar_items = _find_sidebar_accounts(root)
+    results: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+
+    for item in sidebar_items:
+        title = _sidebar_dblclick(
+            root, item["screen_x"], item["screen_y"], timeout=1.5,
+        )
+        # Extract account name from "[Account Name]" in title
+        name = ""
+        if "[" in title and "]" in title:
+            name = title[title.rfind("[") + 1 : title.rfind("]")]
+        if name and name not in seen_names:
+            seen_names.add(name)
+            results.append({
+                "name": name,
+                "section": item["section"],
+                "lb_hwnd": hex(item["lb_hwnd"]),
+                "item_index": item["item_index"],
+            })
+
+    return results
+
+
 def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
     """
-    Navigate the register view to a specific account.
+    Navigate to a specific account's register view.
 
-    Strategy:
-    1. Check if there is already a QWMDI child whose account combo shows
-       the target account.  If so, just bring it to the foreground.
-    2. Otherwise, select *account_name* in the active register's combobox
-       using ``CB_SETCURSEL`` + ``WM_COMMAND(CBN_SELCHANGE)`` and bring
-       the resulting MDI child to the foreground.
+    Strategy
+    --------
+    1. Check if a QWMDI tab already shows the account → bring it forward.
+    2. Try the sidebar: double-click the matching ListBox item.
+    3. Fall back to the All Transactions combo selector.
 
     Parameters
     ----------
@@ -190,7 +338,7 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
     Returns
     -------
     dict
-        ``{"ok": True, "account": str, "combo_index": int}``
+        ``{"ok": True, "account": str, "method": str}``
     """
     import ctypes  # noqa: PLC0415
     import ctypes.wintypes  # noqa: PLC0415
@@ -227,7 +375,13 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
         user32.GetClassNameW(h, cls, 64)
         if cls.value != "QWMDI" or not user32.IsWindowVisible(h):
             return True
-        # Check first visible QWComboBox in this MDI
+        # Match by QWMDI window title (works for account register tabs)
+        mdi_title = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(h, mdi_title, 256)
+        if mdi_title.value.lower() == name_lower:
+            existing_mdi = h
+            return False
+        # Also check first visible QWComboBox in this MDI
         def _check_combo(ch: int, _: int) -> bool:
             nonlocal existing_mdi, existing_idx
             cc = ctypes.create_unicode_buffer(64)
@@ -238,11 +392,11 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
                 if txt.lower() == name_lower:
                     existing_mdi = h
                     existing_idx = _send_msg(ch, CB_GETCURSEL, 0, 0)
-                    return False  # stop inner enumeration
+                    return False
             return True
         user32.EnumChildWindows(h, EnumCB(_check_combo), 0)
         if existing_mdi:
-            return False  # stop outer enumeration
+            return False
         return True
 
     user32.EnumChildWindows(root_hwnd, EnumCB(_find_existing), 0)
@@ -250,20 +404,48 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
     if existing_mdi:
         user32.BringWindowToTop(existing_mdi)
         user32.SetFocus(existing_mdi)
-        return {"ok": True, "account": account_name, "combo_index": existing_idx}
+        return {"ok": True, "account": account_name, "method": "existing_tab"}
 
     # ------------------------------------------------------------------
-    # Phase 2: No existing MDI — use the account combo to navigate.
+    # Phase 2: Try sidebar double-click navigation (opens account register)
     # ------------------------------------------------------------------
-    accounts = list_accounts(bridge)
+    sidebar_items = _find_sidebar_accounts(root_hwnd)
+    if sidebar_items:
+        # We must click each item to discover its name (owner-drawn, no text).
+        # Try each item; if the title changes to show the target, we're done.
+        buf_title = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(root_hwnd, buf_title, 256)
+        original_title = buf_title.value
+
+        for item in sidebar_items:
+            title = _sidebar_dblclick(
+                root_hwnd, item["screen_x"], item["screen_y"], timeout=1.5,
+            )
+            if "[" in title and "]" in title:
+                opened = title[title.rfind("[") + 1 : title.rfind("]")]
+                if opened.lower() == name_lower:
+                    return {"ok": True, "account": opened, "method": "sidebar"}
+
+        # Sidebar didn't find it — restore original view if it changed
+        user32.GetWindowTextW(root_hwnd, buf_title, 256)
+        if buf_title.value != original_title:
+            # Best-effort restore: click "All Transactions" if available
+            pass
+
+    # ------------------------------------------------------------------
+    # Phase 3: Fall back to combo selector (All Transactions register)
+    # ------------------------------------------------------------------
+    try:
+        accounts = list_accounts(bridge)
+    except UIAError:
+        accounts = []
     match = next(
         (a for a in accounts if a["name"].lower() == name_lower),
         None,
     )
     if match is None:
-        available = [a["name"] for a in accounts]
         raise UIAError(
-            f"Account {account_name!r} not found. Available: {available}",
+            f"Account {account_name!r} not found via sidebar or combo.",
             code="ACCOUNT_NOT_FOUND",
         )
 
@@ -308,7 +490,7 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
         user32.BringWindowToTop(target_mdi)
         user32.SetFocus(target_mdi)
 
-    return {"ok": True, "account": match["name"], "combo_index": idx}
+    return {"ok": True, "account": match["name"], "method": "combo"}
 
 
 def read_register_state(bridge: Any) -> dict[str, Any]:
