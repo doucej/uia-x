@@ -164,6 +164,29 @@ class TestWindowRanking:
         win = pm.attach(process_name="qw.exe")
         assert win.hwnd == 0x0020, f"Expected QFRAME (0x0020) but got {hex(win.hwnd)}"
 
+    def test_attach_prefers_app_over_shell_window(self):
+        """When title matches both an app and a File Explorer, prefer the app."""
+        windows = [
+            WindowInfo(
+                hwnd=0x0030, title="Quicken - File Explorer",
+                class_name="CabinetWClass",
+                pid=600, process_name="explorer.exe", visible=True,
+                rect={"left": 0, "top": 0, "right": 1920, "bottom": 1080},
+            ),
+            WindowInfo(
+                hwnd=0x0040, title="Quicken Classic Premier - [Checking]",
+                class_name="QFRAME",
+                pid=700, process_name="qw.exe", visible=True,
+                rect={"left": 0, "top": 0, "right": 1300, "bottom": 750},
+            ),
+        ]
+        pm = MockProcessManager(windows=windows)
+        win = pm.attach(window_title="Quicken")
+        assert win.hwnd == 0x0040, (
+            f"Expected QFRAME (0x0040) but got {hex(win.hwnd)} "
+            f"({win.class_name}) — shell window should rank lower"
+        )
+
 
 class TestDpiScale:
     """Issue #10/#11 — dpi_scale field is present on WindowInfo."""

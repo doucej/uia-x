@@ -220,15 +220,23 @@ class RealProcessManager(ProcessManager):
             }
             raise ProcessNotFoundError(f"No window matched: {criteria}")
 
-        # Rank candidates: prefer visible windows, then by largest area.
-        # This ensures select_window(process_name="qw.exe") picks the main
-        # QFRAME window rather than an invisible 1×1 helper like QWFly.
+        # Rank candidates: prefer visible windows, then application-specific
+        # class names over generic shell/explorer classes, then by largest area.
+        # This avoids selecting a File Explorer window when the user searches
+        # by title (e.g. window_title="Quicken" matching both Quicken.exe's
+        # QFRAME and a File Explorer browsing a "Quicken" folder).
+        _SHELL_CLASSES = frozenset({
+            "cabinetw", "explorerw", "shell_traywnd", "progman",
+            "applicationframewindow", "windows.ui.core.corewindow",
+        })
+
         def _rank(w: WindowInfo) -> tuple:
             area = (
                 (w.rect.get("right", 0) - w.rect.get("left", 0))
                 * (w.rect.get("bottom", 0) - w.rect.get("top", 0))
             )
-            return (0 if w.visible else 1, -area)
+            is_shell = w.class_name.lower().rstrip("class") in _SHELL_CLASSES
+            return (0 if w.visible else 1, 1 if is_shell else 0, -area)
 
         matches.sort(key=_rank)
         self._attached = matches[0]
@@ -290,13 +298,19 @@ class MockProcessManager(ProcessManager):
             }
             raise ProcessNotFoundError(f"No window matched: {criteria}")
 
-        # Prefer visible windows, then largest area (mirrors RealProcessManager).
+        # Prefer visible windows, then app-specific classes, then largest area.
+        _SHELL_CLASSES = frozenset({
+            "cabinetw", "explorerw", "shell_traywnd", "progman",
+            "applicationframewindow", "windows.ui.core.corewindow",
+        })
+
         def _rank(w: WindowInfo) -> tuple:
             area = (
                 (w.rect.get("right", 0) - w.rect.get("left", 0))
                 * (w.rect.get("bottom", 0) - w.rect.get("top", 0))
             )
-            return (0 if w.visible else 1, -area)
+            is_shell = w.class_name.lower().rstrip("class") in _SHELL_CLASSES
+            return (0 if w.visible else 1, 1 if is_shell else 0, -area)
 
         matches.sort(key=_rank)
         self._attached = matches[0]
