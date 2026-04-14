@@ -15,7 +15,7 @@ from typing import Any
 from server.uia_bridge import UIAError, TargetNotFoundError
 
 
-_SKIP_ACCT_ITEMS = frozenset({"custom...", "qcombo_separator", ""})
+_SKIP_ACCT_ITEMS_MISC = frozenset({"custom...", "qcombo_separator", ""})
 
 
 def _is_valid_hwnd(hwnd: int) -> bool:
@@ -165,15 +165,189 @@ def _combo_cur_text(hwnd: int) -> str:
     return buf.value
 
 
+# Known items that should NOT be treated as account names.
+_FILTER_ITEMS = frozenset({
+    "any type", "charge", "payment", "check", "atm", "deposit",
+    "online", "transfer", "eft", "printed check",
+})
+_ACCOUNT_FILTERS = frozenset({
+    "all accounts", "personal accounts only", "business accounts only",
+})
+_SKIP_ACCT_ITEMS = _FILTER_ITEMS | _ACCOUNT_FILTERS | _SKIP_ACCT_ITEMS_MISC
+_TEMPORAL_WORDS = ("month", "year", "week", "day", "today", "quarter",
+                   "type", "income", "expense", "all date", "earliest",
+                   "custom date", "last 12", "last 3", "last 5")
+
+# Quicken navigation/category views — these MDI titles are NOT account names.
+_CATEGORY_VIEWS = frozenset({
+    "home", "spending", "bills", "bills & income", "planning", "tax",
+    "reports", "investing", "property & debt", "net worth", "budget",
+    "debt reduction", "savings goals", "bills & reminders",
+})
+
+
+def _is_combo_filter_item(s: str) -> bool:
+    """Return True if *s* is a combo filter/separator, not an account name."""
+    low = s.lower().strip()
+    if not low:
+        return True
+    if low in _SKIP_ACCT_ITEMS:
+        return True
+    if low.startswith("all ") and any(w in low for w in
+                                       ("account", "debt", "checking",
+                                        "saving", "credit", "liabilit",
+                                        "transaction", "date")):
+        return True
+    if low.endswith(" only"):
+        return True
+    return False
+
+
+def _find_account_combo(root_hwnd: int) -> tuple[int, list[str]] | None:
+    """Find the account-selector QWComboBox anywhere in the window tree.
+
+    Searches ALL QWComboBox children (including those in hidden/background
+    MDI tabs) and returns ``(combo_hwnd, items)`` for the first combo that
+    contains account-like names (not date/filter combos).
+    """
+    import ctypes  # noqa: PLC0415
+    import ctypes.wintypes as wt  # noqa: PLC0415
+
+    user32 = ctypes.windll.user32
+    combos: list[int] = []
+
+    EnumCB = ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
+
+    def _collect(h: int, _: int) -> bool:
+        cls = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(h, cls, 64)
+        if cls.value.lower() == "qwcombobox":
+            combos.append(h)
+        return True
+
+    user32.EnumChildWindows(root_hwnd, EnumCB(_collect), 0)
+
+    # Sort by x-position: the account combo is typically the leftmost.
+    def _left(h: int) -> int:
+        r = wt.RECT()
+        user32.GetWindowRect(h, ctypes.byref(r))
+        return r.left
+
+    combos.sort(key=_left)
+
+    for combo_h in combos:
+        items = _combo_get_items(combo_h)
+        if len(items) < 2:
+            continue
+        lower = [it.lower() for it in items]
+        # Skip combos that are entirely filter/date combos.
+        if all(_is_combo_filter_item(it) for it in items):
+            continue
+        temporal = sum(1 for it in lower if any(w in it for w in _TEMPORAL_WORDS))
+        if temporal > len(items) / 2:
+            continue
+        return combo_h, items
+
+    return None
+
+
+def _discover_accounts_via_mdi(root_hwnd: int) -> list[dict[str, Any]]:
+    """Discover accounts by enumerating QWMDI tabs and their combos.
+
+    This is **much faster** than sidebar scanning (~0.2s vs 200s) because it
+    uses pure Win32 message passing — no physical mouse clicks needed.
+
+    Strategy:
+    1. Enumerate all QWMDI children and read their titles.
+    2. Non-category titles (not "Home", "Spending", etc.) are account names.
+    3. For category-view tabs, read the leftmost combo that has account items.
+    4. Merge and deduplicate.
+
+    Returns a list of ``{"name": str, "source": "mdi_tab"|"combo",
+    "combo_hwnd": hex, "combo_index": int}`` dicts.
+    """
+    import ctypes  # noqa: PLC0415
+    import ctypes.wintypes as wt  # noqa: PLC0415
+
+    user32 = ctypes.windll.user32
+
+    # Step 1: find all QWMDI children.
+    mdi_tabs: list[tuple[int, str]] = []
+    EnumCB = ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
+
+    def _collect_mdi(h: int, _: int) -> bool:
+        cls = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(h, cls, 64)
+        if cls.value == "QWMDI":
+            title = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(h, title, 256)
+            mdi_tabs.append((h, title.value))
+        return True
+
+    user32.EnumChildWindows(root_hwnd, EnumCB(_collect_mdi), 0)
+
+    seen: set[str] = set()
+    result: list[dict[str, Any]] = []
+
+    def _add(name: str, **extra: Any) -> None:
+        key = name.lower().strip()
+        if key and key not in seen:
+            seen.add(key)
+            result.append({"name": name, **extra})
+
+    # Step 2: classify each MDI tab.
+    for mdi_h, mdi_title in mdi_tabs:
+        if not mdi_title or mdi_title.lower() in _CATEGORY_VIEWS:
+            # Category view — read combos inside this tab for account lists.
+            child_combos: list[tuple[int, int]] = []
+
+            def _get_combos(h: int, _: int) -> bool:
+                cc = ctypes.create_unicode_buffer(64)
+                user32.GetClassNameW(h, cc, 64)
+                if cc.value.lower() == "qwcombobox":
+                    r = wt.RECT()
+                    user32.GetWindowRect(h, ctypes.byref(r))
+                    child_combos.append((h, r.left))
+                return True
+
+            user32.EnumChildWindows(mdi_h, EnumCB(_get_combos), 0)
+            child_combos.sort(key=lambda t: t[1])
+
+            for combo_h, _ in child_combos:
+                items = _combo_get_items(combo_h)
+                # Skip combos that are entirely temporal/filter items.
+                if all(_is_combo_filter_item(it) or
+                       any(w in it.lower() for w in _TEMPORAL_WORDS)
+                       for it in items):
+                    continue
+                for idx, item in enumerate(items):
+                    if _is_combo_filter_item(item):
+                        continue
+                    low = item.lower()
+                    if any(w in low for w in _TEMPORAL_WORDS):
+                        continue
+                    _add(item, source="combo",
+                         combo_hwnd=hex(combo_h), combo_index=idx)
+        else:
+            # Non-category MDI tab — title IS the account name.
+            _add(mdi_title, source="mdi_tab")
+
+    return result
+
+
 def list_accounts(bridge: Any) -> list[dict[str, Any]]:
     """
     Return all accounts visible in Quicken.
 
-    Strategy
-    --------
-    1. Try the 'All accounts' register combobox (Spending / All Transactions).
-    2. If the combo contains field-type filters (Charge, Payment, etc.)
-       instead of real account names, fall back to sidebar scanning.
+    Strategy (fastest first)
+    ---------
+    1. MDI-tab discovery: enumerate all QWMDI children.  Account-specific
+       tabs reveal their name via the window title; category-view tabs
+       (Spending, Property & Debt, …) contain account-selector combos.
+       This path takes ~0.2 s.
+    2. Sidebar cache: if a sidebar scan was previously done, return it.
+    3. Sidebar scan: full physical-click scan (~200 s).  Only used when
+       no MDI tabs or combos exist.
 
     Parameters
     ----------
@@ -183,96 +357,41 @@ def list_accounts(bridge: Any) -> list[dict[str, Any]]:
     Returns
     -------
     list of dict
-        Each entry has ``{"name": str, "combo_index": int}`` (combo path)
-        or ``{"name": str, "source": "sidebar"}`` (sidebar path).
+        Each entry has ``{"name": str, "source": ...}``.  Combo-sourced
+        entries also include ``combo_hwnd`` and ``combo_index``.
 
     Raises
     ------
     UIAError
         If no accounts can be located.
     """
-    import ctypes  # noqa: PLC0415
-
-    user32 = ctypes.windll.user32
-
     from server.process_manager import get_process_manager  # noqa: PLC0415
     pm = get_process_manager()
     if not pm.attached:
         raise TargetNotFoundError("Use select_window to attach to a target first.")
+    root = pm.attached.hwnd
 
-    # Known field-type filter values that appear in register filter combos
-    _FILTER_ITEMS = frozenset({
-        "any type", "charge", "payment", "check", "atm", "deposit",
-        "online", "transfer", "eft", "printed check",
-    })
-    # Known account-list filter values (not actual account names)
-    _ACCOUNT_FILTERS = frozenset({
-        "all accounts", "personal accounts only", "business accounts only",
-    })
+    # --- Primary: MDI discovery (instant) ---
+    mdi_accounts = _discover_accounts_via_mdi(root)
+    if mdi_accounts:
+        return mdi_accounts
 
-    # Find all qwcombobox controls (platform-native: fast Win32 path)
-    all_els = bridge.find_all({
-        "roles": [], "has_actions": False, "named_only": False, "root": None,
-    })
-    combos = [e for e in all_els if e.get("class_name", "").lower() == "qwcombobox"]
-
-    def _hwnd_int(e: dict) -> int:
-        raw = e.get("hwnd", 0)
-        return int(raw, 16) if isinstance(raw, str) else int(raw)
-
-    acct_combo_h: int | None = None
-    for cb in combos:
-        nm = (cb.get("name") or "").lower()
-        if "account" in nm:
-            acct_combo_h = _hwnd_int(cb)
-            break
-
-    # Fallback: use leftmost combo that has non-date items
-    if acct_combo_h is None:
-        import ctypes.wintypes  # noqa: PLC0415
-
-        def _combo_x(e: dict) -> int:
-            r = ctypes.wintypes.RECT()
-            user32.GetWindowRect(_hwnd_int(e), ctypes.byref(r))
-            return r.left
-
-        for cb in sorted(combos, key=_combo_x):
-            items = _combo_get_items(_hwnd_int(cb))
-            non_temporal = [
-                it for it in items if it and not any(
-                    x in it.lower() for x in (
-                        "month", "year", "week", "day", "today",
-                        "quarter", "type", "income", "expense",
-                        "transfer", "all date",
-                    )
-                )
-            ]
-            if len(non_temporal) > 1:
-                acct_combo_h = _hwnd_int(cb)
-                break
-
-    if acct_combo_h is not None:
-        raw_items = _combo_get_items(acct_combo_h)
+    # --- Secondary: global combo search ---
+    found = _find_account_combo(root)
+    if found:
+        combo_h, raw_items = found
         result = []
         for idx, name in enumerate(raw_items):
-            if name.lower() in _SKIP_ACCT_ITEMS:
+            if _is_combo_filter_item(name):
                 continue
             result.append({"name": name, "combo_index": idx,
-                           "combo_hwnd": hex(acct_combo_h)})
-        # Check if this is actually a field-type or account-list filter combo
-        if result and all(
-            it["name"].lower() in _FILTER_ITEMS or it["name"].lower() in _ACCOUNT_FILTERS
-            for it in result
-        ):
-            # Combo shows filter types, not account names — fall through
-            result = []
+                           "combo_hwnd": hex(combo_h), "source": "combo"})
         if result:
             return result
 
-    # Combo path failed — fall back to sidebar discovery
+    # --- Tertiary: sidebar ---
     if _sidebar_cache:
         return [{"name": e["name"], "source": "sidebar"} for e in _sidebar_cache]
-    # Auto-populate sidebar cache
     sidebar = list_sidebar_accounts(bridge)
     if sidebar:
         return [{"name": e["name"], "source": "sidebar"} for e in sidebar]
@@ -309,19 +428,36 @@ def _find_sidebar_accounts(root_hwnd: int) -> list[dict[str, Any]]:
 
     EnumCB = ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
 
-    # Find the QWAcctBarHolder
+    # Find the QWAcctBarHolder (may be hidden by investment views)
     holder = None
     def _find_holder(h: int, _: int) -> bool:
         nonlocal holder
         cls = ctypes.create_unicode_buffer(64)
         user32.GetClassNameW(h, cls, 64)
-        if cls.value == "QWAcctBarHolder" and user32.IsWindowVisible(h):
+        if cls.value == "QWAcctBarHolder":
             holder = h
             return False
         return True
     user32.EnumChildWindows(root_hwnd, EnumCB(_find_holder), 0)
     if not holder:
         return []
+
+    # Ensure the sidebar is visible (investment views may hide it)
+    if not user32.IsWindowVisible(holder):
+        SW_SHOW = 5
+        # Walk up and show each hidden ancestor
+        h = holder
+        chain = []
+        while h and h != root_hwnd:
+            chain.append(h)
+            h = user32.GetParent(h)
+        for h in reversed(chain):
+            if not user32.IsWindowVisible(h):
+                user32.ShowWindow(h, SW_SHOW)
+        import time as _time  # noqa: PLC0415
+        _time.sleep(0.2)
+        if not user32.IsWindowVisible(holder):
+            return []  # couldn't recover visibility
 
     # Collect ListBoxes parented by QWListViewer within the holder
     items: list[dict[str, Any]] = []
@@ -365,18 +501,28 @@ def _find_sidebar_accounts(root_hwnd: int) -> list[dict[str, Any]]:
 
 
 def _sidebar_dblclick(root_hwnd: int, screen_x: int, screen_y: int,
-                      timeout: float = 2.0, *,
+                      timeout: float = 6.0, *,
                       lb_hwnd: int = 0, item_index: int = -1,
-                      pre_title: str = "") -> str:
+                      pre_title: str = "",
+                      bail_early: float = 0.8) -> str:
     """Double-click a sidebar item and wait for the title to stabilize.
 
     If ``lb_hwnd`` and ``item_index`` are provided, the item is scrolled
     into view first (via ``LB_SETTOPINDEX``) and its screen position is
     recalculated.
 
-    If ``pre_title`` is given, the function polls until the title differs
-    from it AND contains an ``[account name]`` bracket, or until *timeout*
-    seconds elapse.  This avoids misattributing delayed title changes.
+    If ``pre_title`` is given, the function uses a two-phase wait based
+    on the **bracketed account name** in the title (e.g. ``[My Checking]``):
+
+    Phase 1 (``bail_early`` seconds, default 0.8s):
+        Poll at 100ms.  If the bracket content hasn't changed, bail out —
+        the item is a non-account (header, total, separator).
+
+    Phase 2 (up to ``timeout`` total):
+        Bracket content is changing — wait for it to stabilize on a new
+        account name.  If the title hasn't changed at all since the click,
+        use a shortened Phase 2 (2.5s) to avoid wasting time on dead items.
+        Dismiss modal dialogs once at start, not every poll.
     """
     import ctypes  # noqa: PLC0415
     import ctypes.wintypes as wt  # noqa: PLC0415
@@ -384,12 +530,17 @@ def _sidebar_dblclick(root_hwnd: int, screen_x: int, screen_y: int,
 
     user32 = ctypes.windll.user32
 
+    def _bracket_name(t: str) -> str:
+        if "[" in t and "]" in t:
+            return t[t.rfind("[") + 1 : t.rfind("]")]
+        return ""
+
     # Scroll the target item into view and recalculate coordinates
     if lb_hwnd and item_index >= 0 and _is_valid_hwnd(lb_hwnd):
         LB_SETTOPINDEX = 0x0197
         LB_GETITEMRECT = 0x0198
         _send_msg(lb_hwnd, LB_SETTOPINDEX, max(0, item_index - 1), 0)
-        _time.sleep(0.15)
+        _time.sleep(0.05)
         ir = wt.RECT()
         _send_msg(lb_hwnd, LB_GETITEMRECT, item_index, ctypes.addressof(ir))
         pt = wt.POINT((ir.left + ir.right) // 2, (ir.top + ir.bottom) // 2)
@@ -397,36 +548,80 @@ def _sidebar_dblclick(root_hwnd: int, screen_x: int, screen_y: int,
         screen_x, screen_y = pt.x, pt.y
 
     user32.SetForegroundWindow(root_hwnd)
-    _time.sleep(0.2)
+    _time.sleep(0.05)
 
     # Dismiss any pre-existing modal dialogs before clicking
     _dismiss_modal_dialogs(root_hwnd)
 
     user32.SetCursorPos(screen_x, screen_y)
-    _time.sleep(0.05)
+    _time.sleep(0.03)
     for _ in range(2):
         user32.mouse_event(0x0002, 0, 0, 0, 0)
         user32.mouse_event(0x0004, 0, 0, 0, 0)
-        _time.sleep(0.05)
+        _time.sleep(0.03)
 
-    # Poll until the title stabilizes (differs from pre_title and has brackets)
     buf = ctypes.create_unicode_buffer(256)
-    deadline = _time.monotonic() + timeout
-    title = ""
-    while _time.monotonic() < deadline:
-        _time.sleep(0.4)
-        # Dismiss dialogs that may appear mid-transition
-        _dismiss_modal_dialogs(root_hwnd)
-        user32.GetWindowTextW(root_hwnd, buf, 256)
-        title = buf.value
-        if pre_title and title != pre_title and "[" in title:
-            break  # title changed and has a bracket — account loaded
-    else:
-        # Timeout — read title one last time
-        user32.GetWindowTextW(root_hwnd, buf, 256)
-        title = buf.value
 
-    return title
+    if not pre_title:
+        _time.sleep(0.5)
+        user32.GetWindowTextW(root_hwnd, buf, 256)
+        return buf.value
+
+    pre_bracket = _bracket_name(pre_title)
+
+    # Phase 1 (bail_early seconds): poll for bracket change.
+    bail_deadline = _time.monotonic() + bail_early
+    while _time.monotonic() < bail_deadline:
+        _time.sleep(0.1)
+        user32.GetWindowTextW(root_hwnd, buf, 256)
+        cur = buf.value
+        cur_bracket = _bracket_name(cur)
+        if cur_bracket and cur_bracket != pre_bracket:
+            return cur  # new account opened
+
+    if not pre_bracket:
+        user32.GetWindowTextW(root_hwnd, buf, 256)
+        return buf.value
+
+    # Snapshot at end of Phase 1: is the title actively changing?
+    user32.GetWindowTextW(root_hwnd, buf, 256)
+    phase1_title = buf.value
+
+    # Phase 2: wait for bracket to stabilize.
+    # If the title hasn't changed at all since the click, the item is
+    # likely a non-account (header/total/sub-view) — use a shortened
+    # Phase 2 to catch slow accounts without wasting too much time.
+    # If the title IS different, something is happening — use full timeout.
+    if phase1_title == pre_title:
+        phase2_budget = min(2.5, timeout - bail_early)
+    else:
+        phase2_budget = timeout - bail_early
+
+    # Dismiss any modal that appeared during the click (once, not per-poll).
+    if _dismiss_modal_dialogs(root_hwnd):
+        _time.sleep(0.3)
+
+    full_deadline = _time.monotonic() + phase2_budget
+    while _time.monotonic() < full_deadline:
+        _time.sleep(0.15)
+        user32.GetWindowTextW(root_hwnd, buf, 256)
+        cur = buf.value
+        cur_bracket = _bracket_name(cur)
+        if cur_bracket and cur_bracket != pre_bracket:
+            return cur
+
+    # One final modal dismiss — a dialog may have appeared during Phase 2
+    # and blocked the account switch.
+    if _dismiss_modal_dialogs(root_hwnd):
+        _time.sleep(1.0)
+        user32.GetWindowTextW(root_hwnd, buf, 256)
+        cur_bracket = _bracket_name(buf.value)
+        if cur_bracket and cur_bracket != pre_bracket:
+            return buf.value
+
+    # Final read
+    user32.GetWindowTextW(root_hwnd, buf, 256)
+    return buf.value
 
 
 def list_sidebar_accounts(bridge: Any) -> list[dict[str, Any]]:
@@ -469,21 +664,26 @@ def list_sidebar_accounts(bridge: Any) -> list[dict[str, Any]]:
         title_before = buf.value
 
         title = _sidebar_dblclick(
-            root, item["screen_x"], item["screen_y"], timeout=4.0,
+            root, item["screen_x"], item["screen_y"], timeout=6.0,
             lb_hwnd=item["lb_hwnd"], item_index=item["item_index"],
             pre_title=title_before,
         )
-        # Only record if clicking this item actually changed the title
-        if title == title_before:
-            continue  # header, total, or separator — no account opened
 
-        # Extract account name from "[Account Name]" in title
-        name = ""
-        if "[" in title and "]" in title:
-            name = title[title.rfind("[") + 1 : title.rfind("]")]
+        # Compare bracket content (account name), not full title — the
+        # prefix can change without the account actually switching.
+        def _bracket(t: str) -> str:
+            if "[" in t and "]" in t:
+                return t[t.rfind("[") + 1 : t.rfind("]")]
+            return ""
+
+        name = _bracket(title)
+        prev_name = _bracket(title_before)
+        if not name or name == prev_name:
+            continue  # header, total, or separator — no account opened
         # Skip section-header items (e.g. "Property & Debt" section opens
-        # a summary view, not a real account register).
-        if name and name.lower() == item["section"].lower():
+        # a summary view, not a real account register).  Use fuzzy match
+        # so "Property & De" ≈ "Property & Debt" handles truncation too.
+        if name and _acct_match(name, item["section"]):
             continue
         if name and name not in seen_names:
             seen_names.add(name)
@@ -607,21 +807,66 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
         return {"ok": True, "account": account_name, "method": "existing_tab"}
 
     # ------------------------------------------------------------------
-    # Phase 2: Try sidebar — auto-populate cache on first use.
+    # Phase 2: Try combo selector first (fast — no sidebar scan needed).
     # ------------------------------------------------------------------
-    if not _sidebar_cache:
-        try:
-            list_sidebar_accounts(bridge)
-        except Exception:
-            pass  # sidebar scan failed — continue to Phase 3
+    try:
+        accounts = list_accounts(bridge)
+    except UIAError:
+        accounts = []
+    match = next(
+        (a for a in accounts if _acct_match(a["name"], account_name)),
+        None,
+    )
+    if match and "combo_hwnd" in match:
+        combo_h = int(match["combo_hwnd"], 16)
+        idx = match["combo_index"]
 
-    cached = _sidebar_lookup(account_name)
+        # Bring the MDI tab that owns this combo to the foreground so the
+        # selection change actually activates the account view.
+        _mdi = user32.GetParent(combo_h)
+        while _mdi:
+            _cls = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(_mdi, _cls, 64)
+            if _cls.value == "QWMDI":
+                user32.BringWindowToTop(_mdi)
+                user32.SetFocus(_mdi)
+                break
+            _mdi = user32.GetParent(_mdi)
+
+        _send_msg(combo_h, CB_SETCURSEL, idx, 0)
+        parent = user32.GetParent(combo_h)
+        ctrl_id = user32.GetDlgCtrlID(combo_h)
+        wparam = (CBN_SELCHANGE << 16) | (ctrl_id & 0xFFFF)
+        _send_msg(parent, WM_COMMAND, wparam, combo_h)
+        time.sleep(0.8)
+
+        # Verify the switch via window title bracket first.
+        buf_v = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(root_hwnd, buf_v, 256)
+        title = buf_v.value
+        if "[" in title and "]" in title:
+            opened = title[title.rfind("[") + 1 : title.rfind("]")]
+            if _acct_match(opened, account_name):
+                return {"ok": True, "account": opened, "method": "combo"}
+
+        # For category-view combos (Property & Debt, etc.), the title
+        # bracket won't change to the account name.  Verify by reading
+        # the combo selection text instead.
+        sel_text = _combo_cur_text(combo_h)
+        if _acct_match(sel_text, account_name):
+            return {"ok": True, "account": sel_text, "method": "combo_filter"}
+
+    # ------------------------------------------------------------------
+    # Phase 3: Sidebar — use cached entries if available.
+    # Does NOT trigger a full sidebar scan (takes 200+ s).  Agents should
+    # call list_sidebar_accounts explicitly if they need the full list.
+    # ------------------------------------------------------------------
+    cached = _sidebar_lookup(account_name) if _sidebar_cache else None
 
     def _try_sidebar_click(cached_entry: dict) -> dict | None:
         """Attempt to click the cached sidebar item, scrolling into view."""
         target_lb = int(cached_entry["lb_hwnd"], 16)
         target_idx = cached_entry["item_index"]
-        # Read current title so _sidebar_dblclick can poll for a change
         cur_buf = ctypes.create_unicode_buffer(256)
         user32.GetWindowTextW(root_hwnd, cur_buf, 256)
         title = _sidebar_dblclick(
@@ -639,78 +884,15 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
         result = _try_sidebar_click(cached)
         if result:
             return result
-        # Sidebar click opened wrong account or failed — invalidate cache
-        # and rebuild once.
+        # Sidebar click failed — invalidate cache
         _sidebar_cache = []
-        try:
-            list_sidebar_accounts(bridge)
-        except Exception:
-            pass
-        cached = _sidebar_lookup(account_name)
-        if cached:
-            result = _try_sidebar_click(cached)
-            if result:
-                return result
 
-    # ------------------------------------------------------------------
-    # Phase 3: Fall back to combo selector (All Transactions register)
-    # ------------------------------------------------------------------
-    try:
-        accounts = list_accounts(bridge)
-    except UIAError:
-        accounts = []
-    match = next(
-        (a for a in accounts if _acct_match(a["name"], account_name)),
-        None,
+    raise UIAError(
+        f"Account {account_name!r} not found via combo or sidebar cache.  "
+        f"Make sure the account has an open tab, or use list_sidebar_accounts "
+        f"to populate the sidebar cache first.",
+        code="ACCOUNT_NOT_FOUND",
     )
-    if match is None:
-        raise UIAError(
-            f"Account {account_name!r} not found via sidebar or combo.",
-            code="ACCOUNT_NOT_FOUND",
-        )
-
-    combo_h = int(match["combo_hwnd"], 16)
-    idx = match["combo_index"]
-
-    _send_msg(combo_h, CB_SETCURSEL, idx, 0)
-    parent = user32.GetParent(combo_h)
-    ctrl_id = user32.GetDlgCtrlID(combo_h)
-    wparam = (CBN_SELCHANGE << 16) | (ctrl_id & 0xFFFF)
-    _send_msg(parent, WM_COMMAND, wparam, combo_h)
-
-    # Give Quicken time to process the account switch
-    time.sleep(0.8)
-
-    # Bring the target account's MDI child to the foreground
-    target_mdi = None
-
-    def _find_mdi(h: int, _: int) -> bool:
-        nonlocal target_mdi
-        cls = ctypes.create_unicode_buffer(64)
-        user32.GetClassNameW(h, cls, 64)
-        if cls.value != "QWMDI" or not user32.IsWindowVisible(h):
-            return True
-        def _check_combo(ch: int, _: int) -> bool:
-            nonlocal target_mdi
-            cc = ctypes.create_unicode_buffer(64)
-            user32.GetClassNameW(ch, cc, 64)
-            if (cc.value.lower() == "qwcombobox"
-                    and user32.IsWindowVisible(ch)):
-                if _acct_match(_combo_cur_text(ch), account_name):
-                    target_mdi = h
-                    return False
-            return True
-        user32.EnumChildWindows(h, EnumCB(_check_combo), 0)
-        if target_mdi:
-            return False
-        return True
-
-    user32.EnumChildWindows(root_hwnd, EnumCB(_find_mdi), 0)
-    if target_mdi:
-        user32.BringWindowToTop(target_mdi)
-        user32.SetFocus(target_mdi)
-
-    return {"ok": True, "account": match["name"], "method": "combo"}
 
 
 def read_register_state(bridge: Any) -> dict[str, Any]:
