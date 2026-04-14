@@ -18,6 +18,11 @@ from server.uia_bridge import UIAError, TargetNotFoundError
 _SKIP_ACCT_ITEMS = frozenset({"custom...", "qcombo_separator", ""})
 
 
+def _is_valid_hwnd(hwnd: int) -> bool:
+    """Check whether a window handle is still valid."""
+    import ctypes  # noqa: PLC0415
+    return bool(ctypes.windll.user32.IsWindow(hwnd))
+
 def _acct_match(candidate: str, query: str) -> bool:
     """Fuzzy account name matching: exact, substring, or all-words-present.
 
@@ -42,6 +47,63 @@ def _acct_match(candidate: str, query: str) -> bool:
     if q_words and all(w in c_ascii for w in q_words):
         return True
     return False
+
+
+def _dismiss_modal_dialogs(root_hwnd: int) -> bool:
+    """Find and dismiss any modal dialogs owned by the Quicken window.
+
+    Looks for top-level ``QWinDlg`` windows that own ``root_hwnd`` and
+    contain a "Done" or "Close" button.  Returns True if a dialog was
+    dismissed.
+    """
+    import ctypes  # noqa: PLC0415
+    import time as _time  # noqa: PLC0415
+
+    user32 = ctypes.windll.user32
+    WM_COMMAND = 0x0111
+    dismissed = False
+
+    # Collect visible top-level dialogs owned by root
+    dialogs: list[int] = []
+    def _enum_cb(h: int, _: Any) -> bool:
+        if not user32.IsWindowVisible(h):
+            return True
+        owner = user32.GetWindow(h, 4)  # GW_OWNER
+        if owner != root_hwnd:
+            return True
+        cls = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(h, cls, 64)
+        if cls.value in ("QWinDlg", "#32770"):  # Quicken dialog or system dialog
+            dialogs.append(h)
+        return True
+
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p,
+                                     ctypes.POINTER(ctypes.c_int))
+    user32.EnumWindows(WNDENUMPROC(_enum_cb), None)
+
+    for dlg in dialogs:
+        # Find a dismiss button: Done, Close, OK, Cancel
+        dismiss_btn = 0
+        def _btn_cb(h: int, _: Any) -> bool:
+            nonlocal dismiss_btn
+            if not user32.IsWindowVisible(h):
+                return True
+            buf = ctypes.create_unicode_buffer(64)
+            user32.GetWindowTextW(h, buf, 64)
+            text = buf.value.strip().lower()
+            if text in ("done", "close", "ok", "cancel"):
+                dismiss_btn = h
+                return False  # stop enumeration
+            return True
+
+        user32.EnumChildWindows(dlg, WNDENUMPROC(_btn_cb), None)
+        if dismiss_btn:
+            ctrl_id = user32.GetDlgCtrlID(dismiss_btn)
+            user32.PostMessageW(dlg, WM_COMMAND, ctrl_id, dismiss_btn)
+            _time.sleep(0.5)
+            dismissed = True
+
+    return dismissed
 
 
 def _send_msg(hwnd: int, msg: int, wp: int, lp: int) -> int:
@@ -105,15 +167,13 @@ def _combo_cur_text(hwnd: int) -> str:
 
 def list_accounts(bridge: Any) -> list[dict[str, Any]]:
     """
-    Return all accounts visible in the 'All accounts' register combobox.
+    Return all accounts visible in Quicken.
 
     Strategy
     --------
-    1. Find all ``qwcombobox`` controls in the current window.
-    2. Locate the one named "All accounts" (or the leftmost one that
-       contains non-date, non-type items).
-    3. Read its item list via ``CB_GETLBTEXT``.
-    4. Filter out separators, "Custom...", and empty strings.
+    1. Try the 'All accounts' register combobox (Spending / All Transactions).
+    2. If the combo contains field-type filters (Charge, Payment, etc.)
+       instead of real account names, fall back to sidebar scanning.
 
     Parameters
     ----------
@@ -123,12 +183,13 @@ def list_accounts(bridge: Any) -> list[dict[str, Any]]:
     Returns
     -------
     list of dict
-        Each entry has ``{"name": str, "combo_index": int}``.
+        Each entry has ``{"name": str, "combo_index": int}`` (combo path)
+        or ``{"name": str, "source": "sidebar"}`` (sidebar path).
 
     Raises
     ------
     UIAError
-        If no account combobox can be located.
+        If no accounts can be located.
     """
     import ctypes  # noqa: PLC0415
 
@@ -138,6 +199,16 @@ def list_accounts(bridge: Any) -> list[dict[str, Any]]:
     pm = get_process_manager()
     if not pm.attached:
         raise TargetNotFoundError("Use select_window to attach to a target first.")
+
+    # Known field-type filter values that appear in register filter combos
+    _FILTER_ITEMS = frozenset({
+        "any type", "charge", "payment", "check", "atm", "deposit",
+        "online", "transfer", "eft", "printed check",
+    })
+    # Known account-list filter values (not actual account names)
+    _ACCOUNT_FILTERS = frozenset({
+        "all accounts", "personal accounts only", "business accounts only",
+    })
 
     # Find all qwcombobox controls (platform-native: fast Win32 path)
     all_els = bridge.find_all({
@@ -180,19 +251,36 @@ def list_accounts(bridge: Any) -> list[dict[str, Any]]:
                 acct_combo_h = _hwnd_int(cb)
                 break
 
-    if acct_combo_h is None:
-        raise UIAError(
-            "No account combobox found. Navigate to a register view (e.g. SPENDING) first.",
-            code="ACCOUNT_COMBO_NOT_FOUND",
-        )
+    if acct_combo_h is not None:
+        raw_items = _combo_get_items(acct_combo_h)
+        result = []
+        for idx, name in enumerate(raw_items):
+            if name.lower() in _SKIP_ACCT_ITEMS:
+                continue
+            result.append({"name": name, "combo_index": idx,
+                           "combo_hwnd": hex(acct_combo_h)})
+        # Check if this is actually a field-type or account-list filter combo
+        if result and all(
+            it["name"].lower() in _FILTER_ITEMS or it["name"].lower() in _ACCOUNT_FILTERS
+            for it in result
+        ):
+            # Combo shows filter types, not account names — fall through
+            result = []
+        if result:
+            return result
 
-    raw_items = _combo_get_items(acct_combo_h)
-    result = []
-    for idx, name in enumerate(raw_items):
-        if name.lower() in _SKIP_ACCT_ITEMS:
-            continue
-        result.append({"name": name, "combo_index": idx, "combo_hwnd": hex(acct_combo_h)})
-    return result
+    # Combo path failed — fall back to sidebar discovery
+    if _sidebar_cache:
+        return [{"name": e["name"], "source": "sidebar"} for e in _sidebar_cache]
+    # Auto-populate sidebar cache
+    sidebar = list_sidebar_accounts(bridge)
+    if sidebar:
+        return [{"name": e["name"], "source": "sidebar"} for e in sidebar]
+
+    raise UIAError(
+        "No accounts found. Try navigating to a Spending or All Transactions view.",
+        code="ACCOUNT_NOT_FOUND",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -277,24 +365,68 @@ def _find_sidebar_accounts(root_hwnd: int) -> list[dict[str, Any]]:
 
 
 def _sidebar_dblclick(root_hwnd: int, screen_x: int, screen_y: int,
-                      timeout: float = 2.0) -> str:
-    """Double-click a screen position and return the new root window title."""
+                      timeout: float = 2.0, *,
+                      lb_hwnd: int = 0, item_index: int = -1,
+                      pre_title: str = "") -> str:
+    """Double-click a sidebar item and wait for the title to stabilize.
+
+    If ``lb_hwnd`` and ``item_index`` are provided, the item is scrolled
+    into view first (via ``LB_SETTOPINDEX``) and its screen position is
+    recalculated.
+
+    If ``pre_title`` is given, the function polls until the title differs
+    from it AND contains an ``[account name]`` bracket, or until *timeout*
+    seconds elapse.  This avoids misattributing delayed title changes.
+    """
     import ctypes  # noqa: PLC0415
+    import ctypes.wintypes as wt  # noqa: PLC0415
     import time as _time  # noqa: PLC0415
 
     user32 = ctypes.windll.user32
+
+    # Scroll the target item into view and recalculate coordinates
+    if lb_hwnd and item_index >= 0 and _is_valid_hwnd(lb_hwnd):
+        LB_SETTOPINDEX = 0x0197
+        LB_GETITEMRECT = 0x0198
+        _send_msg(lb_hwnd, LB_SETTOPINDEX, max(0, item_index - 1), 0)
+        _time.sleep(0.15)
+        ir = wt.RECT()
+        _send_msg(lb_hwnd, LB_GETITEMRECT, item_index, ctypes.addressof(ir))
+        pt = wt.POINT((ir.left + ir.right) // 2, (ir.top + ir.bottom) // 2)
+        user32.ClientToScreen(lb_hwnd, ctypes.byref(pt))
+        screen_x, screen_y = pt.x, pt.y
+
     user32.SetForegroundWindow(root_hwnd)
     _time.sleep(0.2)
+
+    # Dismiss any pre-existing modal dialogs before clicking
+    _dismiss_modal_dialogs(root_hwnd)
+
     user32.SetCursorPos(screen_x, screen_y)
     _time.sleep(0.05)
     for _ in range(2):
         user32.mouse_event(0x0002, 0, 0, 0, 0)
         user32.mouse_event(0x0004, 0, 0, 0, 0)
         _time.sleep(0.05)
-    _time.sleep(timeout)
+
+    # Poll until the title stabilizes (differs from pre_title and has brackets)
     buf = ctypes.create_unicode_buffer(256)
-    user32.GetWindowTextW(root_hwnd, buf, 256)
-    return buf.value
+    deadline = _time.monotonic() + timeout
+    title = ""
+    while _time.monotonic() < deadline:
+        _time.sleep(0.4)
+        # Dismiss dialogs that may appear mid-transition
+        _dismiss_modal_dialogs(root_hwnd)
+        user32.GetWindowTextW(root_hwnd, buf, 256)
+        title = buf.value
+        if pre_title and title != pre_title and "[" in title:
+            break  # title changed and has a bracket — account loaded
+    else:
+        # Timeout — read title one last time
+        user32.GetWindowTextW(root_hwnd, buf, 256)
+        title = buf.value
+
+    return title
 
 
 def list_sidebar_accounts(bridge: Any) -> list[dict[str, Any]]:
@@ -303,6 +435,9 @@ def list_sidebar_accounts(bridge: Any) -> list[dict[str, Any]]:
     Each entry has ``{"name", "section", "lb_hwnd", "item_index"}``.
     This is a one-time discovery that physically clicks each sidebar item,
     reads the resulting window title, then restores the original view.
+
+    Only records a mapping when clicking an item actually changes the
+    window title — headers, totals, and separators are skipped.
     """
     import time as _time  # noqa: PLC0415
     import ctypes  # noqa: PLC0415
@@ -324,10 +459,24 @@ def list_sidebar_accounts(bridge: Any) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     seen_names: set[str] = set()
 
+    # Track the title BEFORE each click to detect actual changes
+    prev_title = original_title
+
     for item in sidebar_items:
+        # Read title immediately before this click to avoid attributing
+        # a delayed title change from a previous click to this item.
+        user32.GetWindowTextW(root, buf, 256)
+        title_before = buf.value
+
         title = _sidebar_dblclick(
-            root, item["screen_x"], item["screen_y"], timeout=1.5,
+            root, item["screen_x"], item["screen_y"], timeout=4.0,
+            lb_hwnd=item["lb_hwnd"], item_index=item["item_index"],
+            pre_title=title_before,
         )
+        # Only record if clicking this item actually changed the title
+        if title == title_before:
+            continue  # header, total, or separator — no account opened
+
         # Extract account name from "[Account Name]" in title
         name = ""
         if "[" in title and "]" in title:
@@ -386,6 +535,8 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
     import ctypes.wintypes  # noqa: PLC0415
     import time  # noqa: PLC0415
 
+    global _sidebar_cache  # noqa: PLW0603
+
     CB_SETCURSEL = 0x014E
     CB_GETCURSEL = 0x0147
     CBN_SELCHANGE = 1
@@ -398,6 +549,10 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
     if not pm.attached:
         raise TargetNotFoundError("Use select_window to attach first.")
     root_hwnd = pm.attached.hwnd
+    if not _is_valid_hwnd(root_hwnd):
+        raise TargetNotFoundError(
+            "Quicken window is no longer valid. Use select_window to reattach."
+        )
 
     EnumCB = ctypes.WINFUNCTYPE(
         ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
@@ -448,24 +603,50 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
         return {"ok": True, "account": account_name, "method": "existing_tab"}
 
     # ------------------------------------------------------------------
-    # Phase 2: Try sidebar — use cached name→position map if available,
-    #          otherwise skip (caller can use list_sidebar_accounts first).
+    # Phase 2: Try sidebar — auto-populate cache on first use.
     # ------------------------------------------------------------------
+    if not _sidebar_cache:
+        try:
+            list_sidebar_accounts(bridge)
+        except Exception:
+            pass  # sidebar scan failed — continue to Phase 3
+
     cached = _sidebar_lookup(account_name)
+
+    def _try_sidebar_click(cached_entry: dict) -> dict | None:
+        """Attempt to click the cached sidebar item, scrolling into view."""
+        target_lb = int(cached_entry["lb_hwnd"], 16)
+        target_idx = cached_entry["item_index"]
+        # Read current title so _sidebar_dblclick can poll for a change
+        cur_buf = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(root_hwnd, cur_buf, 256)
+        title = _sidebar_dblclick(
+            root_hwnd, 0, 0, timeout=4.0,
+            lb_hwnd=target_lb, item_index=target_idx,
+            pre_title=cur_buf.value,
+        )
+        if "[" in title and "]" in title:
+            opened = title[title.rfind("[") + 1 : title.rfind("]")]
+            if _acct_match(opened, account_name):
+                return {"ok": True, "account": opened, "method": "sidebar"}
+        return None
+
     if cached:
-        sidebar_items = _find_sidebar_accounts(root_hwnd)
-        # Find the matching item by lb_hwnd + item_index
-        target_lb = int(cached["lb_hwnd"], 16)
-        target_idx = cached["item_index"]
-        for item in sidebar_items:
-            if item["lb_hwnd"] == target_lb and item["item_index"] == target_idx:
-                title = _sidebar_dblclick(
-                    root_hwnd, item["screen_x"], item["screen_y"], timeout=1.5,
-                )
-                if "[" in title and "]" in title:
-                    opened = title[title.rfind("[") + 1 : title.rfind("]")]
-                    return {"ok": True, "account": opened, "method": "sidebar"}
-                break
+        result = _try_sidebar_click(cached)
+        if result:
+            return result
+        # Sidebar click opened wrong account or failed — invalidate cache
+        # and rebuild once.
+        _sidebar_cache = []
+        try:
+            list_sidebar_accounts(bridge)
+        except Exception:
+            pass
+        cached = _sidebar_lookup(account_name)
+        if cached:
+            result = _try_sidebar_click(cached)
+            if result:
+                return result
 
     # ------------------------------------------------------------------
     # Phase 3: Fall back to combo selector (All Transactions register)
@@ -561,6 +742,10 @@ def read_register_state(bridge: Any) -> dict[str, Any]:
         raise TargetNotFoundError("Use select_window to attach first.")
 
     root_hwnd = pm.attached.hwnd
+    if not _is_valid_hwnd(root_hwnd):
+        raise TargetNotFoundError(
+            "Quicken window is no longer valid. Use select_window to reattach."
+        )
 
     def _read_text(h: int) -> str:
         tlen = _send_msg(h, WM_GETTEXTLENGTH, 0, 0)
@@ -825,8 +1010,15 @@ def read_register_rows(
         raise TargetNotFoundError("Use select_window to attach first.")
 
     root_hwnd = pm.attached.hwnd
+    if not _is_valid_hwnd(root_hwnd):
+        raise TargetNotFoundError(
+            "Quicken window is no longer valid. Use select_window to reattach."
+        )
     user32.SetForegroundWindow(root_hwnd)
     _time.sleep(0.3)
+
+    # Overall timeout guard — prevent infinite loops if keyboard nav breaks
+    deadline = _time.monotonic() + 60  # 60 second hard limit
 
     # --- Ensure keyboard focus is inside the register, not the sidebar ---
     txlist_h = _find_txlist_hwnd(root_hwnd)
@@ -1085,6 +1277,7 @@ def read_register_rows(
             _time.sleep(0.3)
 
         prev_row_sig: tuple[str, ...] | None = None
+        dup_count = 0
         rows: list[dict[str, str]] = []
 
         # If first_row was already valid, include it
@@ -1099,18 +1292,24 @@ def read_register_rows(
             start_offset = 1
 
         for _ in range(effective_max - start_offset):
+            if _time.monotonic() > deadline:
+                break  # hard timeout
             row = _read_one_row()
             if row is None:
                 break
 
-            # Content-based stuck detection (fallback for registers
-            # without a transaction count)
+            # Content-based stuck detection — always check to avoid
+            # infinite looping when keyboard nav doesn't advance the row.
             row_sig = (
                 row["date"], row["payee"], row["category"],
                 row["payment"], row["deposit"],
             )
-            if expected_count is None and row_sig == prev_row_sig:
-                break
+            if row_sig == prev_row_sig:
+                dup_count += 1
+                if dup_count >= 2:
+                    break
+            else:
+                dup_count = 0
             prev_row_sig = row_sig
 
             rows.append(row)
