@@ -353,9 +353,12 @@ def read_register_state(bridge: Any) -> dict[str, Any]:
         _send_msg(h, WM_GETTEXT, len(buf), ctypes.addressof(buf))
         return buf.value
 
-    # Enumerate all children to find TxList, balance Static, count Static,
-    # account ComboBox, and filter Edit
-    all_ctrls: list[tuple[int, str, str]] = []
+    # Find the active QWMDI and scope child enumeration to it.
+    mdi_h = _find_active_mdi(root_hwnd)
+    if mdi_h is None:
+        raise UIAError("No active QWMDI found.", code="REGISTER_NOT_FOUND")
+
+    mdi_children: list[tuple[int, str, str]] = []
     EnumCB = ctypes.WINFUNCTYPE(
         ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
     )
@@ -364,37 +367,19 @@ def read_register_state(bridge: Any) -> dict[str, Any]:
         cls_buf = ctypes.create_unicode_buffer(256)
         user32.GetClassNameW(h, cls_buf, 256)
         t = _read_text(h)
-        all_ctrls.append((h, cls_buf.value.lower(), t))
+        mdi_children.append((h, cls_buf.value.lower(), t))
         return True
 
-    user32.EnumChildWindows(root_hwnd, EnumCB(_cb), 0)
+    user32.EnumChildWindows(mdi_h, EnumCB(_cb), 0)
 
-    # Find ALL visible TxList controls and pick the one in the topmost
-    # (active) MDI child.  Quicken may have multiple QWMDI children open
-    # (e.g. one per account with reconcile in progress).
-    # EnumChildWindows enumerates in z-order (topmost first), so the first
-    # visible TxList belongs to the active/foreground MDI child.
+    # Find the TxList within this MDI
     txlist_h = next(
-        (h for h, c, _ in all_ctrls
+        (h for h, c, _ in mdi_children
          if c == "qwclass_transactionlist" and user32.IsWindowVisible(h)),
         None,
     )
     if txlist_h is None:
         raise UIAError("No visible TxList found.", code="REGISTER_NOT_FOUND")
-
-    # Find the QWMDI ancestor of the TxList — balance statics are siblings
-    mdi_h = user32.GetParent(txlist_h)
-
-    mdi_children: list[tuple[int, str, str]] = []
-
-    def _cb2(h: int, _: int) -> bool:
-        cls_buf2 = ctypes.create_unicode_buffer(256)
-        user32.GetClassNameW(h, cls_buf2, 256)
-        t = _read_text(h)
-        mdi_children.append((h, cls_buf2.value.lower(), t))
-        return True
-
-    user32.EnumChildWindows(mdi_h, EnumCB(_cb2), 0)
 
     # Total/balance — Static with numeric content (ignore "Total:" label)
     def _looks_numeric(s: str) -> bool:
@@ -415,12 +400,20 @@ def read_register_state(bridge: Any) -> dict[str, Any]:
         "",
     )
 
-    # Account combobox current selection (QWComboBox visible)
+    # Account name — prefer the QWMDI window title (present in account
+    # register views like "DCU Checking"), fall back to the first visible
+    # QWComboBox selection (works in Spending / All Transactions tab).
+    mdi_title = _read_text(mdi_h)
     acct_combo_h = next(
         (h for h, c, t in mdi_children
          if c == "qwcombobox" and user32.IsWindowVisible(h)), None
     )
-    current_account = _combo_cur_text(acct_combo_h) if acct_combo_h else ""
+    if mdi_title and mdi_title.lower() not in ("home", "dashboard", ""):
+        current_account = mdi_title
+    elif acct_combo_h:
+        current_account = _combo_cur_text(acct_combo_h)
+    else:
+        current_account = ""
 
     # Reconcile active? "C" button and "Reset" button both visible in header
     c_btn_visible = any(
@@ -456,6 +449,95 @@ def read_register_state(bridge: Any) -> dict[str, Any]:
     }
 
 
+def _find_active_mdi(root_hwnd: int) -> int | None:
+    """Find the active QWMDI child window.
+
+    Quicken may have multiple QWMDI children open (one per account tab).
+    The active one is identified by matching the bracketed account name in
+    the root window title, e.g. ``[Fidelity HSA]``.  Falls back to the
+    largest visible QWMDI if no bracket match is found.
+    """
+    import ctypes  # noqa: PLC0415
+    import ctypes.wintypes  # noqa: PLC0415
+    import re  # noqa: PLC0415
+
+    user32 = ctypes.windll.user32
+
+    # Extract account name from root title brackets
+    buf = ctypes.create_unicode_buffer(512)
+    user32.GetWindowTextW(root_hwnd, buf, 512)
+    title = buf.value
+    m = re.search(r"\[(.+?)\]\s*$", title)
+    target_name = m.group(1).lower().strip() if m else ""
+
+    best_match: int | None = None
+    best_area: int = 0
+    name_match: int | None = None
+
+    WNDENUMPROC = ctypes.WINFUNCTYPE(
+        ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
+    )
+
+    def _cb(h: int, _: int) -> bool:
+        nonlocal best_match, best_area, name_match
+        cls = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(h, cls, 64)
+        if cls.value.upper() != "QWMDI":
+            return True
+        if not user32.IsWindowVisible(h):
+            return True
+        user32.GetWindowTextW(h, buf, 512)
+        mdi_title = buf.value.strip()
+        r = ctypes.wintypes.RECT()
+        user32.GetWindowRect(h, ctypes.byref(r))
+        area = (r.right - r.left) * (r.bottom - r.top)
+
+        if target_name and mdi_title.lower().strip() == target_name:
+            name_match = h
+        if area > best_area:
+            best_area = area
+            best_match = h
+        return True
+
+    user32.EnumChildWindows(root_hwnd, WNDENUMPROC(_cb), 0)
+    return name_match or best_match
+
+
+def _find_txlist_hwnd(root_hwnd: int) -> int | None:
+    """Find the main (largest, visible) QWClass_TransactionList child.
+
+    Restricts the search to the active QWMDI child to avoid picking up
+    TxList controls from background account tabs.
+    """
+    import ctypes  # noqa: PLC0415
+    import ctypes.wintypes  # noqa: PLC0415
+
+    user32 = ctypes.windll.user32
+
+    # Scope to active MDI child if possible
+    search_root = _find_active_mdi(root_hwnd) or root_hwnd
+
+    best: tuple[int, int] | None = None
+
+    def _cb(h: int, _: int) -> bool:
+        nonlocal best
+        cls = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(h, cls, 64)
+        if "TransactionList" in cls.value and user32.IsWindowVisible(h):
+            r = ctypes.wintypes.RECT()
+            user32.GetWindowRect(h, ctypes.byref(r))
+            area = (r.right - r.left) * (r.bottom - r.top)
+            if best is None or area > best[1]:
+                best = (h, area)
+        return True
+
+    WNDENUMPROC = ctypes.WINFUNCTYPE(
+        ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
+    )
+    user32.EnumChildWindows(search_root, WNDENUMPROC(_cb), 0)
+    return best[0] if best else None
+
+
 def read_register_rows(
     bridge: Any,
     max_rows: int = 50,
@@ -463,10 +545,12 @@ def read_register_rows(
     """
     Read individual transaction rows from the visible register.
 
-    Navigates using keyboard (Ctrl+Home, Tab, Down) and reads each field
-    via ``GetFocus()`` + ``WM_GETTEXT``.  Uses x-position of the focused
-    ``QREdit`` to distinguish Payment (x ≈ 738) from Deposit (x ≈ 846),
-    since Quicken skips the unused column from the tab order.
+    Works across different register layouts (Checking, Savings, Money Market,
+    etc.) by:
+    1. Clicking into the TxList to ensure keyboard focus is in the register
+    2. Using Ctrl+Home then Down to skip the new-transaction entry row
+    3. Using HWND-based field classification (text vs. numeric QREdit)
+    4. Adaptive payee/category identification by field count
 
     Parameters
     ----------
@@ -509,6 +593,23 @@ def read_register_rows(
     user32.SetForegroundWindow(root_hwnd)
     _time.sleep(0.3)
 
+    # --- Ensure keyboard focus is inside the register, not the sidebar ---
+    txlist_h = _find_txlist_hwnd(root_hwnd)
+    if txlist_h is None:
+        raise UIAError("No visible TxList found.", code="REGISTER_NOT_FOUND")
+    txlist_rect = ctypes.wintypes.RECT()
+    user32.GetWindowRect(txlist_h, ctypes.byref(txlist_rect))
+    # Click near the vertical center of the TxList body.  The top
+    # ~40-60 px is column headers that don't accept keyboard focus,
+    # so using the center avoids that dead zone reliably.
+    click_x = (txlist_rect.left + txlist_rect.right) // 2
+    click_y = (txlist_rect.top + txlist_rect.bottom) // 2
+    user32.SetCursorPos(click_x, click_y)
+    _time.sleep(0.1)
+    user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
+    user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
+    _time.sleep(0.4)
+
     tid = kernel32.GetCurrentThreadId()
     qtid = user32.GetWindowThreadProcessId(root_hwnd, None)
     user32.AttachThreadInput(tid, qtid, True)
@@ -529,15 +630,17 @@ def read_register_rows(
         _kbe(0x11, 2)
         _time.sleep(0.3)
 
-    def _get_focused() -> tuple[int, str, int, int]:
-        """Return (hwnd, text, x_left, y_top) of focused control."""
+    def _get_focused() -> tuple[int, str, str, int, int, int]:
+        """Return (hwnd, class_name, text, x_left, y_top, width)."""
         h = user32.GetFocus()
+        cls = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(h, cls, 64)
         r = ctypes.wintypes.RECT()
         user32.GetWindowRect(h, ctypes.byref(r))
         tlen = _SendMsg(h, 0x000E, 0, 0)  # WM_GETTEXTLENGTH
         buf = ctypes.create_unicode_buffer(tlen + 1)
         _SendMsg(h, 0x000D, tlen + 1, ctypes.addressof(buf))  # WM_GETTEXT
-        return h, buf.value, r.left, r.top
+        return h, cls.value, buf.value, r.left, r.top, r.right - r.left
 
     def _tab() -> None:
         h = user32.GetFocus()
@@ -546,21 +649,171 @@ def read_register_rows(
         _PostMsg(h, 0x0101, 0x09, 0)
         _time.sleep(0.35)
 
+    # Column x-positions learned from the blank new-transaction row.
+    # The blank row shows ALL money columns (none skipped), so we can
+    # record their tab-order x-positions as a reference for data rows.
+    # Tab order for money fields is always: debit → credit → balance.
+    _money_col_xs: list[int] = []  # [debit_x, credit_x, balance_x]
+
+    def _learn_columns_from_row() -> list[tuple[int, str]]:
+        """Tab through the current row, collecting (x, value) for money
+        fields.  Returns the money_fields list in tab order.
+        Also populates ``_money_col_xs`` if three money fields are found
+        (indicating a blank row with all columns visible)."""
+        date_h, date_cls, date_txt, _dx, _dy, _dw = _get_focused()
+        if date_cls.lower() != "qredit":
+            return []
+        date_hwnd = date_h
+
+        text_fields: list[tuple[int, str]] = []
+        money_fields: list[tuple[int, str]] = []
+
+        for _fi in range(14):
+            _tab()
+            h, cls_name, txt, x, _y, _w = _get_focused()
+            if cls_name.lower() != "qredit":
+                break
+            if h == date_hwnd:
+                if money_fields:
+                    break
+                text_fields.append((x, txt))
+            else:
+                money_fields.append((x, txt))
+
+        has_content = (
+            any(v.strip() for _, v in text_fields)
+            or any(v.strip() for _, v in money_fields)
+        )
+
+        # If all fields are empty → blank new-transaction row.
+        # Record all money column x-positions as the reference layout.
+        if not has_content and len(money_fields) >= 3:
+            _money_col_xs.clear()
+            _money_col_xs.extend(x for x, _ in money_fields)
+
+        return money_fields if has_content else []
+
+    def _read_one_row() -> dict[str, str] | None:
+        """Read all fields of the current row.  Returns None if on a blank row.
+
+        Uses x-position of each field to determine its column role.
+        Text fields share one HWND; money fields share a different HWND.
+        Quicken skips empty money columns in tab order, so we match
+        x-positions against the reference layout learned from the blank
+        new-transaction row.
+
+        Money field semantics:
+          payment = debit / outflow (checking withdrawal, credit charge)
+          deposit = credit / inflow (checking deposit, card payment)
+          balance = running total (always last in tab order)
+        """
+        date_h, date_cls, date_txt, _dx, _dy, _dw = _get_focused()
+        if date_cls.lower() != "qredit":
+            return None
+        date_hwnd = date_h
+
+        # Collect (x_position, value) for text and money fields
+        text_fields: list[tuple[int, str]] = []  # (x, value)
+        money_fields: list[tuple[int, str]] = []  # tab order preserved
+
+        for _fi in range(14):
+            _tab()
+            h, cls_name, txt, x, _y, _w = _get_focused()
+            if cls_name.lower() != "qredit":
+                break
+            if h == date_hwnd:
+                if money_fields:
+                    break
+                text_fields.append((x, txt))
+            else:
+                money_fields.append((x, txt))
+
+        # Blank new-transaction row detection
+        has_content = (
+            any(v.strip() for _, v in text_fields)
+            or any(v.strip() for _, v in money_fields)
+        )
+        if not text_fields or not has_content:
+            return None
+
+        # Sort text fields by x for consistent left-to-right visual ordering
+        text_fields.sort(key=lambda t: t[0])
+
+        # --- Text field identification (x-sorted) ---
+        # Visual column order left-to-right is always:
+        #   Payee/Description | Check# | Category | Memo
+        payee = text_fields[0][1] if text_fields else ""
+        category = ""
+        check_num = ""
+        memo = ""
+        if len(text_fields) >= 4:
+            check_num = text_fields[1][1]
+            category = text_fields[2][1]
+            memo = text_fields[3][1]
+        elif len(text_fields) == 3:
+            check_num = text_fields[1][1]
+            category = text_fields[2][1]
+        elif len(text_fields) == 2:
+            category = text_fields[1][1]
+
+        # --- Money field identification ---
+        # The last money field in tab order is ALWAYS Balance.
+        # When the reference layout is available (from the blank row),
+        # match each field's x-position (tolerance ±40px) to identify
+        # the column.  Otherwise fall back to tab-order position.
+        payment = ""
+        deposit = ""
+        balance = ""
+
+        if len(money_fields) >= 3:
+            # All three columns present
+            payment = money_fields[0][1]
+            deposit = money_fields[1][1]
+            balance = money_fields[2][1]
+        elif len(money_fields) == 2:
+            # Last in tab order = Balance
+            balance = money_fields[1][1]
+            val = money_fields[0][1]
+            val_x = money_fields[0][0]
+
+            if len(_money_col_xs) >= 3:
+                # Match val_x to learned debit_x or credit_x
+                debit_x, credit_x = _money_col_xs[0], _money_col_xs[1]
+                if abs(val_x - debit_x) < abs(val_x - credit_x):
+                    payment = val
+                else:
+                    deposit = val
+            else:
+                # Fallback: use gap heuristic (works for banking regs)
+                bal_x = money_fields[1][0]
+                if bal_x - val_x > 150:
+                    payment = val
+                else:
+                    deposit = val
+        elif len(money_fields) == 1:
+            balance = money_fields[0][1]
+
+        return {
+            "date": date_txt,
+            "payee": payee,
+            "check_num": check_num,
+            "category": category,
+            "memo": memo,
+            "payment": payment,
+            "deposit": deposit,
+            "balance": balance,
+        }
+
     try:
-        # Clear state
+        # Clear any edit/selection state
         for _ in range(3):
             _press(0x1B, 0.15)  # Escape
 
-        # Ctrl+Home → Date field of first row
-        _ctrl(0x24)
-        _time.sleep(0.5)
-
-        # Try to get expected row count from register state
+        # Try to get expected row count BEFORE keyboard nav (no focus change)
         expected_count: int | None = None
         try:
             state = read_register_state(bridge)
             count_str = state.get("count", "")
-            # Parse "N Transaction(s)" format
             parts = count_str.split()
             if parts and parts[0].isdigit():
                 expected_count = int(parts[0])
@@ -568,84 +821,56 @@ def read_register_rows(
             pass
 
         effective_max = min(max_rows, expected_count) if expected_count else max_rows
+
+        # Ctrl+Home → first row (typically the new-transaction entry row)
+        _ctrl(0x24)
+        _time.sleep(0.5)
+
+        # Attempt to read the first row.  If it's the blank new-transaction
+        # row we use it to learn the full column layout (all money columns
+        # visible), then skip to the first real data row.
+        first_row = _read_one_row()
+        if first_row is None:
+            # Blank row — learn column layout if not already populated
+            if not _money_col_xs:
+                # Re-read this blank row using the learning helper.
+                # Escape back to date field first, then learn.
+                _press(0x1B, 0.2)
+                _learn_columns_from_row()
+            _press(0x1B, 0.2)
+            _press(0x28, 0.3)  # Down → first data row
+            _time.sleep(0.3)
+
         prev_row_sig: tuple[str, ...] | None = None
-
         rows: list[dict[str, str]] = []
-        for _ in range(effective_max):
-            date_h, date_txt, date_x, date_y = _get_focused()
-            date_hwnd = date_h
 
-            text_vals: list[str] = []
-            money_vals: list[str] = []
+        # If first_row was already valid, include it
+        start_offset = 0
+        if first_row is not None:
+            rows.append(first_row)
+            prev_row_sig = (
+                first_row["date"], first_row["payee"],
+                first_row["category"], first_row["payment"],
+                first_row["deposit"],
+            )
+            start_offset = 1
 
-            for _fi in range(14):
-                _tab()
-                h, txt, x, y = _get_focused()
-                cls_buf = ctypes.create_unicode_buffer(64)
-                user32.GetClassNameW(h, cls_buf, 64)
-                if cls_buf.value.lower() != "qredit":
-                    break
-                if h == date_hwnd:
-                    if money_vals:
-                        break
-                    text_vals.append(txt)
-                else:
-                    money_vals.append(txt)
-
-            if not text_vals:
+        for _ in range(effective_max - start_offset):
+            row = _read_one_row()
+            if row is None:
                 break
 
-            # Map text fields to Payee / Category
-            n = len(text_vals)
-            if n >= 5:
-                payee = text_vals[2]
-                category = text_vals[-1]
-            elif n >= 3:
-                payee = text_vals[1]
-                category = text_vals[-1]
-            elif n == 2:
-                payee = text_vals[0]
-                category = text_vals[1]
-            else:
-                payee = text_vals[0]
-                category = ""
-
-            if not payee.strip():
-                break
-
-            # Content-based stuck detection (for registers without a count)
-            row_sig = (date_txt, payee, category, *money_vals)
+            # Content-based stuck detection (fallback for registers
+            # without a transaction count)
+            row_sig = (
+                row["date"], row["payee"], row["category"],
+                row["payment"], row["deposit"],
+            )
             if expected_count is None and row_sig == prev_row_sig:
                 break
             prev_row_sig = row_sig
 
-            # Money fields: last is Amount (running balance).
-            payment = ""
-            deposit = ""
-            if len(money_vals) >= 3:
-                payment = money_vals[0]
-                deposit = money_vals[1]
-            elif len(money_vals) == 2:
-                val = money_vals[0]
-                amount_val = money_vals[1]
-                if amount_val.startswith("-"):
-                    payment = val
-                else:
-                    deposit = val
-            elif len(money_vals) == 1:
-                val = money_vals[0]
-                if val.startswith("-"):
-                    payment = val.lstrip("-")
-                else:
-                    deposit = val
-
-            rows.append({
-                "date": date_txt,
-                "payee": payee,
-                "category": category,
-                "payment": payment,
-                "deposit": deposit,
-            })
+            rows.append(row)
 
             # Move to next row
             _press(0x1B, 0.2)
