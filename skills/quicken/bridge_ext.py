@@ -635,7 +635,7 @@ def read_register_state(bridge: Any) -> dict[str, Any]:
     )
 
     # Account name — prefer the QWMDI window title (present in account
-    # register views like "DCU Checking"), fall back to the first visible
+    # register views like "My Checking"), fall back to the first visible
     # QWComboBox selection (works in Spending / All Transactions tab).
     mdi_title = _read_text(mdi_h)
     acct_combo_h = next(
@@ -689,7 +689,7 @@ def _find_active_mdi(root_hwnd: int) -> int | None:
 
     Quicken may have multiple QWMDI children open (one per account tab).
     The active one is identified by matching the bracketed account name in
-    the root window title, e.g. ``[Fidelity HSA]``.  Falls back to the
+    the root window title, e.g. ``[My Savings]``.  Falls back to the
     largest visible QWMDI if no bracket match is found.
     """
     import ctypes  # noqa: PLC0415

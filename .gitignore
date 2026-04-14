@@ -31,6 +31,12 @@ build/
 make_deck.py
 *.pptx
 
+# Scratch / debug artifacts
+scripts/*.png
+scripts/add_test_transactions.py
+scripts/enter_all.py
+scripts/enter_transactions.py
+
 # OS
 Thumbs.db
 .DS_Store
