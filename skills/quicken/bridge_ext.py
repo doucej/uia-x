@@ -18,6 +18,32 @@ from server.uia_bridge import UIAError, TargetNotFoundError
 _SKIP_ACCT_ITEMS = frozenset({"custom...", "qcombo_separator", ""})
 
 
+def _acct_match(candidate: str, query: str) -> bool:
+    """Fuzzy account name matching: exact, substring, or all-words-present.
+
+    Handles cases where AI agents use shortened names like "Costco Visa"
+    to match "Costco Anywhere Visa® Card by Citi".
+    """
+    import re  # noqa: PLC0415
+
+    c = candidate.lower()
+    q = query.lower()
+    if c == q:
+        return True
+    if q in c or c in q:
+        return True
+    # Strip non-ASCII (®, ™) and extra whitespace for comparison
+    c_ascii = re.sub(r"[^\x00-\x7f]", "", c).strip()
+    q_ascii = re.sub(r"[^\x00-\x7f]", "", q).strip()
+    if c_ascii == q_ascii or q_ascii in c_ascii or c_ascii in q_ascii:
+        return True
+    # All words in query appear in candidate (order-independent)
+    q_words = q_ascii.split()
+    if q_words and all(w in c_ascii for w in q_words):
+        return True
+    return False
+
+
 def _send_msg(hwnd: int, msg: int, wp: int, lp: int) -> int:
     """Thin wrapper around ``SendMessageW`` with proper 64-bit argtypes."""
     import ctypes  # noqa: PLC0415
@@ -315,7 +341,23 @@ def list_sidebar_accounts(bridge: Any) -> list[dict[str, Any]]:
                 "item_index": item["item_index"],
             })
 
+    # Populate the module-level cache for navigate_to_account
+    global _sidebar_cache  # noqa: PLW0603
+    _sidebar_cache = list(results)
+
     return results
+
+
+# Module-level sidebar cache: name → sidebar_item dict with screen coords
+_sidebar_cache: list[dict[str, Any]] = []
+
+
+def _sidebar_lookup(account_name: str) -> dict[str, Any] | None:
+    """Find a cached sidebar entry matching account_name (fuzzy)."""
+    for entry in _sidebar_cache:
+        if _acct_match(entry["name"], account_name):
+            return entry
+    return None
 
 
 def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
@@ -356,7 +398,6 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
     if not pm.attached:
         raise TargetNotFoundError("Use select_window to attach first.")
     root_hwnd = pm.attached.hwnd
-    name_lower = account_name.lower()
 
     EnumCB = ctypes.WINFUNCTYPE(
         ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
@@ -378,7 +419,7 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
         # Match by QWMDI window title (works for account register tabs)
         mdi_title = ctypes.create_unicode_buffer(256)
         user32.GetWindowTextW(h, mdi_title, 256)
-        if mdi_title.value.lower() == name_lower:
+        if _acct_match(mdi_title.value, account_name):
             existing_mdi = h
             return False
         # Also check first visible QWComboBox in this MDI
@@ -389,7 +430,7 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
             if (cc.value.lower() == "qwcombobox"
                     and user32.IsWindowVisible(ch)):
                 txt = _combo_cur_text(ch)
-                if txt.lower() == name_lower:
+                if _acct_match(txt, account_name):
                     existing_mdi = h
                     existing_idx = _send_msg(ch, CB_GETCURSEL, 0, 0)
                     return False
@@ -407,30 +448,24 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
         return {"ok": True, "account": account_name, "method": "existing_tab"}
 
     # ------------------------------------------------------------------
-    # Phase 2: Try sidebar double-click navigation (opens account register)
+    # Phase 2: Try sidebar — use cached name→position map if available,
+    #          otherwise skip (caller can use list_sidebar_accounts first).
     # ------------------------------------------------------------------
-    sidebar_items = _find_sidebar_accounts(root_hwnd)
-    if sidebar_items:
-        # We must click each item to discover its name (owner-drawn, no text).
-        # Try each item; if the title changes to show the target, we're done.
-        buf_title = ctypes.create_unicode_buffer(256)
-        user32.GetWindowTextW(root_hwnd, buf_title, 256)
-        original_title = buf_title.value
-
+    cached = _sidebar_lookup(account_name)
+    if cached:
+        sidebar_items = _find_sidebar_accounts(root_hwnd)
+        # Find the matching item by lb_hwnd + item_index
+        target_lb = int(cached["lb_hwnd"], 16)
+        target_idx = cached["item_index"]
         for item in sidebar_items:
-            title = _sidebar_dblclick(
-                root_hwnd, item["screen_x"], item["screen_y"], timeout=1.5,
-            )
-            if "[" in title and "]" in title:
-                opened = title[title.rfind("[") + 1 : title.rfind("]")]
-                if opened.lower() == name_lower:
+            if item["lb_hwnd"] == target_lb and item["item_index"] == target_idx:
+                title = _sidebar_dblclick(
+                    root_hwnd, item["screen_x"], item["screen_y"], timeout=1.5,
+                )
+                if "[" in title and "]" in title:
+                    opened = title[title.rfind("[") + 1 : title.rfind("]")]
                     return {"ok": True, "account": opened, "method": "sidebar"}
-
-        # Sidebar didn't find it — restore original view if it changed
-        user32.GetWindowTextW(root_hwnd, buf_title, 256)
-        if buf_title.value != original_title:
-            # Best-effort restore: click "All Transactions" if available
-            pass
+                break
 
     # ------------------------------------------------------------------
     # Phase 3: Fall back to combo selector (All Transactions register)
@@ -440,7 +475,7 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
     except UIAError:
         accounts = []
     match = next(
-        (a for a in accounts if a["name"].lower() == name_lower),
+        (a for a in accounts if _acct_match(a["name"], account_name)),
         None,
     )
     if match is None:
@@ -476,7 +511,7 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
             user32.GetClassNameW(ch, cc, 64)
             if (cc.value.lower() == "qwcombobox"
                     and user32.IsWindowVisible(ch)):
-                if _combo_cur_text(ch).lower() == name_lower:
+                if _acct_match(_combo_cur_text(ch), account_name):
                     target_mdi = h
                     return False
             return True
