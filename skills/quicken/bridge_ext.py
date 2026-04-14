@@ -589,14 +589,31 @@ def read_register_state(bridge: Any) -> dict[str, Any]:
 
     user32.EnumChildWindows(mdi_h, EnumCB(_cb), 0)
 
-    # Find the TxList within this MDI
+    # Find the TxList within this MDI (absent in investment/portfolio views)
     txlist_h = next(
         (h for h, c, _ in mdi_children
          if c == "qwclass_transactionlist" and user32.IsWindowVisible(h)),
         None,
     )
+
+    # Detect investment/portfolio views (ListBox + QWHtmlView, no TxList)
+    has_html = any(c == "qwhtmlview" for _, c, _ in mdi_children)
+    view_type = "register" if txlist_h else ("investment" if has_html else "unknown")
+
     if txlist_h is None:
-        raise UIAError("No visible TxList found.", code="REGISTER_NOT_FOUND")
+        # Return partial state for investment/non-register views
+        mdi_title = _read_text(mdi_h)
+        return {
+            "ok": True,
+            "account": mdi_title if mdi_title else "",
+            "total": "",
+            "count": "",
+            "reconcile_active": False,
+            "filter_text": "",
+            "view_type": view_type,
+            "note": "This account uses an investment/portfolio view without "
+                    "a transaction register. Use uia_read_display for content.",
+        }
 
     # Total/balance — Static with numeric content (ignore "Total:" label)
     def _looks_numeric(s: str) -> bool:
@@ -663,6 +680,7 @@ def read_register_state(bridge: Any) -> dict[str, Any]:
         "count": count_static,
         "reconcile_active": reconcile_active,
         "filter_text": filter_text,
+        "view_type": "register",
     }
 
 
@@ -813,7 +831,15 @@ def read_register_rows(
     # --- Ensure keyboard focus is inside the register, not the sidebar ---
     txlist_h = _find_txlist_hwnd(root_hwnd)
     if txlist_h is None:
-        raise UIAError("No visible TxList found.", code="REGISTER_NOT_FOUND")
+        return {
+            "ok": False,
+            "error": "No transaction register found in this view. "
+                     "Investment/portfolio accounts use a different layout. "
+                     "Use read_register_state to check the view_type first.",
+            "code": "REGISTER_NOT_FOUND",
+            "rows": [],
+            "count": 0,
+        }
     txlist_rect = ctypes.wintypes.RECT()
     user32.GetWindowRect(txlist_h, ctypes.byref(txlist_rect))
     # Click near the vertical center of the TxList body.  The top
