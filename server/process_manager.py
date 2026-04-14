@@ -39,6 +39,32 @@ class WindowInfo:
     dpi_scale: float | None = None  # Windows: GetDpiForWindow(hwnd) / 96.0
 
 
+def _process_name_matches(query: str, win: WindowInfo) -> bool:
+    """Fuzzy process-name matching.
+
+    Agents often pass a human-friendly name like ``"Quicken"`` when the
+    real process is ``qw.exe``.  This helper accepts:
+      - exact match (case-insensitive)
+      - stem match after stripping ``.exe`` (``notepad`` ↔ ``notepad.exe``)
+      - substring match (``chrome`` matches ``chrome.exe``)
+      - title fallback (``Quicken`` matches ``qw.exe`` if the window title
+        contains ``Quicken``)
+    """
+    pn = query.lower()
+    wpn = win.process_name.lower()
+    wpn_stem = wpn.rsplit(".", 1)[0] if "." in wpn else wpn
+    pn_stem = pn.rsplit(".", 1)[0] if "." in pn else pn
+    if wpn == pn or wpn_stem == pn_stem:
+        return True
+    if pn in wpn or pn_stem in wpn_stem:
+        return True
+    # Title fallback: the query may be the product name visible in the
+    # window title even though the executable has a different name.
+    if pn in win.title.lower():
+        return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Abstract base
 # ---------------------------------------------------------------------------
@@ -200,7 +226,7 @@ class RealProcessManager(ProcessManager):
         for win in candidates:
             if pid is not None and win.pid != pid:
                 continue
-            if process_name is not None and win.process_name.lower() != process_name.lower():
+            if process_name is not None and not _process_name_matches(process_name, win):
                 continue
             if window_title is not None and window_title.lower() not in win.title.lower():
                 continue
@@ -278,7 +304,7 @@ class MockProcessManager(ProcessManager):
         for win in self._windows:
             if pid is not None and win.pid != pid:
                 continue
-            if process_name is not None and win.process_name.lower() != process_name.lower():
+            if process_name is not None and not _process_name_matches(process_name, win):
                 continue
             if window_title is not None and window_title.lower() not in win.title.lower():
                 continue

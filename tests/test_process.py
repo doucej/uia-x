@@ -87,6 +87,17 @@ class TestAttach:
         pm.attach(process_name="qw.exe")
         assert pm.attached.process_name == "qw.exe"
 
+    def test_attach_fuzzy_process_name_stem(self, pm: MockProcessManager):
+        """``notepad`` should match ``notepad.exe``."""
+        win = pm.attach(process_name="notepad")
+        assert win.process_name == "notepad.exe"
+
+    def test_attach_fuzzy_title_fallback(self, pm: MockProcessManager):
+        """``Quicken`` should match ``qw.exe`` via title fallback."""
+        win = pm.attach(process_name="Quicken")
+        assert win.process_name == "qw.exe"
+        assert "Quicken" in win.title
+
 
 class TestDetach:
     def test_detach_clears_attached(self, pm: MockProcessManager):
