@@ -52,16 +52,28 @@ def _acct_match(candidate: str, query: str) -> bool:
 def _dismiss_modal_dialogs(root_hwnd: int) -> bool:
     """Find and dismiss any modal dialogs owned by the Quicken window.
 
-    Looks for top-level ``QWinDlg`` windows that own ``root_hwnd`` and
-    contain a "Done" or "Close" button.  Returns True if a dialog was
-    dismissed.
+    Looks for top-level ``QWinDlg``, ``QWinPopup``, or ``#32770`` windows
+    owned by *root_hwnd* and sends them a dismiss command.
+
+    Strategy:
+      1. Click a visible dismiss button (Done, Close, OK, Cancel, Yes, …)
+      2. If no button found, send ``WM_CLOSE`` as fallback.
+
+    Returns True if a dialog was dismissed.
     """
     import ctypes  # noqa: PLC0415
     import time as _time  # noqa: PLC0415
 
     user32 = ctypes.windll.user32
     WM_COMMAND = 0x0111
+    WM_CLOSE = 0x0010
     dismissed = False
+
+    _DIALOG_CLASSES = {"QWinDlg", "QWinPopup", "#32770"}
+    _DISMISS_LABELS = frozenset({
+        "done", "close", "ok", "cancel", "yes", "dismiss",
+        "continue", "accept", "no thanks",
+    })
 
     # Collect visible top-level dialogs owned by root
     dialogs: list[int] = []
@@ -73,7 +85,7 @@ def _dismiss_modal_dialogs(root_hwnd: int) -> bool:
             return True
         cls = ctypes.create_unicode_buffer(64)
         user32.GetClassNameW(h, cls, 64)
-        if cls.value in ("QWinDlg", "#32770"):  # Quicken dialog or system dialog
+        if cls.value in _DIALOG_CLASSES:
             dialogs.append(h)
         return True
 
@@ -82,7 +94,7 @@ def _dismiss_modal_dialogs(root_hwnd: int) -> bool:
     user32.EnumWindows(WNDENUMPROC(_enum_cb), None)
 
     for dlg in dialogs:
-        # Find a dismiss button: Done, Close, OK, Cancel
+        # Find a dismiss button
         dismiss_btn = 0
         def _btn_cb(h: int, _: Any) -> bool:
             nonlocal dismiss_btn
@@ -90,8 +102,9 @@ def _dismiss_modal_dialogs(root_hwnd: int) -> bool:
                 return True
             buf = ctypes.create_unicode_buffer(64)
             user32.GetWindowTextW(h, buf, 64)
-            text = buf.value.strip().lower()
-            if text in ("done", "close", "ok", "cancel"):
+            # Strip Windows accelerator prefix (&) for comparison
+            text = buf.value.strip().replace("&", "").lower()
+            if text in _DISMISS_LABELS:
                 dismiss_btn = h
                 return False  # stop enumeration
             return True
@@ -102,6 +115,12 @@ def _dismiss_modal_dialogs(root_hwnd: int) -> bool:
             user32.PostMessageW(dlg, WM_COMMAND, ctrl_id, dismiss_btn)
             _time.sleep(0.5)
             dismissed = True
+        else:
+            # No recognized button — try WM_CLOSE as fallback
+            user32.PostMessageW(dlg, WM_CLOSE, 0, 0)
+            _time.sleep(0.5)
+            if not user32.IsWindowVisible(dlg):
+                dismissed = True
 
     return dismissed
 
@@ -370,6 +389,9 @@ def list_accounts(bridge: Any) -> list[dict[str, Any]]:
     if not pm.attached:
         raise TargetNotFoundError("Use select_window to attach to a target first.")
     root = pm.attached.hwnd
+
+    # Dismiss any modal dialogs before scanning
+    _dismiss_modal_dialogs(root)
 
     # --- Primary: MDI discovery (instant) ---
     mdi_accounts = _discover_accounts_via_mdi(root)
@@ -758,6 +780,9 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
             "Quicken window is no longer valid. Use select_window to reattach."
         )
 
+    # Dismiss any modal dialogs that may be blocking interaction
+    _dismiss_modal_dialogs(root_hwnd)
+
     EnumCB = ctypes.WINFUNCTYPE(
         ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
     )
@@ -932,6 +957,9 @@ def read_register_state(bridge: Any) -> dict[str, Any]:
         raise TargetNotFoundError(
             "Quicken window is no longer valid. Use select_window to reattach."
         )
+
+    # Dismiss any modal dialogs before reading state
+    _dismiss_modal_dialogs(root_hwnd)
 
     def _read_text(h: int) -> str:
         tlen = _send_msg(h, WM_GETTEXTLENGTH, 0, 0)
@@ -1200,6 +1228,10 @@ def read_register_rows(
         raise TargetNotFoundError(
             "Quicken window is no longer valid. Use select_window to reattach."
         )
+
+    # Dismiss any modal dialogs before attempting register interaction
+    _dismiss_modal_dialogs(root_hwnd)
+
     user32.SetForegroundWindow(root_hwnd)
     _time.sleep(0.3)
 
@@ -1269,6 +1301,8 @@ def read_register_rows(
         r = ctypes.wintypes.RECT()
         user32.GetWindowRect(h, ctypes.byref(r))
         tlen = _SendMsg(h, 0x000E, 0, 0)  # WM_GETTEXTLENGTH
+        if tlen <= 0 or tlen > 32768:
+            return h, cls.value, "", r.left, r.top, r.right - r.left
         buf = ctypes.create_unicode_buffer(tlen + 1)
         _SendMsg(h, 0x000D, tlen + 1, ctypes.addressof(buf))  # WM_GETTEXT
         return h, cls.value, buf.value, r.left, r.top, r.right - r.left
