@@ -1235,20 +1235,30 @@ def read_register_rows(
     qtid = user32.GetWindowThreadProcessId(root_hwnd, None)
     user32.AttachThreadInput(tid, qtid, True)
 
-    def _kbe(vk: int, flags: int = 0) -> None:
-        user32.keybd_event(vk, 0, flags, 0)
-
     def _press(vk: int, delay: float = 0.1) -> None:
-        _kbe(vk)
+        """Send a key press via PostMessage to the currently-focused HWND.
+
+        Unlike ``keybd_event`` (which targets the system foreground window
+        and easily gets stolen by editors/browsers running alongside
+        Quicken), ``PostMessage`` delivers directly to the target HWND's
+        message queue — immune to focus races.
+        """
+        h = user32.GetFocus()
+        _PostMsg(h, 0x0100, vk, 0)   # WM_KEYDOWN
         _time.sleep(0.02)
-        _kbe(vk, 2)
+        _PostMsg(h, 0x0101, vk, 0)   # WM_KEYUP
         _time.sleep(delay)
 
     def _ctrl(vk: int) -> None:
-        _kbe(0x11)
+        """Send Ctrl+<vk> via PostMessage to the focused HWND."""
+        h = user32.GetFocus()
+        _PostMsg(h, 0x0100, 0x11, 0)  # Ctrl down
         _time.sleep(0.02)
-        _press(vk, 0.05)
-        _kbe(0x11, 2)
+        _PostMsg(h, 0x0100, vk, 0)    # Key down
+        _time.sleep(0.02)
+        _PostMsg(h, 0x0101, vk, 0)    # Key up
+        _time.sleep(0.05)
+        _PostMsg(h, 0x0101, 0x11, 0)  # Ctrl up
         _time.sleep(0.3)
 
     def _get_focused() -> tuple[int, str, str, int, int, int]:
@@ -1476,6 +1486,11 @@ def read_register_rows(
                 first_row["deposit"],
             )
             start_offset = 1
+            # After _read_one_row, focus is on a button (Save/More).
+            # Escape back to the QREdit date field, then Down to advance.
+            _press(0x1B, 0.2)
+            _press(0x28, 0.3)  # Down → next row
+            _time.sleep(0.3)
 
         for _ in range(effective_max - start_offset):
             if _time.monotonic() > deadline:
