@@ -481,6 +481,10 @@ def list_sidebar_accounts(bridge: Any) -> list[dict[str, Any]]:
         name = ""
         if "[" in title and "]" in title:
             name = title[title.rfind("[") + 1 : title.rfind("]")]
+        # Skip section-header items (e.g. "Property & Debt" section opens
+        # a summary view, not a real account register).
+        if name and name.lower() == item["section"].lower():
+            continue
         if name and name not in seen_names:
             seen_names.add(name)
             results.append({
