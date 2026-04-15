@@ -526,7 +526,7 @@ def _sidebar_dblclick(root_hwnd: int, screen_x: int, screen_y: int,
                       timeout: float = 6.0, *,
                       lb_hwnd: int = 0, item_index: int = -1,
                       pre_title: str = "",
-                      bail_early: float = 0.8) -> str:
+                      bail_early: float = 0.3) -> str:
     """Double-click a sidebar item and wait for the title to stabilize.
 
     If ``lb_hwnd`` and ``item_index`` are provided, the item is scrolled
@@ -536,15 +536,16 @@ def _sidebar_dblclick(root_hwnd: int, screen_x: int, screen_y: int,
     If ``pre_title`` is given, the function uses a two-phase wait based
     on the **bracketed account name** in the title (e.g. ``[My Checking]``):
 
-    Phase 1 (``bail_early`` seconds, default 0.8s):
-        Poll at 100ms.  If the bracket content hasn't changed, bail out —
-        the item is a non-account (header, total, separator).
+    Phase 1 (``bail_early`` seconds, default 0.3s):
+        Poll at 100ms.  If the bracket content changes, bail immediately.
+        Modal dialogs are polled and dismissed every 0.2s within this loop
+        (extending the deadline when dismissed so the account still loads).
 
     Phase 2 (up to ``timeout`` total):
         Bracket content is changing — wait for it to stabilize on a new
         account name.  If the title hasn't changed at all since the click,
-        use a shortened Phase 2 (2.5s) to avoid wasting time on dead items.
-        Dismiss modal dialogs once at start, not every poll.
+        use a shortened Phase 2 (1.0s) to avoid wasting time on dead items.
+        Modal dialogs are polled and dismissed every 0.3s within this loop.
     """
     import ctypes  # noqa: PLC0415
     import ctypes.wintypes as wt  # noqa: PLC0415
@@ -592,9 +593,17 @@ def _sidebar_dblclick(root_hwnd: int, screen_x: int, screen_y: int,
     pre_bracket = _bracket_name(pre_title)
 
     # Phase 1 (bail_early seconds): poll for bracket change.
+    # Poll modals every 2 iterations (~0.2s) so a blocking dialog (e.g.
+    # "securities mismatch") is dismissed immediately rather than stalling
+    # the entire Phase 1 window.
     bail_deadline = _time.monotonic() + bail_early
+    _p1_poll = 0
     while _time.monotonic() < bail_deadline:
         _time.sleep(0.1)
+        _p1_poll += 1
+        if _p1_poll % 2 == 0:
+            if _dismiss_modal_dialogs(root_hwnd):
+                bail_deadline += 0.3  # extend so account has time to load
         user32.GetWindowTextW(root_hwnd, buf, 256)
         cur = buf.value
         cur_bracket = _bracket_name(cur)
@@ -612,20 +621,21 @@ def _sidebar_dblclick(root_hwnd: int, screen_x: int, screen_y: int,
     # Phase 2: wait for bracket to stabilize.
     # If the title hasn't changed at all since the click, the item is
     # likely a non-account (header/total/sub-view) — use a shortened
-    # Phase 2 to catch slow accounts without wasting too much time.
+    # Phase 2 (1.0s) to avoid wasting time on dead items.
     # If the title IS different, something is happening — use full timeout.
     if phase1_title == pre_title:
-        phase2_budget = min(2.5, timeout - bail_early)
+        phase2_budget = min(1.0, timeout - bail_early)
     else:
         phase2_budget = timeout - bail_early
 
-    # Dismiss any modal that appeared during the click (once, not per-poll).
-    if _dismiss_modal_dialogs(root_hwnd):
-        _time.sleep(0.3)
-
     full_deadline = _time.monotonic() + phase2_budget
+    _p2_poll = 0
     while _time.monotonic() < full_deadline:
         _time.sleep(0.15)
+        _p2_poll += 1
+        if _p2_poll % 2 == 0:
+            if _dismiss_modal_dialogs(root_hwnd):
+                full_deadline += 0.5  # extend so account has time to load
         user32.GetWindowTextW(root_hwnd, buf, 256)
         cur = buf.value
         cur_bracket = _bracket_name(cur)
@@ -635,7 +645,7 @@ def _sidebar_dblclick(root_hwnd: int, screen_x: int, screen_y: int,
     # One final modal dismiss — a dialog may have appeared during Phase 2
     # and blocked the account switch.
     if _dismiss_modal_dialogs(root_hwnd):
-        _time.sleep(1.0)
+        _time.sleep(0.8)
         user32.GetWindowTextW(root_hwnd, buf, 256)
         cur_bracket = _bracket_name(buf.value)
         if cur_bracket and cur_bracket != pre_bracket:
@@ -686,7 +696,7 @@ def list_sidebar_accounts(bridge: Any) -> list[dict[str, Any]]:
         title_before = buf.value
 
         title = _sidebar_dblclick(
-            root, item["screen_x"], item["screen_y"], timeout=6.0,
+            root, item["screen_x"], item["screen_y"], timeout=4.0,
             lb_hwnd=item["lb_hwnd"], item_index=item["item_index"],
             pre_title=title_before,
         )
