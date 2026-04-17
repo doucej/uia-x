@@ -934,7 +934,12 @@ def _sidebar_dblclick(root_hwnd: int, screen_x: int, screen_y: int,
 
     def _bracket_name(t: str) -> str:
         if "[" in t and "]" in t:
-            return t[t.rfind("[") + 1 : t.rfind("]")]
+            raw = t[t.rfind("[") + 1 : t.rfind("]")]
+            try:
+                raw = raw.encode("cp1252").decode("utf-8")
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                pass
+            return raw
         return ""
 
     # Scroll the sidebar container so lb_hwnd is visible, then scroll the
@@ -1163,12 +1168,12 @@ def list_sidebar_accounts(bridge: Any, resume: bool = False,
         item = items[idx]
         idx += 1
 
-        # Optimisation: if the previous click produced the same bracket name
-        # as the one before it, this item is likely a sub-row of the same
-        # account.  Skip it without clicking (saves 1-5s per sub-row).
-        # Reset after 4 consecutive skips to avoid permanently skipping a
-        # new account that happens to follow many sub-rows.
-        if consecutive_same >= 1 and consecutive_same < 4:
+        # Optimisation: if at least TWO previous clicks produced the same
+        # bracket name, this adjacent item is likely another sub-row.  Skip
+        # without clicking (saves 1-5s per sub-row).  Require >= 2 to avoid
+        # skipping single-row accounts adjacent to multi-row ones.  Cap at 3
+        # consecutive skips to ensure we eventually click again.
+        if consecutive_same >= 2 and consecutive_same < 5:
             # Peek: is this the same ListBox and adjacent item_index?
             prev = items[idx - 2] if idx >= 2 else None
             if (prev and prev["lb_hwnd"] == item["lb_hwnd"]
@@ -1189,7 +1194,13 @@ def list_sidebar_accounts(bridge: Any, resume: bool = False,
 
         def _bracket(t: str) -> str:
             if "[" in t and "]" in t:
-                return t[t.rfind("[") + 1 : t.rfind("]")]
+                raw = t[t.rfind("[") + 1 : t.rfind("]")]
+                # Fix UTF-8 double-encoding artifacts (e.g. "Â®" → "®")
+                try:
+                    raw = raw.encode("cp1252").decode("utf-8")
+                except (UnicodeEncodeError, UnicodeDecodeError):
+                    pass
+                return raw
             return ""
 
         name = _bracket(title)
@@ -1203,7 +1214,13 @@ def list_sidebar_accounts(bridge: Any, resume: bool = False,
             consecutive_same = 0
         last_bracket = name
 
-        if _acct_match(name, item["section"]):
+        # Filter section summary rows — match against ALL known section
+        # names, not just the current section (which may be misclassified).
+        _SECTION_NAMES = {
+            "banking", "investing", "property & debt", "separate",
+            "rental property", "business", "savings goals",
+        }
+        if name.lower() in _SECTION_NAMES or _acct_match(name, item["section"]):
             continue  # section summary row
         if name not in seen_names:
             seen_names.add(name)
@@ -1385,6 +1402,10 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
         title = buf_v.value
         if "[" in title and "]" in title:
             opened = title[title.rfind("[") + 1 : title.rfind("]")]
+            try:
+                opened = opened.encode("cp1252").decode("utf-8")
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                pass
             if _acct_match(opened, account_name):
                 return {"ok": True, "account": opened, "method": "combo"}
 
@@ -1481,6 +1502,10 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
         )
         if "[" in title and "]" in title:
             opened = title[title.rfind("[") + 1 : title.rfind("]")]
+            try:
+                opened = opened.encode("cp1252").decode("utf-8")
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                pass
             if _acct_match(opened, account_name):
                 return {"ok": True, "account": opened, "method": "sidebar"}
         return None
