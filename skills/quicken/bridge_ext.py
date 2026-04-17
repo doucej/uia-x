@@ -72,7 +72,8 @@ def _dismiss_modal_dialogs(root_hwnd: int) -> bool:
     _DIALOG_CLASSES = {"QWinDlg", "QWinPopup", "#32770"}
     _DISMISS_LABELS = frozenset({
         "done", "close", "ok", "cancel", "yes", "dismiss",
-        "continue", "accept", "no thanks",
+        "continue", "accept", "no thanks", "no", "ignore", "skip",
+        "not now", "later", "remind me later",
     })
 
     # Collect visible top-level dialogs owned by root
@@ -1184,6 +1185,9 @@ def list_sidebar_accounts(bridge: Any, resume: bool = False,
         user32.GetWindowTextW(root, buf, 256)
         title_before = buf.value
 
+        # Dismiss any modal dialog that may have popped during previous click
+        _dismiss_modal_dialogs(root)
+
         title = _sidebar_dblclick(
             root, item["screen_x"], item["screen_y"], timeout=6.0,
             lb_hwnd=item["lb_hwnd"], item_index=item["item_index"],
@@ -1396,6 +1400,9 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
         _send_msg(parent, WM_COMMAND, wparam, combo_h)
         time.sleep(0.8)
 
+        # Dismiss any modal that may have popped (e.g. Securities Mismatch)
+        _dismiss_modal_dialogs(root_hwnd)
+
         # Verify the switch via window title bracket first.
         buf_v = ctypes.create_unicode_buffer(256)
         user32.GetWindowTextW(root_hwnd, buf_v, 256)
@@ -1515,6 +1522,37 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
         if result:
             return result
         # Don't invalidate the whole cache — just this entry might be stale
+
+    # ------------------------------------------------------------------
+    # Phase 4: Auto-rebuild sidebar cache and retry (one attempt).
+    # This handles the case where list_sidebar_accounts was called in a
+    # previous session, the server restarted, or the cache became stale.
+    # Scan incrementally and stop as soon as the target account is found
+    # (avoids 5+ min full scan when account is near the top).
+    # ------------------------------------------------------------------
+    if not cached and _sidebar_cache:
+        # Cache exists but account not in it — don't rescan (it's not there)
+        pass
+    elif not cached:
+        # No cache at all — do an incremental scan, stop when found
+        try:
+            global _scan_state  # noqa: PLW0603
+            _scan_state = {}
+            for _attempt in range(15):  # max 15 batches (~7 min cap)
+                resume = _attempt > 0
+                res = list_sidebar_accounts(bridge, resume=resume,
+                                            max_seconds=30)
+                # Check if we found the target yet
+                cached = _sidebar_lookup(account_name)
+                if cached:
+                    result = _try_sidebar_click(cached)
+                    if result:
+                        return result
+                    break  # found in cache but click failed
+                if res.get("done"):
+                    break
+        except Exception:  # noqa: BLE001
+            pass  # sidebar scan failed — fall through to error
 
     raise UIAError(
         f"Account {account_name!r} not found via combo or sidebar cache.  "

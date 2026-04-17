@@ -1,11 +1,11 @@
 mcp[cli]>=1.0.0
 pydantic>=2.0.0
 
-# Windows-only (install on Windows)
-pywinauto>=0.6.8
-comtypes>=1.4.0
-Pillow>=10.0.0
-winsdk>=1.0.0b10
+# Windows-only (PEP 508 markers keep these from installing on Linux/macOS)
+pywinauto>=0.6.8; sys_platform == "win32"
+comtypes>=1.4.0; sys_platform == "win32"
+Pillow>=10.0.0; sys_platform == "win32"
+winsdk>=1.0.0b10; sys_platform == "win32"
 
 # Linux-only (install via system packages on Linux)
 # apt install python3-pyatspi gir1.2-atspi-2.0 python3-gi at-spi2-core
