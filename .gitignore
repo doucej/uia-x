@@ -33,9 +33,14 @@ make_deck.py
 
 # Scratch / debug artifacts
 scripts/*.png
+scripts/*.txt
 scripts/add_test_transactions.py
 scripts/enter_all.py
 scripts/enter_transactions.py
+scripts/test_ocr_tool.py
+
+# Logs (may contain window titles / account names)
+logs/*.log
 
 # OS
 Thumbs.db
