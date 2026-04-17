@@ -225,3 +225,33 @@ def register(
             return {"ok": False, "error": str(exc), "code": exc.code}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+    @mcp.tool(
+        name="read_screen_text",
+        description=(
+            "Read visible text from the active Quicken window using server-side "
+            "Windows OCR.  Returns structured text lines with x/y positions.  "
+            "This is essential for reading content from custom-drawn controls "
+            "that do not expose text via standard Win32 or UIA APIs, such as "
+            "investment portfolio values, owner-drawn sidebar items, and "
+            "QWHtmlView content.  The calling model does NOT need vision "
+            "capabilities — all OCR is performed server-side and only text is "
+            "returned.  Optionally pass a region as 'left,top,right,bottom' "
+            "in screen coordinates to scope the capture; if omitted, the "
+            "active MDI child window is used.  Windows-only.  [Quicken skill]"
+        ),
+    )
+    def read_screen_text_tool(
+        api_key: str = "",
+        region: str = "",
+    ) -> dict[str, Any]:
+        auth_err = check_auth(api_key)
+        if auth_err:
+            return auth_err
+        try:
+            bridge = get_bridge()
+            return bridge_ext.read_screen_text(bridge, region=region)
+        except UIAError as exc:
+            return {"ok": False, "error": str(exc), "code": exc.code}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
