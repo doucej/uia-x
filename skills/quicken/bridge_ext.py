@@ -431,17 +431,29 @@ def list_accounts(bridge: Any) -> list[dict[str, Any]]:
 def _find_sidebar_accounts(root_hwnd: int) -> list[dict[str, Any]]:
     """Discover sidebar accounts by scanning QWAcctBarHolder ListBox items.
 
-    The Quicken sidebar has section buttons (Banking, Investing, etc.) with
-    child ``QWListViewer`` containers holding ``ListBox`` controls.  Each
-    ListBox item represents an account.  Items with height ≤ 5 px are
-    decorative separators and are skipped.
+    The Quicken sidebar has section headers (QC_button) that toggle sections
+    open/closed.  Within each section, child ``QWListViewer`` containers hold
+    ``ListBox`` controls with one row per account.  Items with height ≤ 5 px
+    are decorative separators and are skipped.
+
+    **Two-stage approach**:
+    1. *Expand collapsed sections* — find any section whose QWListViewer
+       ListBoxes are hidden (vis=False, cnt>0) and click its visible
+       QC_button header to expand it.  This handles sections like
+       "Property & Debt" or "Separate" that are collapsed by default.
+    2. *Two-pass scroll enumeration* — after expanding, the sidebar may be
+       taller than the visible window.  Enumerate at both scroll position 0
+       and the bottom to find ListBoxes that are off-screen.
 
     Returns a list of ``{"section", "lb_hwnd", "item_index", "screen_x",
-    "screen_y"}`` dicts (one per real item).  The ``name`` field is left
-    empty because these are owner-drawn and unreadable via LB_GETTEXT.
+    "screen_y", "content_y_lb", "holder_hwnd"}`` dicts (one per real item).
+    ``content_y_lb`` is the ListBox's Y offset within the holder's full
+    (unscrolled) content space; used by ``_scroll_holder_to_content_y`` to
+    bring the item back into view when clicking.
     """
     import ctypes  # noqa: PLC0415
     import ctypes.wintypes as wt  # noqa: PLC0415
+    import time as _time  # noqa: PLC0415
 
     user32 = ctypes.windll.user32
     SM = user32.SendMessageW
@@ -467,7 +479,6 @@ def _find_sidebar_accounts(root_hwnd: int) -> list[dict[str, Any]]:
     # Ensure the sidebar is visible (investment views may hide it)
     if not user32.IsWindowVisible(holder):
         SW_SHOW = 5
-        # Walk up and show each hidden ancestor
         h = holder
         chain = []
         while h and h != root_hwnd:
@@ -476,60 +487,336 @@ def _find_sidebar_accounts(root_hwnd: int) -> list[dict[str, Any]]:
         for h in reversed(chain):
             if not user32.IsWindowVisible(h):
                 user32.ShowWindow(h, SW_SHOW)
-        import time as _time  # noqa: PLC0415
         _time.sleep(0.2)
         if not user32.IsWindowVisible(holder):
             return []  # couldn't recover visibility
 
-    # Collect ListBoxes parented by QWListViewer within the holder
-    items: list[dict[str, Any]] = []
+    user32.SetForegroundWindow(root_hwnd)
+
+    # --------------------------------------------------------------------------
+    # Stage 1: Expand all collapsed sections that have accounts
+    # --------------------------------------------------------------------------
+    # Collect info about all direct children of the holder:
+    # - QWListViewer children: represent sections/sub-sections (hold the ListBoxes)
+    # - QC_button children: section header toggle buttons + per-row buttons
+    #
+    # Strategy: find sections with hidden QWListViewer + cnt>0, then click the
+    # one visible QC_button with the same section name to expand it.
     cls_buf = ctypes.create_unicode_buffer(64)
     txt_buf = ctypes.create_unicode_buffer(256)
 
-    def _scan_lb(h: int, _: int) -> bool:
+    def _get_class(h: int) -> str:
         user32.GetClassNameW(h, cls_buf, 64)
-        if cls_buf.value != "ListBox" or not user32.IsWindowVisible(h):
-            return True
-        parent = user32.GetParent(h)
-        user32.GetClassNameW(parent, cls_buf, 64)
-        if cls_buf.value != "QWListViewer":
-            return True
-        # Section name is the QWListViewer window text
-        user32.GetWindowTextW(parent, txt_buf, 256)
-        section = txt_buf.value
+        return cls_buf.value
 
-        lb_rect = wt.RECT()
-        user32.GetWindowRect(h, ctypes.byref(lb_rect))
-        count = SM(h, 0x018B, 0, 0)  # LB_GETCOUNT
-        for i in range(min(count, 100)):
-            ir = wt.RECT()
-            SM(h, 0x0198, i, ctypes.addressof(ir))  # LB_GETITEMRECT
-            item_h = ir.bottom - ir.top
-            if item_h <= 5:
-                continue  # separator
-            sx = lb_rect.left + (ir.left + ir.right) // 2
-            sy = lb_rect.top + (ir.top + ir.bottom) // 2
-            items.append({
-                "section": section,
-                "lb_hwnd": h,
-                "item_index": i,
-                "screen_x": sx,
-                "screen_y": sy,
-            })
+    def _get_text(h: int) -> str:
+        user32.GetWindowTextW(h, txt_buf, 256)
+        return txt_buf.value
+
+    def _get_rect(h: int) -> wt.RECT:
+        r = wt.RECT(); user32.GetWindowRect(h, ctypes.byref(r)); return r
+
+    # Scan holder's direct children for collapsed sections
+    # Map: section_name -> {has_hidden_items: bool, visible_btns: [hwnd]}
+    section_state: dict[str, dict] = {}
+    def _scan_child(h: int, _: int) -> bool:
+        if user32.GetParent(h) != holder:
+            return True
+        cls_name = _get_class(h)
+        txt = _get_text(h)
+        vis = bool(user32.IsWindowVisible(h))
+        if cls_name == "QWListViewer" and txt:
+            # Check its ListBox child for hidden items
+            def _check_lb(ch: int, __: int) -> bool:
+                if _get_class(ch) == "ListBox":
+                    cnt = SM(ch, 0x018B, 0, 0)  # LB_GETCOUNT
+                    lb_vis = bool(user32.IsWindowVisible(ch))
+                    if cnt > 0 and not lb_vis:
+                        section_state.setdefault(txt, {"has_hidden_items": False,
+                                                       "visible_btns": []})
+                        section_state[txt]["has_hidden_items"] = True
+                return True
+            user32.EnumChildWindows(h, EnumCB(_check_lb), 0)
+        elif cls_name == "QC_button" and txt and vis:
+            section_state.setdefault(txt, {"has_hidden_items": False,
+                                           "visible_btns": []})
+            section_state[txt]["visible_btns"].append(h)
         return True
+    user32.EnumChildWindows(holder, EnumCB(_scan_child), 0)
 
-    user32.EnumChildWindows(holder, EnumCB(_scan_lb), 0)
+    # Build list of section headers that need expanding, sorted BOTTOM-UP so
+    # that lower sections are expanded first (expanding a higher section pushes
+    # lower ones down; bottom-up avoids off-screen issues for later expansions).
+    candidates: list[tuple[int, int]] = []  # (screen_top, btn_hwnd)
+    for section_name, state in section_state.items():
+        if not state["has_hidden_items"] or not state["visible_btns"]:
+            continue
+        btns = state["visible_btns"]
+        # Pick the topmost visible button (section header, not a sub-row button)
+        btns.sort(key=lambda b: _get_rect(b).top)
+        btn = btns[0]
+        candidates.append((_get_rect(btn).top, btn))
+    candidates.sort(reverse=True)  # bottom-most section first
+
+    # Use SendMessageW(WM_LBUTTONDOWN/UP) rather than mouse_event so:
+    #   - the mouse cursor doesn't move (no interference with other UI)
+    #   - it works regardless of whether the button is within the viewport
+    WM_LBUTTONDOWN = 0x0201
+    WM_LBUTTONUP   = 0x0202
+    MK_LBUTTON     = 0x0001
+    expanded_any = False
+    for _, btn in candidates:
+        r = _get_rect(btn)
+        mid_x = (r.right - r.left) // 2
+        mid_y = (r.bottom - r.top) // 2
+        lparam = (mid_y << 16) | (mid_x & 0xFFFF)
+        user32.SendMessageW(btn, WM_LBUTTONDOWN, MK_LBUTTON, lparam)
+        _time.sleep(0.05)
+        user32.SendMessageW(btn, WM_LBUTTONUP, 0, lparam)
+        _time.sleep(0.5)  # wait for section to expand/reflow
+        expanded_any = True
+
+    if expanded_any:
+        _time.sleep(0.2)  # extra settle time after all expansions
+
+    # --------------------------------------------------------------------------
+    # Stage 2: Two-pass scroll enumeration
+    # --------------------------------------------------------------------------
+    class _SI(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_uint), ("fMask", ctypes.c_uint),
+                    ("nMin", ctypes.c_int), ("nMax", ctypes.c_int),
+                    ("nPage", ctypes.c_uint), ("nPos", ctypes.c_int),
+                    ("nTrackPos", ctypes.c_int)]
+
+    WM_VSCROLL = 0x0115
+    SB_THUMBPOSITION = 4
+    SB_ENDSCROLL = 8
+
+    def _get_scroll_info() -> _SI:
+        si = _SI(); si.cbSize = ctypes.sizeof(si); si.fMask = 0x17
+        user32.GetScrollInfo(holder, 1, ctypes.byref(si))
+        return si
+
+    def _scroll_to(pos: int) -> None:
+        user32.SendMessageW(holder, WM_VSCROLL, (pos << 16) | SB_THUMBPOSITION, 0)
+        _time.sleep(0.25)
+        user32.SendMessageW(holder, WM_VSCROLL, SB_ENDSCROLL, 0)
+        _time.sleep(0.1)
+
+    orig_pos = _get_scroll_info().nPos
+
+    holder_rect = wt.RECT()
+
+    items: list[dict[str, Any]] = []
+    seen_lb_hwnds: set[int] = set()
+
+    def _enum_one_pos(scroll_pos: int) -> None:
+        """Enumerate all visible ListBoxes at the given scroll position."""
+        user32.GetWindowRect(holder, ctypes.byref(holder_rect))
+        cur_holder_top = holder_rect.top
+
+        def _scan_lb(h: int, _: int) -> bool:
+            if h in seen_lb_hwnds:
+                return True
+            if _get_class(h) != "ListBox" or not user32.IsWindowVisible(h):
+                return True
+            parent = user32.GetParent(h)
+            if _get_class(parent) != "QWListViewer":
+                return True
+            section = _get_text(parent)
+
+            lb_rect = wt.RECT()
+            user32.GetWindowRect(h, ctypes.byref(lb_rect))
+            content_y_lb = lb_rect.top - cur_holder_top + scroll_pos
+            count = SM(h, 0x018B, 0, 0)  # LB_GETCOUNT
+            seen_lb_hwnds.add(h)
+            for i in range(min(count, 100)):
+                ir = wt.RECT()
+                SM(h, 0x0198, i, ctypes.addressof(ir))  # LB_GETITEMRECT
+                item_h = ir.bottom - ir.top
+                if item_h <= 5:
+                    continue  # separator
+                sx = lb_rect.left + (ir.left + ir.right) // 2
+                sy = lb_rect.top + (ir.top + ir.bottom) // 2
+                items.append({
+                    "section": section,
+                    "lb_hwnd": h,
+                    "item_index": i,
+                    "screen_x": sx,
+                    "screen_y": sy,
+                    "content_y_lb": content_y_lb,
+                    "holder_hwnd": holder,
+                })
+            return True
+
+        user32.EnumChildWindows(holder, EnumCB(_scan_lb), 0)
+
+    # Pass 1: scroll to top, enumerate
+    _scroll_to(0)
+    _enum_one_pos(0)
+
+    # Pass 2: scroll to bottom, enumerate any new ListBoxes
+    si = _get_scroll_info()
+    bottom_pos = max(0, si.nMax - int(si.nPage) + 1)
+    if bottom_pos > 0:
+        _scroll_to(bottom_pos)
+        _enum_one_pos(bottom_pos)
+
+    # Restore original scroll position
+    _scroll_to(orig_pos)
+
     return items
 
 
 _SIDEBAR_DEBUG = False  # set True temporarily to diagnose timing
 
 
+def _scroll_holder_for_lb(lb_hwnd: int) -> None:
+    """Scroll QWAcctBarHolder so that lb_hwnd is within its visible viewport.
+
+    The sidebar container (QWAcctBarHolder) is taller than the screen area and
+    has its own vertical scrollbar.  ListBoxes below the current scroll
+    position are real windows (EnumChildWindows finds them) but clicking their
+    screen coordinates misses — they're clipped by the container.  This
+    function scrolls the container just enough to bring lb_hwnd into view.
+
+    Hierarchy: ListBox → QWListViewer → QWAcctBarHolder
+    """
+    import ctypes  # noqa: PLC0415
+    import ctypes.wintypes as wt  # noqa: PLC0415
+    import time as _time  # noqa: PLC0415
+
+    user32 = ctypes.windll.user32
+
+    if not lb_hwnd or not _is_valid_hwnd(lb_hwnd):
+        return
+
+    # Walk up two levels: ListBox → QWListViewer → QWAcctBarHolder
+    lv = user32.GetParent(lb_hwnd)
+    holder = user32.GetParent(lv) if lv else 0
+    if not holder:
+        return
+    cls_buf = ctypes.create_unicode_buffer(64)
+    user32.GetClassNameW(holder, cls_buf, 64)
+    if cls_buf.value != "QWAcctBarHolder":
+        return  # unexpected hierarchy
+
+    class SCROLLINFO(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_uint), ("fMask", ctypes.c_uint),
+                    ("nMin", ctypes.c_int), ("nMax", ctypes.c_int),
+                    ("nPage", ctypes.c_uint), ("nPos", ctypes.c_int),
+                    ("nTrackPos", ctypes.c_int)]
+
+    SIF_ALL = 0x17
+    si = SCROLLINFO()
+    si.cbSize = ctypes.sizeof(si)
+    si.fMask = SIF_ALL
+    if not user32.GetScrollInfo(holder, 1, ctypes.byref(si)):  # SB_VERT=1
+        return
+    if si.nMax == 0:
+        return  # nothing to scroll
+
+    holder_rect = wt.RECT()
+    user32.GetWindowRect(holder, ctypes.byref(holder_rect))
+    holder_top = holder_rect.top
+    holder_height = holder_rect.bottom - holder_rect.top
+
+    lb_rect = wt.RECT()
+    user32.GetWindowRect(lb_hwnd, ctypes.byref(lb_rect))
+
+    # Content coordinates: offset of lb within full (unscrolled) holder content
+    content_top = lb_rect.top - holder_top + si.nPos
+    content_bot = lb_rect.bottom - holder_top + si.nPos
+
+    margin = 10  # px to leave visible above/below the ListBox
+    new_pos = si.nPos
+
+    if content_top < si.nPos + margin:
+        new_pos = max(si.nMin, content_top - margin)
+    elif content_bot > si.nPos + holder_height - margin:
+        new_pos = min(si.nMax - int(si.nPage) + 1, content_bot - holder_height + margin)
+
+    if new_pos == si.nPos:
+        return  # already visible
+
+    WM_VSCROLL = 0x0115
+    SB_THUMBPOSITION = 4
+    SB_ENDSCROLL = 8
+    wp = (new_pos << 16) | (SB_THUMBPOSITION & 0xFFFF)
+    user32.SendMessageW(holder, WM_VSCROLL, wp, 0)
+    _time.sleep(0.05)
+    user32.SendMessageW(holder, WM_VSCROLL, SB_ENDSCROLL, 0)
+    _time.sleep(0.05)
+
+
+def _scroll_holder_to_content_y(holder_hwnd: int, content_y_lb: int) -> None:
+    """Scroll QWAcctBarHolder so the ListBox at *content_y_lb* is in view.
+
+    Unlike ``_scroll_holder_for_lb`` (which relies on ``GetWindowRect`` of a
+    possibly-hidden window), this function uses the pre-computed content-space
+    Y coordinate stored in each sidebar item dict.  This works even when the
+    ListBox is currently hidden (Quicken collapses off-screen ListBoxes to
+    height=0 until they scroll into the viewport).
+
+    After scrolling, Quicken shows the previously-hidden ListBox at its
+    correct position.  A small sleep allows the window to be repositioned
+    before the caller calls ``LB_SETTOPINDEX`` / ``LB_GETITEMRECT``.
+    """
+    import ctypes  # noqa: PLC0415
+    import ctypes.wintypes as wt  # noqa: PLC0415
+    import time as _time  # noqa: PLC0415
+
+    user32 = ctypes.windll.user32
+
+    class SCROLLINFO(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_uint), ("fMask", ctypes.c_uint),
+                    ("nMin", ctypes.c_int), ("nMax", ctypes.c_int),
+                    ("nPage", ctypes.c_uint), ("nPos", ctypes.c_int),
+                    ("nTrackPos", ctypes.c_int)]
+
+    si = SCROLLINFO()
+    si.cbSize = ctypes.sizeof(si)
+    si.fMask = 0x17  # SIF_ALL
+    if not user32.GetScrollInfo(holder_hwnd, 1, ctypes.byref(si)):
+        return
+    if si.nMax == 0:
+        return  # no scrollbar
+
+    holder_rect = wt.RECT()
+    user32.GetWindowRect(holder_hwnd, ctypes.byref(holder_rect))
+    holder_height = holder_rect.bottom - holder_rect.top
+    max_scroll = max(0, si.nMax - int(si.nPage) + 1)
+
+    margin = 30  # px of extra space to show above the ListBox
+
+    # Check if already in view (content_y_lb within current viewport)
+    if si.nPos + margin <= content_y_lb <= si.nPos + holder_height - margin:
+        return  # ListBox is already visible, no scroll needed
+
+    # Scroll so content_y_lb lands near the top of the viewport
+    target_pos = max(si.nMin, content_y_lb - margin)
+    target_pos = min(target_pos, max_scroll)
+
+    if target_pos == si.nPos:
+        return
+
+    WM_VSCROLL = 0x0115
+    SB_THUMBPOSITION = 4
+    SB_ENDSCROLL = 8
+    user32.SendMessageW(holder_hwnd, WM_VSCROLL,
+                        (target_pos << 16) | SB_THUMBPOSITION, 0)
+    _time.sleep(0.25)  # wait for Quicken to show/reposition the ListBox
+    user32.SendMessageW(holder_hwnd, WM_VSCROLL, SB_ENDSCROLL, 0)
+    _time.sleep(0.1)
+
+
 def _sidebar_dblclick(root_hwnd: int, screen_x: int, screen_y: int,
                       timeout: float = 6.0, *,
                       lb_hwnd: int = 0, item_index: int = -1,
                       pre_title: str = "",
-                      bail_early: float = 0.3) -> str:
+                      bail_early: float = 0.3,
+                      content_y_lb: int = 0,
+                      holder_hwnd: int = 0) -> str:
     """Double-click a sidebar item and wait for the title to stabilize.
 
     If ``lb_hwnd`` and ``item_index`` are provided, the item is scrolled
@@ -561,8 +848,15 @@ def _sidebar_dblclick(root_hwnd: int, screen_x: int, screen_y: int,
             return t[t.rfind("[") + 1 : t.rfind("]")]
         return ""
 
-    # Scroll the target item into view and recalculate coordinates
+    # Scroll the sidebar container so lb_hwnd is visible, then scroll the
+    # ListBox to bring item_index to the top and recalculate screen coords.
     if lb_hwnd and item_index >= 0 and _is_valid_hwnd(lb_hwnd):
+        # Prefer content_y_lb-based scrolling (works even if lb is hidden).
+        # Fall back to GetWindowRect-based for old callers without content_y_lb.
+        if content_y_lb > 0 and holder_hwnd:
+            _scroll_holder_to_content_y(holder_hwnd, content_y_lb)
+        else:
+            _scroll_holder_for_lb(lb_hwnd)
         LB_SETTOPINDEX = 0x0197
         LB_GETITEMRECT = 0x0198
         _send_msg(lb_hwnd, LB_SETTOPINDEX, max(0, item_index - 1), 0)
@@ -774,6 +1068,8 @@ def list_sidebar_accounts(bridge: Any, resume: bool = False,
             root, item["screen_x"], item["screen_y"], timeout=5.0,
             lb_hwnd=item["lb_hwnd"], item_index=item["item_index"],
             pre_title=title_before,
+            content_y_lb=item.get("content_y_lb", 0),
+            holder_hwnd=item.get("holder_hwnd", 0),
         )
 
         def _bracket(t: str) -> str:
@@ -791,6 +1087,12 @@ def list_sidebar_accounts(bridge: Any, resume: bool = False,
             results.append({
                 "name": name,
                 "section": item["section"],
+                "lb_hwnd": item["lb_hwnd"],
+                "item_index": item["item_index"],
+                "content_y_lb": item.get("content_y_lb", 0),
+                "holder_hwnd": item.get("holder_hwnd", 0),
+                "screen_x": item["screen_x"],
+                "screen_y": item["screen_y"],
             })
 
     # Persist updated state
@@ -981,14 +1283,18 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
 
     def _try_sidebar_click(cached_entry: dict) -> dict | None:
         """Attempt to click the cached sidebar item, scrolling into view."""
-        target_lb = int(cached_entry["lb_hwnd"], 16)
+        target_lb = int(cached_entry["lb_hwnd"], 16) if isinstance(cached_entry["lb_hwnd"], str) else cached_entry["lb_hwnd"]
         target_idx = cached_entry["item_index"]
+        cy_lb = cached_entry.get("content_y_lb", 0)
+        h_hwnd = cached_entry.get("holder_hwnd", 0)
         cur_buf = ctypes.create_unicode_buffer(256)
         user32.GetWindowTextW(root_hwnd, cur_buf, 256)
         title = _sidebar_dblclick(
             root_hwnd, 0, 0, timeout=4.0,
             lb_hwnd=target_lb, item_index=target_idx,
             pre_title=cur_buf.value,
+            content_y_lb=cy_lb,
+            holder_hwnd=h_hwnd,
         )
         if "[" in title and "]" in title:
             opened = title[title.rfind("[") + 1 : title.rfind("]")]
