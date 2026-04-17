@@ -28,6 +28,10 @@ def _acct_match(candidate: str, query: str) -> bool:
 
     Handles cases where AI agents use shortened names like "Costco Visa"
     to match "Costco Anywhere Visa® Card by Citi".
+
+    Deliberately broad — callers like ``_sidebar_lookup`` use
+    shortest-candidate-first ranking to pick the best match when
+    multiple candidates qualify.
     """
     import re  # noqa: PLC0415
 
@@ -298,7 +302,7 @@ def _discover_accounts_via_mdi(root_hwnd: int) -> list[dict[str, Any]]:
     def _collect_mdi(h: int, _: int) -> bool:
         cls = ctypes.create_unicode_buffer(64)
         user32.GetClassNameW(h, cls, 64)
-        if cls.value == "QWMDI":
+        if cls.value == "QWMDI" and user32.IsWindowVisible(h):
             title = ctypes.create_unicode_buffer(256)
             user32.GetWindowTextW(h, title, 256)
             mdi_tabs.append((h, title.value))
@@ -743,8 +747,9 @@ def _find_sidebar_accounts(root_hwnd: int) -> list[dict[str, Any]]:
             item_h = ir.bottom - ir.top
             if item_h <= 5:
                 continue  # separator
-            # Screen coords are approximate; _sidebar_dblclick recalculates
-            # via LB_GETITEMRECT + ClientToScreen after scrolling.
+            # Absolute content Y of this specific item within the holder
+            item_mid_y = (ir.top + ir.bottom) // 2  # midpoint in LB client
+            item_abs_y = max(0, content_y) + item_mid_y
             items.append({
                 "section": section,
                 "lb_hwnd": h,
@@ -752,6 +757,7 @@ def _find_sidebar_accounts(root_hwnd: int) -> list[dict[str, Any]]:
                 "screen_x": 0,
                 "screen_y": 0,
                 "content_y_lb": max(0, content_y),
+                "item_content_y": item_abs_y,
                 "holder_hwnd": holder,
             })
 
@@ -1234,6 +1240,7 @@ def list_sidebar_accounts(bridge: Any, resume: bool = False,
                 "lb_hwnd": item["lb_hwnd"],
                 "item_index": item["item_index"],
                 "content_y_lb": item.get("content_y_lb", 0),
+                "item_content_y": item.get("item_content_y", 0),
                 "holder_hwnd": item.get("holder_hwnd", 0),
                 "screen_x": item["screen_x"],
                 "screen_y": item["screen_y"],
@@ -1263,11 +1270,25 @@ _scan_state: dict[str, Any] = {}
 
 
 def _sidebar_lookup(account_name: str) -> dict[str, Any] | None:
-    """Find a cached sidebar entry matching account_name (fuzzy)."""
+    """Find a cached sidebar entry matching account_name.
+
+    Prefers exact (case-insensitive) matches, then the shortest fuzzy match
+    (most specific name among candidates).
+    """
+    q = account_name.lower()
+    # Pass 1: exact case-insensitive match
+    for entry in _sidebar_cache:
+        if entry["name"].lower() == q:
+            return entry
+    # Pass 2: fuzzy — pick the shortest matching name (most specific)
+    best: dict[str, Any] | None = None
+    best_len = float("inf")
     for entry in _sidebar_cache:
         if _acct_match(entry["name"], account_name):
-            return entry
-    return None
+            if len(entry["name"]) < best_len:
+                best = entry
+                best_len = len(entry["name"])
+    return best
 
 
 def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
@@ -1296,7 +1317,7 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
     import ctypes.wintypes  # noqa: PLC0415
     import time  # noqa: PLC0415
 
-    global _sidebar_cache  # noqa: PLW0603
+    global _sidebar_cache, _scan_state  # noqa: PLW0603
 
     CB_SETCURSEL = 0x014E
     CB_GETCURSEL = 0x0147
@@ -1430,91 +1451,164 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
     # ------------------------------------------------------------------
     cached = _sidebar_lookup(account_name) if _sidebar_cache else None
 
-    def _resolve_lb_hwnd(cached_entry: dict) -> tuple[int, int]:
-        """Return (lb_hwnd, item_index), re-resolving stale handles.
+    def _try_sidebar_click(cached_entry: dict) -> dict | None:
+        """Click-and-search sidebar navigation with fuzzy index recovery.
 
-        If the cached lb_hwnd is still valid, return it directly.
-        Otherwise, scroll the holder to the cached content_y_lb position,
-        then re-enumerate visible ListBoxes to find the one whose screen
-        position overlaps that content location.
+        Quicken's owner-drawn virtual ListBoxes can shift item indices
+        between the scan and subsequent navigations.  This function:
+
+        1. Scrolls to the cached ``content_y_lb`` position.
+        2. Re-resolves the nearest visible ListBox.
+        3. Tries the cached ``item_index`` first (fast path).
+        4. If the wrong account opens, searches ±4 nearby indices.
+        5. Skips header/separator items (height < 10 px).
+        6. Updates the sidebar cache entry on success.
+
+        The search is deliberately limited (1 ListBox, ±4 indices) to
+        keep latency under ~30 seconds.  If it fails, Phase 4 will do
+        a full incremental rescan.
         """
-        lb = int(cached_entry["lb_hwnd"], 16) if isinstance(cached_entry["lb_hwnd"], str) else cached_entry["lb_hwnd"]
-        idx = cached_entry["item_index"]
-        if _is_valid_hwnd(lb) and user32.IsWindowVisible(lb):
-            return lb, idx
-
-        # lb_hwnd is stale — try to re-resolve via content_y_lb
-        cy = cached_entry.get("content_y_lb", 0)
         holder = cached_entry.get("holder_hwnd", 0)
-        if not cy or not holder or not _is_valid_hwnd(holder):
-            return lb, idx  # can't resolve, let caller fail gracefully
+        cy_lb = cached_entry.get("content_y_lb", 0)
+        idx = cached_entry["item_index"]
 
-        _scroll_holder_to_content_y(holder, cy)
-        time.sleep(0.15)
+        if not holder or not _is_valid_hwnd(holder):
+            return None
 
-        # Re-enumerate visible ListBoxes in the holder
+        # Scroll the section into view
+        if cy_lb > 0:
+            _scroll_holder_to_content_y(holder, cy_lb)
+            time.sleep(0.2)
+
+        # Enumerate ALL visible ListBoxes in the holder with their
+        # content-Y and item counts.
         import ctypes.wintypes as wt  # noqa: PLC0415
         _EnumCB = ctypes.WINFUNCTYPE(
-            ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
-        )
-        best_lb, best_dist = 0, 9999
-        def _find_lb(h: int, _: int) -> bool:
-            nonlocal best_lb, best_dist
+            ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+
+        class _SI(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_uint), ("fMask", ctypes.c_uint),
+                        ("nMin", ctypes.c_int), ("nMax", ctypes.c_int),
+                        ("nPage", ctypes.c_uint), ("nPos", ctypes.c_int),
+                        ("nTrackPos", ctypes.c_int)]
+
+        si = _SI()
+        si.cbSize = ctypes.sizeof(si)
+        si.fMask = 0x17
+        user32.GetScrollInfo(holder, 1, ctypes.byref(si))
+
+        hr = wt.RECT()
+        user32.GetWindowRect(holder, ctypes.byref(hr))
+
+        all_lbs: list[tuple[int, int, int]] = []  # (hwnd, content_y, count)
+
+        def _collect_lbs(h: int, _: int) -> bool:
             cls = ctypes.create_unicode_buffer(64)
             user32.GetClassNameW(h, cls, 64)
             if cls.value != "ListBox" or not user32.IsWindowVisible(h):
                 return True
             cnt = _send_msg(h, 0x018B, 0, 0)  # LB_GETCOUNT
-            if cnt <= idx:
+            if cnt < 1:
                 return True
             r = wt.RECT()
             user32.GetWindowRect(h, ctypes.byref(r))
-            hr = wt.RECT()
-            user32.GetWindowRect(holder, ctypes.byref(hr))
-            import ctypes as _ct  # noqa: PLC0415
-            si_cls = type('SI', (_ct.Structure,), {'_fields_': [
-                ("cbSize", _ct.c_uint), ("fMask", _ct.c_uint),
-                ("nMin", _ct.c_int), ("nMax", _ct.c_int),
-                ("nPage", _ct.c_uint), ("nPos", _ct.c_int),
-                ("nTrackPos", _ct.c_int)]})
-            si = si_cls()
-            si.cbSize = _ct.sizeof(si)
-            si.fMask = 0x17
-            user32.GetScrollInfo(holder, 1, _ct.byref(si))
-            lb_content_y = r.top - hr.top + si.nPos
-            dist = abs(lb_content_y - cy)
-            if dist < best_dist:
-                best_dist = dist
-                best_lb = h
+            lb_cy = r.top - hr.top + si.nPos
+            all_lbs.append((h, lb_cy, cnt))
             return True
 
-        user32.EnumChildWindows(holder, _EnumCB(_find_lb), 0)
-        if best_lb and best_dist < 50:
-            return best_lb, idx
-        return lb, idx  # fallback
+        user32.EnumChildWindows(holder, _EnumCB(_collect_lbs), 0)
 
-    def _try_sidebar_click(cached_entry: dict) -> dict | None:
-        """Attempt to click the cached sidebar item, scrolling into view."""
-        target_lb, target_idx = _resolve_lb_hwnd(cached_entry)
-        cy_lb = cached_entry.get("content_y_lb", 0)
-        h_hwnd = cached_entry.get("holder_hwnd", 0)
-        cur_buf = ctypes.create_unicode_buffer(256)
-        user32.GetWindowTextW(root_hwnd, cur_buf, 256)
-        title = _sidebar_dblclick(
-            root_hwnd, 0, 0, timeout=8.0,
-            lb_hwnd=target_lb, item_index=target_idx,
-            pre_title=cur_buf.value,
-            content_y_lb=cy_lb,
-            holder_hwnd=h_hwnd,
-        )
-        if "[" in title and "]" in title:
-            opened = title[title.rfind("[") + 1 : title.rfind("]")]
-            try:
-                opened = opened.encode("cp1252").decode("utf-8")
-            except (UnicodeEncodeError, UnicodeDecodeError):
-                pass
-            if _acct_match(opened, account_name):
+        if not all_lbs:
+            return None
+
+        # Sort by distance from cached content_y_lb
+        all_lbs.sort(key=lambda x: abs(x[1] - cy_lb))
+
+        LB_GETITEMRECT = 0x0198
+
+        def _item_height(lb_h: int, item_idx: int) -> int:
+            """Return pixel height of a ListBox item (0 on error)."""
+            ir2 = wt.RECT()
+            ret = _send_msg(lb_h, LB_GETITEMRECT, item_idx,
+                            ctypes.addressof(ir2))
+            if ret == 0:
+                return 0
+            return max(0, ir2.bottom - ir2.top)
+
+        def _click_and_check(lb_h: int, item_idx: int) -> dict | None:
+            """Double-click item and verify the opened account name."""
+            cur_buf = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(root_hwnd, cur_buf, 256)
+            pre_title = cur_buf.value
+
+            title = _sidebar_dblclick(
+                root_hwnd, 0, 0, timeout=3.0,
+                lb_hwnd=lb_h, item_index=item_idx,
+                pre_title=pre_title,
+                content_y_lb=cy_lb,
+                holder_hwnd=holder,
+                bail_early=0.2,
+            )
+
+            _dismiss_modal_dialogs(root_hwnd)
+
+            # Re-read title in case dismiss changed it
+            if title == pre_title:
+                time.sleep(0.4)
+                user32.GetWindowTextW(root_hwnd, cur_buf, 256)
+                title = cur_buf.value
+
+            opened = ""
+            if "[" in title and "]" in title:
+                opened = title[title.rfind("[") + 1 : title.rfind("]")]
+                try:
+                    opened = opened.encode("cp1252").decode("utf-8")
+                except (UnicodeEncodeError, UnicodeDecodeError):
+                    pass
+
+            if opened and _acct_match(opened, account_name):
+                # Update cache to reflect correct index for next time
+                cached_entry["item_index"] = item_idx
+                cached_entry["lb_hwnd"] = lb_h
                 return {"ok": True, "account": opened, "method": "sidebar"}
+
+            # Also check active MDI title
+            mdi_h = _find_active_mdi(root_hwnd)
+            if mdi_h:
+                mdi_buf = ctypes.create_unicode_buffer(256)
+                user32.GetWindowTextW(mdi_h, mdi_buf, 256)
+                mdi_name = mdi_buf.value.strip()
+                if _acct_match(mdi_name, account_name):
+                    cached_entry["item_index"] = item_idx
+                    cached_entry["lb_hwnd"] = lb_h
+                    return {"ok": True, "account": mdi_name,
+                            "method": "sidebar"}
+
+            return None
+
+        def _search_order(center: int, count: int, radius: int = 4) -> list[int]:
+            """Build search order: center first, then ±radius outward."""
+            order = [center] if 0 <= center < count else []
+            for delta in range(1, radius + 1):
+                if center - delta >= 0:
+                    order.append(center - delta)
+                if center + delta < count:
+                    order.append(center + delta)
+            return order
+
+        # Search the nearest ListBox only, ±4 indices from cached position.
+        # This keeps worst-case latency under ~30s (9 items × 3s each).
+        if not all_lbs:
+            return None
+        lb_h, lb_cy, lb_cnt = all_lbs[0]
+        for item_i in _search_order(idx, lb_cnt):
+            # Skip tiny header/separator items
+            if _item_height(lb_h, item_i) < 10:
+                continue
+            result = _click_and_check(lb_h, item_i)
+            if result:
+                return result
+
         return None
 
     if cached:
@@ -1525,27 +1619,24 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
 
     # ------------------------------------------------------------------
     # Phase 4: Auto-rebuild sidebar cache and retry (one attempt).
-    # This handles the case where list_sidebar_accounts was called in a
-    # previous session, the server restarted, or the cache became stale.
-    # Scan incrementally and stop as soon as the target account is found
-    # (avoids 5+ min full scan when account is near the top).
+    # Runs when the cache is empty, when the account wasn't in the cache,
+    # OR when Phase 3 found a cache entry but the click search failed
+    # (the item may have moved to a different section entirely).
     # ------------------------------------------------------------------
-    if not cached and _sidebar_cache:
-        # Cache exists but account not in it — don't rescan (it's not there)
-        pass
-    elif not cached:
-        # No cache at all — do an incremental scan, stop when found
+    scan_done = _scan_state.get("done", False)
+    if not scan_done:
         try:
-            global _scan_state  # noqa: PLW0603
-            _scan_state = {}
+            if not _scan_state.get("items"):
+                _scan_state = {}
             for _attempt in range(15):  # max 15 batches (~7 min cap)
-                resume = _attempt > 0
+                resume = _attempt > 0 or bool(_scan_state.get("items"))
                 res = list_sidebar_accounts(bridge, resume=resume,
                                             max_seconds=30)
                 # Check if we found the target yet
-                cached = _sidebar_lookup(account_name)
-                if cached:
-                    result = _try_sidebar_click(cached)
+                found = _sidebar_lookup(account_name)
+                if found and (not cached or found is not cached):
+                    # New/different cache entry — try clicking it
+                    result = _try_sidebar_click(found)
                     if result:
                         return result
                     break  # found in cache but click failed
@@ -1612,7 +1703,16 @@ def read_register_state(bridge: Any) -> dict[str, Any]:
         return buf.value
 
     # Find the active QWMDI and scope child enumeration to it.
+    # Retry briefly — after navigation the MDI may still be loading.
     mdi_h = _find_active_mdi(root_hwnd)
+    if mdi_h is None:
+        import time as _time  # noqa: PLC0415
+        for _retry in range(3):
+            _time.sleep(0.5)
+            _dismiss_modal_dialogs(root_hwnd)
+            mdi_h = _find_active_mdi(root_hwnd)
+            if mdi_h is not None:
+                break
     if mdi_h is None:
         raise UIAError("No active QWMDI found.", code="REGISTER_NOT_FOUND")
 
@@ -1844,7 +1944,7 @@ def _find_active_mdi(root_hwnd: int) -> int | None:
         user32.GetWindowRect(h, ctypes.byref(r))
         area = (r.right - r.left) * (r.bottom - r.top)
 
-        if target_name and mdi_title.lower().strip() == target_name:
+        if target_name and _acct_match(mdi_title, target_name):
             name_match = h
         if area > best_area:
             best_area = area
@@ -2809,6 +2909,21 @@ def read_screen_text(
         y = int(line.words[0].bounding_rect.y) if line.words else 0
         x = int(line.words[0].bounding_rect.x) if line.words else 0
         lines_out.append({"text": words, "y": y, "x": x})
+
+    # Post-process: Quicken's proprietary font renders "$" as a glyph that
+    # Windows OCR consistently reads as "5".  Fix dollar-amount patterns:
+    #   "543,207.62" → "$43,207.62",  "55,000.00" → "$5,000.00"
+    import re as _re  # noqa: PLC0415
+
+    _dollar_re = _re.compile(
+        r"(?<![.\d])5(\d{1,3}(?:,\d{3})*\.\d{2})(?!\d)"
+    )
+
+    def _fix_dollar(text: str) -> str:
+        return _dollar_re.sub(r"$\1", text)
+
+    for entry in lines_out:
+        entry["text"] = _fix_dollar(entry["text"])
 
     full_text = "\n".join(ld["text"] for ld in lines_out)
 
