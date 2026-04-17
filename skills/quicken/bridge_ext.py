@@ -522,6 +522,9 @@ def _find_sidebar_accounts(root_hwnd: int) -> list[dict[str, Any]]:
     return items
 
 
+_SIDEBAR_DEBUG = False  # set True temporarily to diagnose timing
+
+
 def _sidebar_dblclick(root_hwnd: int, screen_x: int, screen_y: int,
                       timeout: float = 6.0, *,
                       lb_hwnd: int = 0, item_index: int = -1,
@@ -596,14 +599,21 @@ def _sidebar_dblclick(root_hwnd: int, screen_x: int, screen_y: int,
     # Poll modals every 2 iterations (~0.2s) so a blocking dialog (e.g.
     # "securities mismatch") is dismissed immediately rather than stalling
     # the entire Phase 1 window.
-    bail_deadline = _time.monotonic() + bail_early
+    # Hard cap: modals can extend bail_deadline at most 4× (e.g. 1.2s total
+    # at bail_early=0.3s) so a persistent/repeated modal can't loop forever.
+    bail_start = _time.monotonic()
+    bail_deadline = bail_start + bail_early
+    bail_deadline_cap = bail_start + bail_early * 4
+    if _SIDEBAR_DEBUG:
+        import sys
+        print(f"  [dbg] P1 start pre_bracket={pre_bracket!r}", flush=True, file=sys.stderr)
     _p1_poll = 0
     while _time.monotonic() < bail_deadline:
         _time.sleep(0.1)
         _p1_poll += 1
         if _p1_poll % 2 == 0:
             if _dismiss_modal_dialogs(root_hwnd):
-                bail_deadline += 0.3  # extend so account has time to load
+                bail_deadline = min(bail_deadline + 0.3, bail_deadline_cap)
         user32.GetWindowTextW(root_hwnd, buf, 256)
         cur = buf.value
         cur_bracket = _bracket_name(cur)
@@ -614,38 +624,64 @@ def _sidebar_dblclick(root_hwnd: int, screen_x: int, screen_y: int,
         user32.GetWindowTextW(root_hwnd, buf, 256)
         return buf.value
 
-    # Snapshot at end of Phase 1: is the title actively changing?
+    # Snapshot at end of Phase 1: is the bracket still the same?
     user32.GetWindowTextW(root_hwnd, buf, 256)
     phase1_title = buf.value
+    phase1_bracket = _bracket_name(phase1_title)
 
     # Phase 2: wait for bracket to stabilize.
-    # If the title hasn't changed at all since the click, the item is
-    # likely a non-account (header/total/sub-view) — use a shortened
-    # Phase 2 (1.0s) to avoid wasting time on dead items.
-    # If the title IS different, something is happening — use full timeout.
-    if phase1_title == pre_title:
+    # Use bracket comparison for no-change detection: Quicken updates the title
+    # prefix/status text even when staying on the same account, so full-string
+    # equality is too strict. If the bracket hasn't changed after Phase 1, this
+    # is likely a duplicate sidebar item — use shortened Phase 2 (1.0s).
+    # For investment accounts that briefly go blank (phase1_bracket==""), treat
+    # as full-budget: the early-exit below will catch the same-bracket return.
+    no_change = (phase1_bracket == pre_bracket)
+    if no_change:
         phase2_budget = min(1.0, timeout - bail_early)
     else:
         phase2_budget = timeout - bail_early
 
-    full_deadline = _time.monotonic() + phase2_budget
+    # Hard cap: total (Phase 1 elapsed + Phase 2) must not exceed timeout.
+    # Apply the cap to the initial deadline as well as to extensions.
+    full_deadline_cap = bail_start + timeout
+    full_deadline = min(_time.monotonic() + phase2_budget, full_deadline_cap)
+    if _SIDEBAR_DEBUG:
+        import sys
+        p1_elapsed = _time.monotonic() - bail_start
+        print(f"  [dbg] P2 start phase1_bracket={phase1_bracket!r} "
+              f"no_change={no_change} phase2_budget={phase2_budget:.2f}s "
+              f"p1_elapsed={p1_elapsed:.2f}s deadline_cap={full_deadline_cap - bail_start:.2f}s",
+              flush=True, file=sys.stderr)
     _p2_poll = 0
     while _time.monotonic() < full_deadline:
         _time.sleep(0.15)
         _p2_poll += 1
-        if _p2_poll % 2 == 0:
-            if _dismiss_modal_dialogs(root_hwnd):
-                full_deadline += 0.5  # extend so account has time to load
         user32.GetWindowTextW(root_hwnd, buf, 256)
         cur = buf.value
         cur_bracket = _bracket_name(cur)
-        if cur_bracket and cur_bracket != pre_bracket:
-            return cur
+        if cur_bracket:
+            if cur_bracket != pre_bracket:
+                return cur  # new account opened
+            # Bracket returned to same value — confirmed duplicate, exit now
+            break
+        if _p2_poll % 2 == 0:
+            dismissed = _dismiss_modal_dialogs(root_hwnd)
+            if dismissed and not no_change:
+                if _SIDEBAR_DEBUG:
+                    import sys
+                    print(f"  [dbg] P2 modal dismissed, extending deadline "
+                          f"(time={_time.monotonic()-bail_start:.2f}s)", flush=True, file=sys.stderr)
+                full_deadline = min(full_deadline + 0.5, full_deadline_cap)
 
-    # One final modal dismiss — a dialog may have appeared during Phase 2
-    # and blocked the account switch.
-    if _dismiss_modal_dialogs(root_hwnd):
-        _time.sleep(0.8)
+    # One final modal dismiss — only worth the sleep for actively-loading
+    # accounts; skip for no-change (duplicate) items to save time.
+    if _SIDEBAR_DEBUG:
+        import sys
+        print(f"  [dbg] P2 done, elapsed={_time.monotonic()-bail_start:.2f}s no_change={no_change}",
+              flush=True, file=sys.stderr)
+    if not no_change and _dismiss_modal_dialogs(root_hwnd):
+        _time.sleep(0.5)
         user32.GetWindowTextW(root_hwnd, buf, 256)
         cur_bracket = _bracket_name(buf.value)
         if cur_bracket and cur_bracket != pre_bracket:
@@ -656,15 +692,44 @@ def _sidebar_dblclick(root_hwnd: int, screen_x: int, screen_y: int,
     return buf.value
 
 
-def list_sidebar_accounts(bridge: Any) -> list[dict[str, Any]]:
-    """Return sidebar accounts with their names (discovered by clicking).
+def list_sidebar_accounts(bridge: Any, resume: bool = False,
+                           max_seconds: float = 20.0) -> dict[str, Any]:
+    """Discover sidebar accounts by clicking each item and reading window titles.
 
-    Each entry has ``{"name", "section", "lb_hwnd", "item_index"}``.
-    This is a one-time discovery that physically clicks each sidebar item,
-    reads the resulting window title, then restores the original view.
+    Because Quicken's sidebar is owner-drawn, the only reliable way to read
+    account names is to click each item and watch the window title.  Investment
+    accounts can take 2-7 seconds each, so a single full scan would exceed HTTP
+    timeouts.
 
-    Only records a mapping when clicking an item actually changes the
-    window title — headers, totals, and separators are skipped.
+    **Resumable / time-bounded scan**
+
+    Call repeatedly until ``done`` is ``True``::
+
+        result = list_sidebar_accounts(bridge, resume=False)   # fresh start
+        while not result["done"]:
+            result = list_sidebar_accounts(bridge, resume=True)
+        all_accounts = result["accounts"]
+
+    Parameters
+    ----------
+    bridge
+        Active UIABridge instance (unused directly; used for pm attachment).
+    resume
+        If *False* (default), restart scan from the beginning.
+        If *True*, continue from where the last call left off.
+    max_seconds
+        Seconds budget per call (default 20).  When the budget expires the
+        function returns immediately with ``done=False`` so the caller can
+        resume in a fresh HTTP request.
+
+    Returns
+    -------
+    dict with keys:
+        ``ok`` -- always ``True`` on success.
+        ``accounts`` -- list of ``{name, section}`` dicts discovered so far.
+        ``scanned`` -- number of sidebar items processed so far (across calls).
+        ``total`` -- total sidebar items enumerated.
+        ``done`` -- ``True`` when all items have been processed.
     """
     import time as _time  # noqa: PLC0415
     import ctypes  # noqa: PLC0415
@@ -678,63 +743,79 @@ def list_sidebar_accounts(bridge: Any) -> list[dict[str, Any]]:
     user32 = ctypes.windll.user32
     buf = ctypes.create_unicode_buffer(256)
 
-    # Remember current view
-    user32.GetWindowTextW(root, buf, 256)
-    original_title = buf.value
+    global _scan_state  # noqa: PLW0603
 
-    sidebar_items = _find_sidebar_accounts(root)
-    results: list[dict[str, Any]] = []
-    seen_names: set[str] = set()
+    if not resume or not _scan_state.get("items"):
+        # Fresh scan: enumerate sidebar items and reset state
+        sidebar_items = _find_sidebar_accounts(root)
+        _scan_state = {
+            "items": sidebar_items,
+            "idx": 0,
+            "results": [],
+            "seen_names": set(),
+            "done": False,
+        }
 
-    # Track the title BEFORE each click to detect actual changes
-    prev_title = original_title
+    items = _scan_state["items"]
+    idx = _scan_state["idx"]
+    results: list[dict[str, Any]] = _scan_state["results"]
+    seen_names: set[str] = _scan_state["seen_names"]
 
-    for item in sidebar_items:
-        # Read title immediately before this click to avoid attributing
-        # a delayed title change from a previous click to this item.
+    deadline = _time.monotonic() + max_seconds
+
+    while idx < len(items) and _time.monotonic() < deadline:
+        item = items[idx]
+        idx += 1
+
         user32.GetWindowTextW(root, buf, 256)
         title_before = buf.value
 
         title = _sidebar_dblclick(
-            root, item["screen_x"], item["screen_y"], timeout=4.0,
+            root, item["screen_x"], item["screen_y"], timeout=5.0,
             lb_hwnd=item["lb_hwnd"], item_index=item["item_index"],
             pre_title=title_before,
         )
 
-        # Compare bracket content (account name), not full title — the
-        # prefix can change without the account actually switching.
         def _bracket(t: str) -> str:
             if "[" in t and "]" in t:
                 return t[t.rfind("[") + 1 : t.rfind("]")]
             return ""
 
         name = _bracket(title)
-        prev_name = _bracket(title_before)
-        if not name or name == prev_name:
-            continue  # header, total, or separator — no account opened
-        # Skip section-header items (e.g. "Property & Debt" section opens
-        # a summary view, not a real account register).  Use fuzzy match
-        # so "Property & De" ≈ "Property & Debt" handles truncation too.
-        if name and _acct_match(name, item["section"]):
-            continue
-        if name and name not in seen_names:
+        if not name:
+            continue  # separator, header, or no navigation happened
+        if _acct_match(name, item["section"]):
+            continue  # section summary row (e.g. "Property & Debt" overview)
+        if name not in seen_names:
             seen_names.add(name)
             results.append({
                 "name": name,
                 "section": item["section"],
-                "lb_hwnd": hex(item["lb_hwnd"]),
-                "item_index": item["item_index"],
             })
 
-    # Populate the module-level cache for navigate_to_account
-    global _sidebar_cache  # noqa: PLW0603
-    _sidebar_cache = list(results)
+    # Persist updated state
+    _scan_state["idx"] = idx
+    _scan_state["done"] = idx >= len(items)
 
-    return results
+    if _scan_state["done"]:
+        # Populate the module-level cache for navigate_to_account
+        global _sidebar_cache  # noqa: PLW0603
+        _sidebar_cache = list(results)
+
+    return {
+        "ok": True,
+        "accounts": list(results),
+        "scanned": idx,
+        "total": len(items),
+        "done": _scan_state["done"],
+    }
 
 
 # Module-level sidebar cache: name → sidebar_item dict with screen coords
 _sidebar_cache: list[dict[str, Any]] = []
+
+# Resumable scan state for list_sidebar_accounts
+_scan_state: dict[str, Any] = {}
 
 
 def _sidebar_lookup(account_name: str) -> dict[str, Any] | None:
