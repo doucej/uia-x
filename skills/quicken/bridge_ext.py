@@ -2387,7 +2387,18 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
     if existing_mdi:
         user32.BringWindowToTop(existing_mdi)
         user32.SetFocus(existing_mdi)
-        return {"ok": True, "account": account_name, "method": "existing_tab"}
+        _mtitle = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(existing_mdi, _mtitle, 256)
+        matched_name = _mtitle.value.strip() or account_name
+        # If this was a fuzzy match, verify it's reasonable: the matched
+        # account should be shorter than the query (abbreviation) or within
+        # 3 chars.  Longer fuzzy matches risk "DCU Savings" → "DCU LTD
+        # Savings" when a real DCU Savings account exists in the sidebar.
+        if not exact_mdi and len(matched_name) > len(account_name) + 3:
+            pass  # skip — fall through to combo/sidebar for better match
+        else:
+            return {"ok": True, "account": matched_name,
+                    "method": "existing_tab"}
 
     # ------------------------------------------------------------------
     # Phase 2: Try combo selector first (fast — no sidebar scan needed).
