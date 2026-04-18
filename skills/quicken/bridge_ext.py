@@ -1647,16 +1647,25 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
                         _time.sleep(2.0)
                         _dismiss_modal_dialogs(root_hwnd)
                         post = _read_bracket()
+                    elif post == pre:
+                        # Might be a slow-loading investment account whose
+                        # title hasn't updated yet.  Brief recheck.
+                        _time.sleep(0.5)
+                        _dismiss_modal_dialogs(root_hwnd)
+                        recheck = _read_bracket()
+                        if recheck and recheck != pre:
+                            post = recheck
 
                     navigated = post and post != pre
                     name = post or pre
 
                     if _SIDEBAR_DEBUG:
-                        if navigated:
-                            print(f"  [pass {pass_num}] #{total_clicks}: "
-                                  f"{name!r} (scroll={actual_pos} lb={lb_h} "
-                                  f"i={i} y={pt.y})",
-                                  flush=True, file=sys.stderr)
+                        tag = "NAV" if navigated else "dup"
+                        print(f"  [pass {pass_num}] #{total_clicks} "
+                              f"{tag}: pre={pre!r} post={post!r} "
+                              f"(scroll={actual_pos} lb={lb_h} "
+                              f"i={i} y={pt.y} h={ir.bottom-ir.top})",
+                              flush=True, file=sys.stderr)
 
                     if name and name.lower() not in SECTION_NAMES:
                         if name not in accounts:
