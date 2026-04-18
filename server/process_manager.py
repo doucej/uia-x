@@ -39,30 +39,35 @@ class WindowInfo:
     dpi_scale: float | None = None  # Windows: GetDpiForWindow(hwnd) / 96.0
 
 
-def _process_name_matches(query: str, win: WindowInfo) -> bool:
-    """Fuzzy process-name matching.
+def _process_name_match_quality(query: str, win: WindowInfo) -> int:
+    """Score how well *query* matches *win*'s process name.
+
+    Returns 0 for no match, or a positive integer (higher = better):
+      - 3: exact or stem match  (``qw`` ↔ ``qw.exe``)
+      - 2: substring in process name  (``chrome`` in ``chrome.exe``)
+      - 1: title fallback  (``Quicken`` in window title of ``qw.exe``)
 
     Agents often pass a human-friendly name like ``"Quicken"`` when the
-    real process is ``qw.exe``.  This helper accepts:
-      - exact match (case-insensitive)
-      - stem match after stripping ``.exe`` (``notepad`` ↔ ``notepad.exe``)
-      - substring match (``chrome`` matches ``chrome.exe``)
-      - title fallback (``Quicken`` matches ``qw.exe`` if the window title
-        contains ``Quicken``)
+    real process is ``qw.exe``.
     """
     pn = query.lower()
     wpn = win.process_name.lower()
     wpn_stem = wpn.rsplit(".", 1)[0] if "." in wpn else wpn
     pn_stem = pn.rsplit(".", 1)[0] if "." in pn else pn
     if wpn == pn or wpn_stem == pn_stem:
-        return True
+        return 3
     if pn in wpn or pn_stem in wpn_stem:
-        return True
+        return 2
     # Title fallback: the query may be the product name visible in the
     # window title even though the executable has a different name.
     if pn in win.title.lower():
-        return True
-    return False
+        return 1
+    return 0
+
+
+def _process_name_matches(query: str, win: WindowInfo) -> bool:
+    """Return True if *query* matches *win* at any quality level."""
+    return _process_name_match_quality(query, win) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -222,19 +227,23 @@ class RealProcessManager(ProcessManager):
 
         candidates = self.list_windows(visible_only=False)
 
-        matches: list[WindowInfo] = []
+        matches: list[tuple[int, WindowInfo]] = []
         for win in candidates:
             if pid is not None and win.pid != pid:
                 continue
-            if process_name is not None and not _process_name_matches(process_name, win):
-                continue
+            if process_name is not None:
+                pq = _process_name_match_quality(process_name, win)
+                if pq == 0:
+                    continue
+            else:
+                pq = 3  # no process filter → neutral (best quality)
             if window_title is not None and window_title.lower() not in win.title.lower():
                 continue
             if class_name is not None and win.class_name.lower() != class_name.lower():
                 continue
             if hwnd is not None and win.hwnd != hwnd:
                 continue
-            matches.append(win)
+            matches.append((pq, win))
 
         if not matches:
             criteria = {
@@ -246,27 +255,27 @@ class RealProcessManager(ProcessManager):
             }
             raise ProcessNotFoundError(f"No window matched: {criteria}")
 
-        # Rank candidates: prefer visible windows, then application-specific
-        # class names over generic shell/explorer classes, then by largest area.
-        # This avoids selecting a File Explorer window when the user searches
-        # by title (e.g. window_title="Quicken" matching both Quicken.exe's
-        # QFRAME and a File Explorer browsing a "Quicken" folder).
+        # Rank candidates: prefer higher match quality (exact process name
+        # match over title fallback), then visible windows, then
+        # application-specific class names over generic shell/explorer
+        # classes, then by largest area.
         _SHELL_CLASSES = frozenset({
             "cabinetw", "explorerw", "shell_traywnd", "progman",
             "applicationframewindow", "windows.ui.core.corewindow",
         })
 
-        def _rank(w: WindowInfo) -> tuple:
+        def _rank(item: tuple[int, WindowInfo]) -> tuple:
+            pq, w = item
             area = (
                 (w.rect.get("right", 0) - w.rect.get("left", 0))
                 * (w.rect.get("bottom", 0) - w.rect.get("top", 0))
             )
             is_shell = w.class_name.lower().rstrip("class") in _SHELL_CLASSES
-            return (0 if w.visible else 1, 1 if is_shell else 0, -area)
+            return (-pq, 0 if w.visible else 1, 1 if is_shell else 0, -area)
 
         matches.sort(key=_rank)
-        self._attached = matches[0]
-        return matches[0]
+        self._attached = matches[0][1]
+        return matches[0][1]
 
 
 # ---------------------------------------------------------------------------
@@ -300,19 +309,23 @@ class MockProcessManager(ProcessManager):
         if not any([pid, process_name, window_title, class_name, hwnd]):
             raise ProcessNotFoundError("At least one search criterion is required.")
 
-        matches: list[WindowInfo] = []
+        matches: list[tuple[int, WindowInfo]] = []
         for win in self._windows:
             if pid is not None and win.pid != pid:
                 continue
-            if process_name is not None and not _process_name_matches(process_name, win):
-                continue
+            if process_name is not None:
+                pq = _process_name_match_quality(process_name, win)
+                if pq == 0:
+                    continue
+            else:
+                pq = 3
             if window_title is not None and window_title.lower() not in win.title.lower():
                 continue
             if class_name is not None and win.class_name.lower() != class_name.lower():
                 continue
             if hwnd is not None and win.hwnd != hwnd:
                 continue
-            matches.append(win)
+            matches.append((pq, win))
 
         if not matches:
             criteria = {
@@ -324,23 +337,25 @@ class MockProcessManager(ProcessManager):
             }
             raise ProcessNotFoundError(f"No window matched: {criteria}")
 
-        # Prefer visible windows, then app-specific classes, then largest area.
+        # Prefer higher match quality, visible windows, app-specific classes,
+        # then largest area.
         _SHELL_CLASSES = frozenset({
             "cabinetw", "explorerw", "shell_traywnd", "progman",
             "applicationframewindow", "windows.ui.core.corewindow",
         })
 
-        def _rank(w: WindowInfo) -> tuple:
+        def _rank(item: tuple[int, WindowInfo]) -> tuple:
+            pq, w = item
             area = (
                 (w.rect.get("right", 0) - w.rect.get("left", 0))
                 * (w.rect.get("bottom", 0) - w.rect.get("top", 0))
             )
             is_shell = w.class_name.lower().rstrip("class") in _SHELL_CLASSES
-            return (0 if w.visible else 1, 1 if is_shell else 0, -area)
+            return (-pq, 0 if w.visible else 1, 1 if is_shell else 0, -area)
 
         matches.sort(key=_rank)
-        self._attached = matches[0]
-        return matches[0]
+        self._attached = matches[0][1]
+        return matches[0][1]
 
 
 # ---------------------------------------------------------------------------
