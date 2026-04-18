@@ -1652,6 +1652,7 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
 
     accounts: dict[str, dict[str, Any]] = {}
     _invest_lbs: set[int] = set()  # ListBoxes in investment sections
+    _defer_invest: set[int] = set()  # LBs deferred to investment phase
     _clicked: set[tuple[int, int]] = set()  # (lb_h, item_idx) already clicked
     _consec_dups: dict[int, int] = {}  # lb_h -> consecutive non-navigating clicks
     deadline = _time.monotonic() + max_seconds
@@ -1672,6 +1673,46 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
         user32.GetWindowTextW(root_hwnd, buf, 256)
         return _bracket_name(buf.value)
 
+    def _read_active_mdi_name() -> str:
+        """Read the active MDI child name directly (faster than title bar).
+
+        Enumerates visible QWMDI and QWHtmlView children and returns the
+        name of the largest one (the active/frontmost account view).
+        """
+        best_name = ""
+        best_area = 0
+        _mdi_cls = ctypes.create_unicode_buffer(64)
+        _mdi_txt = ctypes.create_unicode_buffer(256)
+
+        def _enum_mdi_active(h: int, _: int) -> bool:
+            nonlocal best_name, best_area
+            user32.GetClassNameW(h, _mdi_cls, 64)
+            if _mdi_cls.value not in ("QWMDI", "QWHtmlView"):
+                return True
+            if not user32.IsWindowVisible(h):
+                return True
+            user32.GetWindowTextW(h, _mdi_txt, 256)
+            n = _mdi_txt.value.strip()
+            if not n:
+                return True
+            r = wt.RECT()
+            user32.GetWindowRect(h, ctypes.byref(r))
+            area = (r.right - r.left) * (r.bottom - r.top)
+            if area > best_area:
+                best_area = area
+                best_name = n
+            return True
+
+        user32.EnumChildWindows(root_hwnd, EnumCB(_enum_mdi_active), 0)
+        return best_name
+
+    def _read_account_name() -> str:
+        """Read current account name via title bar or MDI child."""
+        name = _read_bracket()
+        if not name:
+            name = _read_active_mdi_name()
+        return name
+
     MAX_PASSES = 4
     for pass_num in range(MAX_PASSES):
         if _time.monotonic() >= deadline:
@@ -1688,6 +1729,12 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
         if pass_num > 0:
             _expand_sidebar_sections(holder)
             _time.sleep(0.3)
+            # Reset consec_dups between passes so investment LBs
+            # get retried — their items always look like dups.
+            _consec_dups.clear()
+            # Allow deferred investment LBs on subsequent passes
+            # (pass 0 is banking-focused).
+            _defer_invest.clear()
 
         si = _get_si()
         max_scroll = max(0, si.nMax - int(si.nPage) + 1)
@@ -1755,21 +1802,31 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
             for lb_h, count in vis_lbs:
                 if _time.monotonic() >= deadline:
                     break
-                if _consec_dups.get(lb_h, 0) >= 3:
+                # Deferred investment LBs are processed in later passes
+                if lb_h in _defer_invest:
+                    if _SIDEBAR_DEBUG:
+                        print(f"  [defer] lb={lb_h:#x}: deferred to investment phase",
+                              flush=True, file=sys.stderr)
+                    continue
+                # Investment LBs always look like dups (title updates
+                # slowly after sidebar recovery), so use a much higher
+                # threshold — we rely on _clicked to avoid repeats.
+                _dup_limit = 8 if lb_h in _invest_lbs else 3
+                if _consec_dups.get(lb_h, 0) >= _dup_limit:
                     if _SIDEBAR_DEBUG:
                         print(f"  [skip-lb] lb={lb_h:#x}: "
-                              f"{_consec_dups[lb_h]} consecutive dups, "
-                              f"skipping rest",
+                              f"{_consec_dups[lb_h]} consecutive dups "
+                              f"(limit={_dup_limit}), skipping rest",
                               flush=True, file=sys.stderr)
                     continue
                 for i in range(min(count, 30)):
                     if _time.monotonic() >= deadline:
                         break
-                    if _consec_dups.get(lb_h, 0) >= 3:
+                    if _consec_dups.get(lb_h, 0) >= _dup_limit:
                         if _SIDEBAR_DEBUG:
                             print(f"  [skip-lb] lb={lb_h:#x}: "
-                                  f"{_consec_dups[lb_h]} consecutive dups, "
-                                  f"skipping rest",
+                                  f"{_consec_dups[lb_h]} consecutive dups "
+                                  f"(limit={_dup_limit}), skipping rest",
                                   flush=True, file=sys.stderr)
                         break
                     if (lb_h, i) in _clicked:
@@ -1801,10 +1858,14 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
 
                     pre = _read_bracket()
                     if not pre:
+                        pre = _read_active_mdi_name()
+                    if not pre:
                         # Title blank — try brief wait + modal dismiss
                         _time.sleep(0.5)
                         _dismiss_modal_dialogs(root_hwnd)
                         pre = _read_bracket()
+                        if not pre:
+                            pre = _read_active_mdi_name()
                     if not pre:
                         if _SIDEBAR_DEBUG:
                             user32.GetWindowTextW(root_hwnd, buf, 256)
@@ -1836,11 +1897,15 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
 
                     post = _read_bracket()
                     if not post:
+                        post = _read_active_mdi_name()
+                    if not post:
                         # Title blank (loading) — poll up to 2s
                         for _w in range(4):
                             _time.sleep(0.5)
                             _dismiss_modal_dialogs(root_hwnd)
                             post = _read_bracket()
+                            if not post:
+                                post = _read_active_mdi_name()
                             if post:
                                 break
                     elif post == pre and sidebar_still_up:
@@ -1848,6 +1913,8 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
                         _time.sleep(0.5)
                         _dismiss_modal_dialogs(root_hwnd)
                         recheck = _read_bracket()
+                        if not recheck:
+                            recheck = _read_active_mdi_name()
                         if recheck and recheck != pre:
                             post = recheck
                     _t_post_read = _time.monotonic()
@@ -1887,62 +1954,63 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
                             accounts[name]["nav_lb"] = lb_h
                             accounts[name]["nav_item"] = i
 
-                    # Mid-scan sidebar recovery: Quicken briefly hides the
-                    # sidebar (and its toolbar) during account transitions.
-                    # Known invest LBs never self-recover — skip straight
-                    # to BM_CLICK.  Others get a brief 1s poll.
+                    # Mid-scan sidebar recovery: Quicken hides the
+                    # sidebar on every double-click.  Restore immediately
+                    # with BM_CLICK, then check title/MDI for new name.
+                    # Banking accounts update the title within 3s of
+                    # recovery; investment accounts often don't (10-30s
+                    # load time).  For known-invest LBs, skip the title
+                    # wait to iterate faster.
                     if not user32.IsWindowVisible(_holder[0]):
-                        _sidebar_ok = False
-                        _t_recov_start = _time.monotonic()
-                        if lb_h not in _invest_lbs:
-                            # Quick self-recovery poll using cached handle
-                            _cached_h = _holder[0]
-                            for _wait_i in range(4):
-                                _time.sleep(0.25)
-                                if _cached_h and user32.IsWindow(_cached_h) and user32.IsWindowVisible(_cached_h):
-                                    _sidebar_ok = True
-                                    break
-                            if not _sidebar_ok:
-                                # Handle may have been destroyed — re-find
-                                _h = _find_sidebar_holder(root_hwnd)
-                                if _h and user32.IsWindowVisible(_h):
-                                    _holder[0] = _h
-                                    holder = _h
-                                    _sidebar_ok = True
-                                    break
-                        if not _sidebar_ok:
-                            _h = _find_sidebar_holder(root_hwnd)
-                            if _h:
-                                _holder[0] = _h
-                                holder = _h
-                    if not user32.IsWindowVisible(_holder[0]):
-                        # Sidebar persistently hidden (investment account).
-                        _invest_lbs.add(lb_h)
-                        if _SIDEBAR_DEBUG:
-                            print(f"  [pass {pass_num}] sidebar HIDDEN after "
-                                  f"click #{total_clicks} ({name!r}), "
-                                  f"lb={lb_h:#x} i={i} marked invest "
-                                  f"dt_selfrecov={_time.monotonic() - _t_recov_start:.2f}s",
-                                  flush=True, file=sys.stderr)
-                        _t_bm = _time.monotonic()
+                        _t_recov = _time.monotonic()
                         if restore_budget <= 0 or not _ensure_sidebar_visible():
+                            if _SIDEBAR_DEBUG:
+                                print(f"  [pass {pass_num}] sidebar recovery "
+                                      f"FAILED for click #{total_clicks} "
+                                      f"({name!r}), lb={lb_h:#x} i={i}",
+                                      flush=True, file=sys.stderr)
                             break
                         restore_budget -= 1
+                        _recov_dt = _time.monotonic() - _t_recov
                         holder = _holder[0]
                         user32.GetWindowRect(holder, ctypes.byref(hr))
                         htop, hbot = hr.top, hr.bottom
-                        # Post-recovery title stabilization: the account
-                        # loaded by the click may not appear in the title
-                        # bar until after sidebar recovery.  Wait up to 1s
-                        # for the title to change from `pre`.
-                        new_name = _read_bracket()
-                        if new_name == pre or not new_name:
-                            for _tw in range(2):
+
+                        # Classify: fast recovery = banking, slow = invest
+                        if _recov_dt >= 8.0:
+                            _invest_lbs.add(lb_h)
+                            if pass_num == 0:
+                                _defer_invest.add(lb_h)
+
+                        is_invest = lb_h in _invest_lbs
+
+                        if _SIDEBAR_DEBUG:
+                            tag = "invest" if is_invest else "banking"
+                            print(f"  [pass {pass_num}] sidebar hidden after "
+                                  f"click #{total_clicks} ({name!r}), "
+                                  f"lb={lb_h:#x} i={i} [{tag}] "
+                                  f"dt_recov={_recov_dt:.2f}s",
+                                  flush=True, file=sys.stderr)
+
+                        # Read new account name (MDI first, then title).
+                        new_name = _read_active_mdi_name()
+                        if not new_name or new_name == pre:
+                            new_name = _read_bracket()
+
+                        # For banking LBs, wait for title to stabilize
+                        # (accounts load in 3-5s). For invest LBs, skip
+                        # the wait — title rarely changes and waiting
+                        # wastes time budget.
+                        if (new_name == pre or not new_name) and not is_invest:
+                            for _tw in range(6):
                                 _time.sleep(0.5)
                                 _dismiss_modal_dialogs(root_hwnd)
-                                new_name = _read_bracket()
+                                new_name = _read_active_mdi_name()
+                                if not new_name or new_name == pre:
+                                    new_name = _read_bracket()
                                 if new_name and new_name != pre:
                                     break
+
                         if (new_name and new_name != pre
                                 and new_name.lower() not in SECTION_NAMES
                                 and new_name not in accounts):
@@ -1958,12 +2026,12 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
                                       f"{new_name!r}",
                                       flush=True, file=sys.stderr)
                         elif new_name and new_name != pre:
-                            _consec_dups[lb_h] = 0  # navigated to known account
+                            _consec_dups[lb_h] = 0
                         else:
-                            _consec_dups[lb_h] = _consec_dups.get(lb_h, 0) + 1
+                            pass  # don't penalize — click DID navigate
                         if _SIDEBAR_DEBUG:
-                            print(f"  [recovery] BM_CLICK took "
-                                  f"{_time.monotonic() - _t_bm:.2f}s "
+                            print(f"  [recovery] total "
+                                  f"{_time.monotonic() - _t_recov:.2f}s "
                                   f"title={new_name!r}",
                                   flush=True, file=sys.stderr)
                         sidebar_restored = True
@@ -2066,6 +2134,8 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
                 for lb_h, count in vis_lbs:
                     if _time.monotonic() >= deadline:
                         break
+                    if lb_h in _defer_invest:
+                        continue
                     if _consec_dups.get(lb_h, 0) >= 3:
                         continue
                     for i in range(min(count, 30)):
@@ -2091,9 +2161,13 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
                             continue
                         pre = _read_bracket()
                         if not pre:
+                            pre = _read_active_mdi_name()
+                        if not pre:
                             _time.sleep(0.5)
                             _dismiss_modal_dialogs(root_hwnd)
                             pre = _read_bracket()
+                            if not pre:
+                                pre = _read_active_mdi_name()
                         if not pre:
                             continue
                         if (pre.lower() not in SECTION_NAMES
@@ -2107,6 +2181,8 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
                         _dismiss_modal_dialogs(root_hwnd)
                         _time.sleep(0.30)
                         post = _read_bracket()
+                        if not post:
+                            post = _read_active_mdi_name()
                         navigated = (post and post != pre)
                         sidebar_still_up = user32.IsWindowVisible(_holder[0])
                         if navigated:
@@ -2127,7 +2203,9 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
                             if not _ensure_sidebar_visible():
                                 break
                             holder = _holder[0]
-                            new_name = _read_bracket()
+                            new_name = _read_active_mdi_name()
+                            if not new_name or new_name == pre:
+                                new_name = _read_bracket()
                             if (new_name and new_name != pre
                                     and new_name.lower() not in SECTION_NAMES
                                     and new_name not in accounts):
@@ -2188,7 +2266,8 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
 
     def _enum_mdi(h: int, _: int) -> bool:
         user32.GetClassNameW(h, mdi_cls, 64)
-        if mdi_cls.value != "QWMDI":
+        # QWMDI = banking registers, QWHtmlView = investment views
+        if mdi_cls.value not in ("QWMDI", "QWHtmlView"):
             return True
         user32.GetWindowTextW(h, mdi_txt, 256)
         name = mdi_txt.value.strip()
@@ -2914,11 +2993,34 @@ def read_register_state(bridge: Any) -> dict[str, Any]:
 
     # Detect investment/portfolio views (ListBox + QWHtmlView, no TxList)
     has_html = any(c == "qwhtmlview" for _, c, _ in mdi_children)
-    view_type = "register" if txlist_h else ("investment" if has_html else "unknown")
+    # Investment accounts may not have QWHtmlView as a direct descendant
+    # but they have a holdings ListBox and/or an "Actions" button.
+    has_holdings_lb = any(
+        c == "listbox" and user32.IsWindowVisible(h)
+        and (_send_msg_timeout(h, 0x018B, 0, 0, timeout_ms=500) or 0) > 0
+        for h, c, _ in mdi_children
+    )
+    has_actions = any(
+        c == "qc_button" and _read_text(h).strip() == "Actions"
+        for h, c, _ in mdi_children if user32.IsWindowVisible(h)
+    )
+    is_investment = has_html or has_holdings_lb or has_actions
+    view_type = "register" if txlist_h else ("investment" if is_investment else "unknown")
 
     if txlist_h is None:
         # Investment/portfolio view: extract what we can
         mdi_title = _read_text(mdi_h)
+
+        # Fall back to bracket name from root title bar when MDI title
+        # is empty (common for investment accounts whose QWMDI wrapper
+        # doesn't carry the account name).
+        if not mdi_title:
+            import re as _re  # noqa: PLC0415
+            root_buf = ctypes.create_unicode_buffer(512)
+            user32.GetWindowTextW(root_hwnd, root_buf, 512)
+            _m = _re.search(r"\[(.+?)\]\s*$", root_buf.value)
+            if _m:
+                mdi_title = _m.group(1).strip()
 
         # Count holdings in the ListBox
         holdings_count = 0
@@ -3081,21 +3183,23 @@ def _find_active_mdi(root_hwnd: int) -> int | None:
     """Find the active QWMDI child window.
 
     Quicken may have multiple QWMDI children open (one per account tab).
-    The active one is identified by matching the bracketed account name in
-    the root window title, e.g. ``[My Savings]``.  Falls back to the
-    largest visible QWMDI if no bracket match is found.
 
-    Matching priority:
-    1. Exact case-insensitive match on QWMDI title vs bracket name.
-    2. Fuzzy match (shortest title wins — avoids "3 Duggan" vs
+    Approach (in priority order):
+    1. Title-matching: exact case-insensitive match on QWMDI title vs
+       the bracketed account name in the root window title.
+    2. WM_MDIGETACTIVE via the MDIClient — reliable for investment
+       accounts whose QWMDI wrapper has an empty title.  Only used
+       when the bracket name is absent or no QWMDI title matches.
+    3. Fuzzy title match (shortest title wins — avoids "3 Duggan" vs
        "3 Duggan Loan" ambiguity).
-    3. Largest visible QWMDI (no bracket in root title).
+    4. Largest visible QWMDI fallback.
     """
     import ctypes  # noqa: PLC0415
     import ctypes.wintypes  # noqa: PLC0415
     import re  # noqa: PLC0415
 
     user32 = ctypes.windll.user32
+    WM_MDIGETACTIVE = 0x0229
 
     # Extract account name from root title brackets
     buf = ctypes.create_unicode_buffer(512)
@@ -3132,8 +3236,6 @@ def _find_active_mdi(root_hwnd: int) -> int | None:
             if mdi_title.lower() == target_name.lower():
                 exact_match = h
             elif not exact_match and _acct_match(mdi_title, target_name):
-                # Among fuzzy matches, prefer the shortest title (most
-                # specific) to avoid "3 Duggan" picking "3 Duggan Loan".
                 if len(mdi_title) < fuzzy_len:
                     fuzzy_match = h
                     fuzzy_len = len(mdi_title)
@@ -3143,7 +3245,35 @@ def _find_active_mdi(root_hwnd: int) -> int | None:
         return True
 
     user32.EnumChildWindows(root_hwnd, WNDENUMPROC(_cb), 0)
-    return exact_match or fuzzy_match or best_match
+
+    # If title-matching found a result, use it.
+    if exact_match or fuzzy_match:
+        return exact_match or fuzzy_match
+
+    # No title match — try WM_MDIGETACTIVE (works for investment accounts
+    # whose QWMDI has an empty title that can't be matched).
+    mdi_client: list[int] = []
+
+    def _find_mdiclient(h: int, _: int) -> bool:
+        cls = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(h, cls, 64)
+        if cls.value == "MDIClient":
+            mdi_client.append(h)
+            return False
+        return True
+
+    user32.EnumChildWindows(root_hwnd, WNDENUMPROC(_find_mdiclient), 0)
+    if mdi_client:
+        active_h = _send_msg_timeout(
+            mdi_client[0], WM_MDIGETACTIVE, 0, 0, timeout_ms=1500)
+        if active_h and user32.IsWindow(active_h):
+            cls = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(active_h, cls, 64)
+            if cls.value.upper() == "QWMDI" and user32.IsWindowVisible(active_h):
+                return active_h
+
+    # Final fallback: largest visible QWMDI
+    return best_match
 
 
 def _find_txlist_hwnd(root_hwnd: int) -> int | None:
@@ -3673,6 +3803,14 @@ def set_register_filter(bridge: Any, text: str) -> dict[str, Any]:
     parent = user32.GetParent(filter_h)
     user32.PostMessageW(parent, WM_COMMAND, (EN_CHANGE << 16) | ctrl_id, filter_h)
     time.sleep(0.4)
+
+    # Verify Quicken didn't silently switch accounts (a known side-effect
+    # of triggering EN_CHANGE on some filter controls).
+    post_mdi = _find_active_mdi(root_hwnd)
+    if post_mdi and post_mdi != mdi_h:
+        user32.BringWindowToTop(mdi_h)
+        user32.SetFocus(mdi_h)
+        time.sleep(0.2)
 
     # Read updated count
     count_static = next(
