@@ -302,15 +302,17 @@ def _combo_get_items(hwnd: int) -> list[str]:
     CB_GETLBTEXT = 0x0148
     CB_GETLBTEXTLEN = 0x0149
 
-    count = _send_msg(hwnd, CB_GETCOUNT, 0, 0)
+    count = _send_msg_timeout(hwnd, CB_GETCOUNT, 0, 0, timeout_ms=1500) or 0
     out: list[str] = []
     for i in range(min(count, 500)):
-        tlen = _send_msg(hwnd, CB_GETLBTEXTLEN, i, 0)
-        if tlen <= 0:
+        tlen = _send_msg_timeout(hwnd, CB_GETLBTEXTLEN, i, 0,
+                                 timeout_ms=1500)
+        if not tlen or tlen <= 0:
             out.append("")
             continue
         buf = ctypes.create_unicode_buffer(tlen + 1)
-        _send_msg(hwnd, CB_GETLBTEXT, i, ctypes.addressof(buf))
+        _send_msg_timeout(hwnd, CB_GETLBTEXT, i, ctypes.addressof(buf),
+                          timeout_ms=1500)
         out.append(buf.value)
     return out
 
@@ -323,14 +325,15 @@ def _combo_cur_text(hwnd: int) -> str:
     CB_GETLBTEXT = 0x0148
     CB_GETLBTEXTLEN = 0x0149
 
-    idx = _send_msg(hwnd, CB_GETCURSEL, 0, 0)
-    if idx < 0:
+    idx = _send_msg_timeout(hwnd, CB_GETCURSEL, 0, 0, timeout_ms=1500)
+    if idx is None or idx < 0:
         return ""
-    tl = _send_msg(hwnd, CB_GETLBTEXTLEN, idx, 0)
-    if tl <= 0:
+    tl = _send_msg_timeout(hwnd, CB_GETLBTEXTLEN, idx, 0, timeout_ms=1500)
+    if not tl or tl <= 0:
         return ""
     buf = ctypes.create_unicode_buffer(tl + 1)
-    _send_msg(hwnd, CB_GETLBTEXT, idx, ctypes.addressof(buf))
+    _send_msg_timeout(hwnd, CB_GETLBTEXT, idx, ctypes.addressof(buf),
+                      timeout_ms=1500)
     return buf.value
 
 
@@ -1813,7 +1816,10 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
                     # Record pre-click account (already navigated there)
                     if (pre.lower() not in SECTION_NAMES
                             and pre not in accounts):
-                        accounts[pre] = {"name": pre, "section": ""}
+                        accounts[pre] = {"name": pre, "section": "",
+                                         "nav_lb": lb_h, "nav_item": i,
+                                         "nav_scroll": actual_pos,
+                                         "nav_y": pt.y, "nav_sx": pt.x}
 
                     _clicked.add((lb_h, i))
                     _t_click = _time.monotonic()
@@ -1940,7 +1946,12 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
                         if (new_name and new_name != pre
                                 and new_name.lower() not in SECTION_NAMES
                                 and new_name not in accounts):
-                            accounts[new_name] = {"name": new_name, "section": ""}
+                            accounts[new_name] = {
+                                "name": new_name, "section": "",
+                                "nav_lb": lb_h, "nav_item": i,
+                                "nav_scroll": actual_pos,
+                                "nav_y": pt.y, "nav_sx": pt.x,
+                            }
                             _consec_dups[lb_h] = 0
                             if _SIDEBAR_DEBUG:
                                 print(f"  [recovery] captured new account: "
@@ -2087,7 +2098,8 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
                             continue
                         if (pre.lower() not in SECTION_NAMES
                                 and pre not in accounts):
-                            accounts[pre] = {"name": pre, "section": ""}
+                            accounts[pre] = {"name": pre, "section": "",
+                                             "nav_lb": lb_h, "nav_item": i}
                         _clicked.add((lb_h, i))
                         _t_click = _time.monotonic()
                         _dblclick(pt.x, pt.y)
@@ -2100,7 +2112,8 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
                         if navigated:
                             if (post.lower() not in SECTION_NAMES
                                     and post not in accounts):
-                                accounts[post] = {"name": post, "section": ""}
+                                accounts[post] = {"name": post, "section": "",
+                                                  "nav_lb": lb_h, "nav_item": i}
                                 _found_new_in_wheel = True
                             _consec_dups[lb_h] = 0
                         elif sidebar_still_up:
@@ -2119,7 +2132,9 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
                                     and new_name.lower() not in SECTION_NAMES
                                     and new_name not in accounts):
                                 accounts[new_name] = {"name": new_name,
-                                                      "section": ""}
+                                                      "section": "",
+                                                      "nav_lb": lb_h,
+                                                      "nav_item": i}
                                 _found_new_in_wheel = True
                                 _consec_dups[lb_h] = 0
                             elif new_name and new_name != pre:
@@ -2401,11 +2416,12 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
                 break
             _mdi = user32.GetParent(_mdi)
 
-        _send_msg(combo_h, CB_SETCURSEL, idx, 0)
+        _send_msg_timeout(combo_h, CB_SETCURSEL, idx, 0, timeout_ms=2000)
         parent = user32.GetParent(combo_h)
         ctrl_id = user32.GetDlgCtrlID(combo_h)
         wparam = (CBN_SELCHANGE << 16) | (ctrl_id & 0xFFFF)
-        _send_msg(parent, WM_COMMAND, wparam, combo_h)
+        _send_msg_timeout(parent, WM_COMMAND, wparam, combo_h,
+                          timeout_ms=2000)
         time.sleep(0.8)
 
         # Dismiss any modal that may have popped (e.g. Securities Mismatch)
@@ -2446,6 +2462,41 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
         holder = _find_sidebar_holder(root_hwnd)
         if not holder or not _is_valid_hwnd(holder):
             return None
+
+        # Ensure sidebar is visible (may be hidden after investment nav)
+        if not user32.IsWindowVisible(holder):
+            BM_CLICK = 0x00F5
+            _acls = ctypes.create_unicode_buffer(64)
+            _atxt = ctypes.create_unicode_buffer(256)
+            _abtn = 0
+            def _find_abtn(ch: int, _: int) -> bool:
+                nonlocal _abtn
+                user32.GetClassNameW(ch, _acls, 64)
+                if _acls.value != "QC_button":
+                    return True
+                user32.GetWindowTextW(ch, _atxt, 256)
+                if _atxt.value.upper() == "ACCOUNTS":
+                    _abtn = ch
+                    return False
+                return True
+            _EnumCB_nav = ctypes.WINFUNCTYPE(
+                ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+            user32.EnumChildWindows(
+                root_hwnd, _EnumCB_nav(_find_abtn), 0)
+            if _abtn:
+                user32.SetForegroundWindow(root_hwnd)
+                _dismiss_modal_dialogs(root_hwnd)
+                user32.PostMessageW(_abtn, BM_CLICK, 0, 0)
+                for _poll in range(80):
+                    time.sleep(0.25)
+                    if user32.IsWindow(holder) and user32.IsWindowVisible(holder):
+                        break
+                    h2 = _find_sidebar_holder(root_hwnd)
+                    if h2 and user32.IsWindowVisible(h2):
+                        holder = h2
+                        break
+                else:
+                    return None  # sidebar unrecoverable
 
         _expand_sidebar_sections(holder)
         _dismiss_modal_dialogs(root_hwnd)
@@ -2528,28 +2579,52 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
 
         # --- Fast path: try the cached click position ---
         cached = _sidebar_lookup(target_name) if _sidebar_cache else None
-        if cached and "nav_scroll" in cached:
+        if cached and "nav_lb" in cached:
             user32.SetForegroundWindow(root_hwnd)
-            _scroll_to(cached["nav_scroll"])
-            _dismiss_modal_dialogs(root_hwnd)
+            nav_lb = cached["nav_lb"]
+            nav_item = cached["nav_item"]
+            LB_GETITEMRECT_FP = 0x0198
 
-            # Click at the stored position and nearby offsets
-            sx_ = cached.get("nav_sx", 0)
-            nav_y = cached["nav_y"]
-            hr = wt.RECT()
-            user32.GetWindowRect(holder, ctypes.byref(hr))
-            if not sx_:
-                sx_ = (hr.left + hr.right) // 2
+            # Use LB_GETITEMRECT for current position (more reliable than
+            # cached screen coords which shift on scroll/resize).
+            if user32.IsWindow(nav_lb):
+                ir_fp = wt.RECT()
+                ret_fp = _send_msg_timeout(
+                    nav_lb, LB_GETITEMRECT_FP, nav_item,
+                    ctypes.addressof(ir_fp), timeout_ms=1000)
+                if ret_fp and (ir_fp.bottom - ir_fp.top) > 5:
+                    pt_fp = wt.POINT((ir_fp.left + ir_fp.right) // 2,
+                                     (ir_fp.top + ir_fp.bottom) // 2)
+                    user32.ClientToScreen(nav_lb, ctypes.byref(pt_fp))
+                    hr_fp = wt.RECT()
+                    user32.GetWindowRect(holder, ctypes.byref(hr_fp))
+                    if hr_fp.top <= pt_fp.y <= hr_fp.bottom:
+                        _dismiss_modal_dialogs(root_hwnd)
+                        _dblclick(pt_fp.x, pt_fp.y)
+                        match = _check_match()
+                        if match:
+                            return {"ok": True, "account": match,
+                                    "method": "sidebar_cached_lb"}
 
-            for y_off in [0, -20, 20, -40, 40]:
-                y_ = nav_y + y_off
-                if y_ < hr.top or y_ > hr.bottom:
-                    continue
-                _dblclick(sx_, y_)
-                match = _check_match()
-                if match:
-                    return {"ok": True, "account": match,
-                            "method": "sidebar_cached"}
+            # Fallback: scroll to cached position and click at stored coords
+            if "nav_scroll" in cached:
+                _scroll_to(cached["nav_scroll"])
+                _dismiss_modal_dialogs(root_hwnd)
+                sx_ = cached.get("nav_sx", 0)
+                nav_y = cached["nav_y"]
+                hr = wt.RECT()
+                user32.GetWindowRect(holder, ctypes.byref(hr))
+                if not sx_:
+                    sx_ = (hr.left + hr.right) // 2
+                for y_off in [0, -20, 20, -40, 40]:
+                    y_ = nav_y + y_off
+                    if y_ < hr.top or y_ > hr.bottom:
+                        continue
+                    _dblclick(sx_, y_)
+                    match = _check_match()
+                    if match:
+                        return {"ok": True, "account": match,
+                                "method": "sidebar_cached"}
 
         # --- Slow path: per-item ListBox scan ---
         _expand_sidebar_sections(holder)
@@ -2668,6 +2743,55 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
                                         "account": post_bracket,
                                         "method": "sidebar_scan"}
 
+                        # Sidebar may hide after investment account click
+                        if not user32.IsWindowVisible(holder):
+                            # Restore sidebar for continued scanning
+                            BM_CLICK_NAV = 0x00F5
+                            _acls2 = ctypes.create_unicode_buffer(64)
+                            _atxt2 = ctypes.create_unicode_buffer(256)
+                            _abtn2 = 0
+                            def _find_abtn2(ch: int, _: int) -> bool:
+                                nonlocal _abtn2
+                                user32.GetClassNameW(ch, _acls2, 64)
+                                if _acls2.value != "QC_button":
+                                    return True
+                                user32.GetWindowTextW(ch, _atxt2, 256)
+                                if _atxt2.value.upper() == "ACCOUNTS":
+                                    _abtn2 = ch
+                                    return False
+                                return True
+                            user32.EnumChildWindows(
+                                root_hwnd, _nav_EnumCB(_find_abtn2), 0)
+                            if _abtn2:
+                                _dismiss_modal_dialogs(root_hwnd)
+                                user32.PostMessageW(
+                                    _abtn2, BM_CLICK_NAV, 0, 0)
+                                for _rp in range(80):
+                                    time.sleep(0.25)
+                                    if (user32.IsWindow(holder)
+                                            and user32.IsWindowVisible(holder)):
+                                        break
+                                    h3 = _find_sidebar_holder(root_hwnd)
+                                    if h3 and user32.IsWindowVisible(h3):
+                                        holder = h3
+                                        break
+                            # After recovery, re-read the bracket to see
+                            # if the investment account name appeared
+                            if not post_bracket:
+                                user32.GetWindowTextW(
+                                    root_hwnd, buf, 256)
+                                post_bracket = _bracket_name(buf.value)
+                                if post_bracket:
+                                    _sidebar_cache_add(
+                                        post_bracket, actual_pos,
+                                        pt.y, pt.x, lb_h, i)
+                                    if _acct_match(
+                                            post_bracket, target_name):
+                                        return {"ok": True,
+                                                "account": post_bracket,
+                                                "method": "sidebar_scan"}
+                            break  # break item loop — re-enumerate LBs
+
                 scroll_pos += step_size
 
         return None
@@ -2733,11 +2857,12 @@ def read_register_state(bridge: Any) -> dict[str, Any]:
     _dismiss_modal_dialogs(root_hwnd)
 
     def _read_text(h: int) -> str:
-        tlen = _send_msg(h, WM_GETTEXTLENGTH, 0, 0)
-        if tlen <= 0:
+        tlen = _send_msg_timeout(h, WM_GETTEXTLENGTH, 0, 0, timeout_ms=1500)
+        if not tlen or tlen <= 0:
             return ""
         buf = ctypes.create_unicode_buffer(tlen + 1)
-        _send_msg(h, WM_GETTEXT, len(buf), ctypes.addressof(buf))
+        _send_msg_timeout(h, WM_GETTEXT, len(buf), ctypes.addressof(buf),
+                          timeout_ms=1500)
         return buf.value
 
     # Find the active QWMDI and scope child enumeration to it.
@@ -2789,11 +2914,12 @@ def read_register_state(bridge: Any) -> dict[str, Any]:
         lb_h = next(
             (h for h, c, _ in mdi_children
              if c == "listbox" and user32.IsWindowVisible(h)
-             and _send_msg(h, 0x018B, 0, 0) > 0),
+             and (_send_msg_timeout(h, 0x018B, 0, 0, timeout_ms=1500) or 0) > 0),
             None,
         )
         if lb_h:
-            holdings_count = _send_msg(lb_h, 0x018B, 0, 0)  # LB_GETCOUNT
+            holdings_count = _send_msg_timeout(
+                lb_h, 0x018B, 0, 0, timeout_ms=1500) or 0
 
         # Collect header buttons that are geometrically inside this MDI
         mdi_rect = ctypes.wintypes.RECT()
@@ -3469,11 +3595,12 @@ def set_register_filter(bridge: Any, text: str) -> dict[str, Any]:
     _dismiss_modal_dialogs(root_hwnd)
 
     def _read_text(h: int) -> str:
-        tlen = _send_msg(h, WM_GETTEXTLENGTH, 0, 0)
-        if tlen <= 0:
+        tlen = _send_msg_timeout(h, WM_GETTEXTLENGTH, 0, 0, timeout_ms=1500)
+        if not tlen or tlen <= 0:
             return ""
         buf = ctypes.create_unicode_buffer(tlen + 1)
-        _send_msg(h, WM_GETTEXT, len(buf), ctypes.addressof(buf))
+        _send_msg_timeout(h, WM_GETTEXT, len(buf), ctypes.addressof(buf),
+                          timeout_ms=1500)
         return buf.value
 
     # Scope to the ACTIVE QWMDI to avoid silently switching accounts.
@@ -3526,7 +3653,8 @@ def set_register_filter(bridge: Any, text: str) -> dict[str, Any]:
 
     # Write text via WM_SETTEXT and trigger change notification
     buf = ctypes.create_unicode_buffer(text)
-    _send_msg(filter_h, WM_SETTEXT, 0, ctypes.addressof(buf))
+    _send_msg_timeout(filter_h, WM_SETTEXT, 0, ctypes.addressof(buf),
+                      timeout_ms=2000)
     # Post EN_CHANGE to parent so Quicken re-filters
     WM_COMMAND = 0x0111
     EN_CHANGE = 0x0300
@@ -3616,11 +3744,12 @@ def open_reconcile(
     root_hwnd = pm.attached.hwnd
 
     def _read_text(h: int) -> str:
-        tlen = _send_msg(h, WM_GETTEXTLENGTH, 0, 0)
-        if tlen <= 0:
+        tlen = _send_msg_timeout(h, WM_GETTEXTLENGTH, 0, 0, timeout_ms=1500)
+        if not tlen or tlen <= 0:
             return ""
         buf = ctypes.create_unicode_buffer(tlen + 1)
-        _send_msg(h, WM_GETTEXT, len(buf), ctypes.addressof(buf))
+        _send_msg_timeout(h, WM_GETTEXT, len(buf), ctypes.addressof(buf),
+                          timeout_ms=1500)
         return buf.value
 
     def _click_qc_button(h: int) -> None:
@@ -3631,8 +3760,8 @@ def open_reconcile(
         cy = (rc.bottom - rc.top) // 2
         lp = ctypes.c_long((cy << 16) | (cx & 0xFFFF)).value
         user32.SetFocus(h)
-        _send_msg(h, 0x0201, 1, lp)  # WM_LBUTTONDOWN
-        _send_msg(h, 0x0202, 0, lp)  # WM_LBUTTONUP
+        _send_msg_timeout(h, 0x0201, 1, lp, timeout_ms=2000)
+        _send_msg_timeout(h, 0x0202, 0, lp, timeout_ms=2000)
 
     def _wait_for_dialog(title_substr: str, timeout: float) -> int | None:
         """Poll until a top-level dialog with matching title appears."""
@@ -3741,12 +3870,14 @@ def open_reconcile(
     if combo_h is None:
         raise UIAError("Account combo not found in reconcile dialog.", code="ELEMENT_NOT_FOUND")
 
-    count = _send_msg(combo_h, CB_GETCOUNT, 0, 0)
+    count = _send_msg_timeout(combo_h, CB_GETCOUNT, 0, 0, timeout_ms=1500) or 0
     target_idx: int | None = None
     for i in range(count):
-        tlen = _send_msg(combo_h, CB_GETLBTEXTLEN, i, 0)
+        tlen = _send_msg_timeout(combo_h, CB_GETLBTEXTLEN, i, 0,
+                                 timeout_ms=1500) or 0
         tbuf = ctypes.create_unicode_buffer(tlen + 2)
-        _send_msg(combo_h, CB_GETLBTEXT, i, ctypes.addressof(tbuf))
+        _send_msg_timeout(combo_h, CB_GETLBTEXT, i, ctypes.addressof(tbuf),
+                          timeout_ms=1500)
         if tbuf.value.strip().lower() == account_name.strip().lower():
             target_idx = i
             break
@@ -3760,7 +3891,7 @@ def open_reconcile(
             code="ACCOUNT_NOT_FOUND",
         )
 
-    _send_msg(combo_h, CB_SETCURSEL, target_idx, 0)
+    _send_msg_timeout(combo_h, CB_SETCURSEL, target_idx, 0, timeout_ms=1500)
 
     # Click OK.
     ok_h = next((h for h, c, t in children if c == "qc_button" and t == "OK"), None)
@@ -3789,7 +3920,8 @@ def open_reconcile(
             return
         user32.SetFocus(h)
         tbuf = ctypes.create_unicode_buffer(text)
-        _send_msg(h, WM_SETTEXT, 0, ctypes.addressof(tbuf))
+        _send_msg_timeout(h, WM_SETTEXT, 0, ctypes.addressof(tbuf),
+                          timeout_ms=2000)
 
     _set_edit(edit_handles[0], statement_date)   # Ending statement date
     _set_edit(edit_handles[2], ending_balance)   # Ending balance
