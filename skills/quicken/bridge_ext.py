@@ -1851,42 +1851,34 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
     # ------------------------------------------------------------------
     # Phase 1: Check if there's already a QWMDI child showing this acct.
     # If so, bring it to front — no combo manipulation needed.
+    # Prefer exact title match over fuzzy to avoid "3 Duggan" vs
+    # "3 Duggan Loan" ambiguity.
     # ------------------------------------------------------------------
-    existing_mdi = None
-    existing_idx = -1
+    exact_mdi = None
+    fuzzy_mdi = None
+    fuzzy_mdi_len = 999999
 
     def _find_existing(h: int, _: int) -> bool:
-        nonlocal existing_mdi, existing_idx
+        nonlocal exact_mdi, fuzzy_mdi, fuzzy_mdi_len
         cls = ctypes.create_unicode_buffer(64)
         user32.GetClassNameW(h, cls, 64)
         if cls.value != "QWMDI" or not user32.IsWindowVisible(h):
             return True
-        # Match by QWMDI window title (works for account register tabs)
         mdi_title = ctypes.create_unicode_buffer(256)
         user32.GetWindowTextW(h, mdi_title, 256)
-        if _acct_match(mdi_title.value, account_name):
-            existing_mdi = h
-            return False
-        # Also check first visible QWComboBox in this MDI
-        def _check_combo(ch: int, _: int) -> bool:
-            nonlocal existing_mdi, existing_idx
-            cc = ctypes.create_unicode_buffer(64)
-            user32.GetClassNameW(ch, cc, 64)
-            if (cc.value.lower() == "qwcombobox"
-                    and user32.IsWindowVisible(ch)):
-                txt = _combo_cur_text(ch)
-                if _acct_match(txt, account_name):
-                    existing_mdi = h
-                    existing_idx = _send_msg(ch, CB_GETCURSEL, 0, 0)
-                    return False
-            return True
-        user32.EnumChildWindows(h, EnumCB(_check_combo), 0)
-        if existing_mdi:
-            return False
+        t = mdi_title.value.strip()
+        if t.lower() == account_name.lower():
+            exact_mdi = h
+            return False  # stop — exact match wins
+        if _acct_match(t, account_name):
+            if len(t) < fuzzy_mdi_len:
+                fuzzy_mdi = h
+                fuzzy_mdi_len = len(t)
         return True
 
     user32.EnumChildWindows(root_hwnd, EnumCB(_find_existing), 0)
 
+    existing_mdi = exact_mdi or fuzzy_mdi
     if existing_mdi:
         user32.BringWindowToTop(existing_mdi)
         user32.SetFocus(existing_mdi)
@@ -2465,6 +2457,12 @@ def _find_active_mdi(root_hwnd: int) -> int | None:
     The active one is identified by matching the bracketed account name in
     the root window title, e.g. ``[My Savings]``.  Falls back to the
     largest visible QWMDI if no bracket match is found.
+
+    Matching priority:
+    1. Exact case-insensitive match on QWMDI title vs bracket name.
+    2. Fuzzy match (shortest title wins — avoids "3 Duggan" vs
+       "3 Duggan Loan" ambiguity).
+    3. Largest visible QWMDI (no bracket in root title).
     """
     import ctypes  # noqa: PLC0415
     import ctypes.wintypes  # noqa: PLC0415
@@ -2477,18 +2475,20 @@ def _find_active_mdi(root_hwnd: int) -> int | None:
     user32.GetWindowTextW(root_hwnd, buf, 512)
     title = buf.value
     m = re.search(r"\[(.+?)\]\s*$", title)
-    target_name = m.group(1).lower().strip() if m else ""
+    target_name = m.group(1).strip() if m else ""
 
     best_match: int | None = None
     best_area: int = 0
-    name_match: int | None = None
+    exact_match: int | None = None
+    fuzzy_match: int | None = None
+    fuzzy_len: int = 999999
 
     WNDENUMPROC = ctypes.WINFUNCTYPE(
         ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
     )
 
     def _cb(h: int, _: int) -> bool:
-        nonlocal best_match, best_area, name_match
+        nonlocal best_match, best_area, exact_match, fuzzy_match, fuzzy_len
         cls = ctypes.create_unicode_buffer(64)
         user32.GetClassNameW(h, cls, 64)
         if cls.value.upper() != "QWMDI":
@@ -2501,15 +2501,22 @@ def _find_active_mdi(root_hwnd: int) -> int | None:
         user32.GetWindowRect(h, ctypes.byref(r))
         area = (r.right - r.left) * (r.bottom - r.top)
 
-        if target_name and _acct_match(mdi_title, target_name):
-            name_match = h
+        if target_name:
+            if mdi_title.lower() == target_name.lower():
+                exact_match = h
+            elif not exact_match and _acct_match(mdi_title, target_name):
+                # Among fuzzy matches, prefer the shortest title (most
+                # specific) to avoid "3 Duggan" picking "3 Duggan Loan".
+                if len(mdi_title) < fuzzy_len:
+                    fuzzy_match = h
+                    fuzzy_len = len(mdi_title)
         if area > best_area:
             best_area = area
             best_match = h
         return True
 
     user32.EnumChildWindows(root_hwnd, WNDENUMPROC(_cb), 0)
-    return name_match or best_match
+    return exact_match or fuzzy_match or best_match
 
 
 def _find_txlist_hwnd(root_hwnd: int) -> int | None:
