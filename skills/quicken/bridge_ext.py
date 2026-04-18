@@ -208,6 +208,11 @@ def _dismiss_modal_dialogs(root_hwnd: int, *, max_rounds: int = 3) -> bool:
         if not dismissed_this_round:
             break  # couldn't dismiss anything — stop looping
 
+    # Restore focus to the main application window after dismissal
+    if any_dismissed:
+        user32.SetForegroundWindow(root_hwnd)
+        _time.sleep(0.15)
+
     return any_dismissed
 
 
@@ -228,6 +233,46 @@ def _send_msg(hwnd: int, msg: int, wp: int, lp: int) -> int:
         _fn.restype = ctypes.wintypes.LPARAM
         _fn._typed = True  # type: ignore[attr-defined]
     return _fn(hwnd, msg, wp, lp)
+
+
+def _send_msg_timeout(
+    hwnd: int, msg: int, wp: int, lp: int, timeout_ms: int = 2000,
+) -> int | None:
+    """``SendMessageTimeoutW`` — returns result or *None* on timeout/hang.
+
+    Uses ``SMTO_ABORTIFHUNG | SMTO_BLOCK`` so we never wait longer than
+    *timeout_ms*.  Callers that touch Quicken's UI thread during modal-dialog
+    activity must use this instead of ``_send_msg`` to avoid deadlocking.
+    """
+    import ctypes  # noqa: PLC0415
+    import ctypes.wintypes  # noqa: PLC0415
+
+    _fn = ctypes.windll.user32.SendMessageTimeoutW
+    if not hasattr(_fn, "_typed"):
+        _fn.argtypes = [
+            ctypes.wintypes.HWND,   # hWnd
+            ctypes.wintypes.UINT,   # Msg
+            ctypes.wintypes.WPARAM, # wParam
+            ctypes.wintypes.LPARAM, # lParam
+            ctypes.wintypes.UINT,   # fuFlags
+            ctypes.wintypes.UINT,   # uTimeout
+            ctypes.POINTER(ctypes.wintypes.DWORD),  # lpdwResult
+        ]
+        _fn.restype = ctypes.wintypes.LPARAM
+        _fn._typed = True  # type: ignore[attr-defined]
+
+    SMTO_ABORTIFHUNG = 0x0002
+    SMTO_BLOCK = 0x0001
+    result = ctypes.wintypes.DWORD(0)
+    ok = _fn(
+        hwnd, msg, wp, lp,
+        SMTO_ABORTIFHUNG | SMTO_BLOCK,
+        timeout_ms,
+        ctypes.byref(result),
+    )
+    if not ok:
+        return None  # timeout or hung thread
+    return result.value
 
 
 def _post_msg(hwnd: int, msg: int, wp: int, lp: int) -> bool:
@@ -596,9 +641,10 @@ def _expand_sidebar_sections(holder: int) -> bool:
         if cls_name == "QWListViewer" and txt:
             def _check_lb(ch: int, __: int) -> bool:
                 if _get_class(ch) == "ListBox":
-                    cnt = SM(ch, 0x018B, 0, 0)  # LB_GETCOUNT
+                    cnt = _send_msg_timeout(ch, 0x018B, 0, 0,
+                                            timeout_ms=1500)
                     lb_vis = bool(user32.IsWindowVisible(ch))
-                    if cnt > 0 and not lb_vis:
+                    if cnt and cnt > 0 and not lb_vis:
                         section_state.setdefault(
                             txt, {"has_hidden_items": False, "visible_btns": []})
                         section_state[txt]["has_hidden_items"] = True
@@ -802,10 +848,12 @@ def _find_sidebar_accounts(root_hwnd: int) -> list[dict[str, Any]]:
         return si
 
     def _scroll_to(pos: int) -> None:
-        user32.SendMessageW(holder, WM_VSCROLL,
-                            (pos << 16) | SB_THUMBPOSITION, 0)
+        _send_msg_timeout(holder, WM_VSCROLL,
+                          (pos << 16) | SB_THUMBPOSITION, 0,
+                          timeout_ms=2000)
         _time.sleep(0.25)
-        user32.SendMessageW(holder, WM_VSCROLL, SB_ENDSCROLL, 0)
+        _send_msg_timeout(holder, WM_VSCROLL, SB_ENDSCROLL, 0,
+                          timeout_ms=2000)
         _time.sleep(0.1)
 
     orig_pos = _get_scroll_info().nPos
@@ -834,8 +882,8 @@ def _find_sidebar_accounts(root_hwnd: int) -> list[dict[str, Any]]:
         if _get_class(parent) != "QWListViewer":
             return True
         section = _get_text(parent)
-        count = SM(h, 0x018B, 0, 0)  # LB_GETCOUNT
-        if count <= 0:
+        count = _send_msg_timeout(h, 0x018B, 0, 0, timeout_ms=1500)
+        if not count or count <= 0:
             seen_lb_hwnds.add(h)
             return True
 
@@ -879,8 +927,8 @@ def _find_sidebar_accounts(root_hwnd: int) -> list[dict[str, Any]]:
             if _get_class(parent) != "QWListViewer":
                 return True
             section = _get_text(parent)
-            count = SM(h, 0x018B, 0, 0)
-            if count <= 0:
+            count = _send_msg_timeout(h, 0x018B, 0, 0, timeout_ms=1500)
+            if not count or count <= 0:
                 seen_lb_hwnds.add(h)
                 return True
             lb_rect = wt.RECT()
@@ -916,7 +964,10 @@ def _find_sidebar_accounts(root_hwnd: int) -> list[dict[str, Any]]:
         content_y = lb_info["content_y"]
         for i in range(min(count, 100)):
             ir = wt.RECT()
-            SM(h, 0x0198, i, ctypes.addressof(ir))  # LB_GETITEMRECT
+            rc = _send_msg_timeout(
+                h, 0x0198, i, ctypes.addressof(ir), timeout_ms=1500)
+            if rc is None:
+                continue
             item_h = ir.bottom - ir.top
             if item_h <= 5:
                 continue  # separator
@@ -1024,9 +1075,9 @@ def _scroll_holder_for_lb(lb_hwnd: int) -> None:
     SB_THUMBPOSITION = 4
     SB_ENDSCROLL = 8
     wp = (new_pos << 16) | (SB_THUMBPOSITION & 0xFFFF)
-    user32.SendMessageW(holder, WM_VSCROLL, wp, 0)
+    _send_msg_timeout(holder, WM_VSCROLL, wp, 0, timeout_ms=2000)
     _time.sleep(0.05)
-    user32.SendMessageW(holder, WM_VSCROLL, SB_ENDSCROLL, 0)
+    _send_msg_timeout(holder, WM_VSCROLL, SB_ENDSCROLL, 0, timeout_ms=2000)
     _time.sleep(0.05)
 
 
@@ -1084,10 +1135,12 @@ def _scroll_holder_to_content_y(holder_hwnd: int, content_y_lb: int) -> None:
     WM_VSCROLL = 0x0115
     SB_THUMBPOSITION = 4
     SB_ENDSCROLL = 8
-    user32.SendMessageW(holder_hwnd, WM_VSCROLL,
-                        (target_pos << 16) | SB_THUMBPOSITION, 0)
-    _time.sleep(0.25)  # wait for Quicken to show/reposition the ListBox
-    user32.SendMessageW(holder_hwnd, WM_VSCROLL, SB_ENDSCROLL, 0)
+    _send_msg_timeout(holder_hwnd, WM_VSCROLL,
+                      (target_pos << 16) | SB_THUMBPOSITION, 0,
+                      timeout_ms=2000)
+    _time.sleep(0.25)
+    _send_msg_timeout(holder_hwnd, WM_VSCROLL, SB_ENDSCROLL, 0,
+                      timeout_ms=2000)
     _time.sleep(0.1)
 
 
@@ -1453,9 +1506,12 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
         return si
 
     def _scroll_to(pos: int) -> None:
-        SM(_holder[0], WM_VSCROLL, (pos << 16) | SB_THUMBPOSITION, 0)
+        _send_msg_timeout(
+            _holder[0], WM_VSCROLL, (pos << 16) | SB_THUMBPOSITION, 0,
+            timeout_ms=2000)
         _time.sleep(0.20)
-        SM(_holder[0], WM_VSCROLL, SB_ENDSCROLL, 0)
+        _send_msg_timeout(
+            _holder[0], WM_VSCROLL, SB_ENDSCROLL, 0, timeout_ms=2000)
         _time.sleep(0.10)
 
     hr = wt.RECT()
@@ -1534,8 +1590,9 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
                 wr = wt.RECT()
                 user32.GetWindowRect(h, ctypes.byref(wr))
                 if wr.bottom - wr.top > 5:
-                    cnt = SM(h, LB_GETCOUNT, 0, 0)
-                    if cnt > 0:
+                    cnt = _send_msg_timeout(
+                        h, LB_GETCOUNT, 0, 0, timeout_ms=1500)
+                    if cnt and cnt > 0:
                         vis_lbs.append((h, cnt))
                 return True
 
@@ -1548,7 +1605,11 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
                     if _time.monotonic() >= deadline:
                         break
                     ir = wt.RECT()
-                    SM(lb_h, LB_GETITEMRECT, i, ctypes.addressof(ir))
+                    rc = _send_msg_timeout(
+                        lb_h, LB_GETITEMRECT, i, ctypes.addressof(ir),
+                        timeout_ms=1500)
+                    if rc is None:
+                        continue
                     item_h = ir.bottom - ir.top
                     if item_h < 10:
                         continue
@@ -1687,6 +1748,21 @@ _sidebar_cache: list[dict[str, Any]] = []
 
 # Resumable scan state for list_sidebar_accounts
 _scan_state: dict[str, Any] = {}
+
+
+def _sidebar_cache_add(name: str, scroll: int, y: int, sx: int,
+                       lb: int, item: int) -> None:
+    """Add or update an entry in the sidebar cache."""
+    for entry in _sidebar_cache:
+        if entry["name"].lower() == name.lower():
+            entry.update(nav_scroll=scroll, nav_y=y, nav_sx=sx,
+                         nav_lb=lb, nav_item=item)
+            return
+    _sidebar_cache.append({
+        "name": name, "section": "",
+        "nav_scroll": scroll, "nav_y": y, "nav_sx": sx,
+        "nav_lb": lb, "nav_item": item,
+    })
 
 
 def _sidebar_lookup(account_name: str) -> dict[str, Any] | None:
@@ -1916,10 +1992,12 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
 
         def _scroll_to(pos: int) -> None:
             if scrollbar_h:
-                user32.SendMessageW(scrollbar_h, SBM_SETPOS, pos, 1)
-            user32.SendMessageW(
+                _send_msg_timeout(scrollbar_h, SBM_SETPOS, pos, 1,
+                                  timeout_ms=2000)
+            _send_msg_timeout(
                 holder, WM_VSCROLL,
-                (pos << 16) | SB_THUMBPOSITION, scrollbar_h)
+                (pos << 16) | SB_THUMBPOSITION, scrollbar_h,
+                timeout_ms=2000)
             time.sleep(0.15)
 
         def _dblclick(sx_: int, y_: int) -> None:
@@ -1934,10 +2012,12 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
         buf = ctypes.create_unicode_buffer(256)
 
         def _check_match() -> str | None:
-            """Read title bracket, wait for blank, return if target matches.
+            """Read title bracket after a sidebar click.
 
             Dismisses modal dialogs (Securities Comparison Mismatch etc.)
-            that may appear during investment-account navigation.
+            and waits for blank titles to resolve (investment accounts).
+            Returns the bracket name if it matches the target, else None.
+            Also populates the sidebar cache with any discovered accounts.
             """
             _dismiss_modal_dialogs(root_hwnd)
             user32.GetWindowTextW(root_hwnd, buf, 256)
@@ -1996,7 +2076,7 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
         user32.GetWindowRect(holder, ctypes.byref(hr))
         viewport_h = hr.bottom - hr.top
         step_size = max(50, viewport_h // 3)
-        deadline = time.monotonic() + 90
+        deadline = time.monotonic() + 180
 
         _nav_EnumCB = ctypes.WINFUNCTYPE(
             ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
@@ -2028,8 +2108,9 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
                         wr = wt.RECT()
                         user32.GetWindowRect(h, ctypes.byref(wr))
                         if wr.bottom - wr.top > 5:
-                            cnt = user32.SendMessageW(h, LB_GETCOUNT, 0, 0)
-                            if cnt > 0:
+                            cnt = _send_msg_timeout(
+                                h, LB_GETCOUNT, 0, 0, timeout_ms=1500)
+                            if cnt and cnt > 0:
                                 vis_lbs.append((h, cnt))
                     return True
 
@@ -2043,9 +2124,11 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
                         if time.monotonic() >= deadline:
                             break
                         ir = wt.RECT()
-                        user32.SendMessageW(
+                        rc = _send_msg_timeout(
                             lb_h, LB_GETITEMRECT, i,
-                            ctypes.addressof(ir))
+                            ctypes.addressof(ir), timeout_ms=1500)
+                        if rc is None:
+                            continue  # timed out — skip item
                         if ir.bottom - ir.top < 10:
                             continue
                         pt = wt.POINT(
@@ -2054,18 +2137,45 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
                         user32.ClientToScreen(lb_h, ctypes.byref(pt))
                         if pt.y < htop or pt.y > hbot:
                             continue
+
+                        # Read bracket BEFORE clicking
+                        user32.GetWindowTextW(root_hwnd, buf, 256)
+                        pre_bracket = _bracket_name(buf.value)
+
                         _dblclick(pt.x, pt.y)
-                        match = _check_match()
-                        if match:
-                            return {"ok": True, "account": match,
-                                    "method": "sidebar_scan"}
+
+                        # Detect title change or blank (investment load)
+                        _dismiss_modal_dialogs(root_hwnd)
+                        user32.GetWindowTextW(root_hwnd, buf, 256)
+                        post_bracket = _bracket_name(buf.value)
+
+                        # If blank or changed, poll for final title
+                        if not post_bracket or post_bracket != pre_bracket:
+                            if not post_bracket:
+                                for _poll in range(8):  # up to ~4s
+                                    time.sleep(0.5)
+                                    _dismiss_modal_dialogs(root_hwnd)
+                                    user32.GetWindowTextW(
+                                        root_hwnd, buf, 256)
+                                    post_bracket = _bracket_name(buf.value)
+                                    if post_bracket:
+                                        break
+
+                        if post_bracket:
+                            # Cache every discovered account
+                            _sidebar_cache_add(post_bracket, actual_pos,
+                                               pt.y, pt.x, lb_h, i)
+                            if _acct_match(post_bracket, target_name):
+                                return {"ok": True,
+                                        "account": post_bracket,
+                                        "method": "sidebar_scan"}
 
                 scroll_pos += step_size
 
         return None
 
     # If the account is in the sidebar cache, we know it exists —
-    # try targeted sidebar navigation.
+    # try targeted sidebar navigation (fast path uses cached position).
     if _sidebar_cache:
         cached = _sidebar_lookup(account_name)
         if cached:
@@ -2074,16 +2184,10 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
                 return result
 
     # ------------------------------------------------------------------
-    # Phase 4: Full sidebar scan + targeted navigation.
-    # Runs when the cache is empty or account wasn't found in cache.
+    # Phase 4: Direct targeted sidebar navigation.
+    # Scrolls through the sidebar clicking items until the target opens.
+    # No pre-scan needed — _navigate_via_sidebar does its own scan.
     # ------------------------------------------------------------------
-    if not _sidebar_cache:
-        try:
-            list_sidebar_accounts(bridge, max_seconds=60)
-        except Exception:  # noqa: BLE001
-            pass
-
-    # Try targeted navigation regardless of cache state
     result = _navigate_via_sidebar(account_name)
     if result:
         return result
