@@ -2975,6 +2975,9 @@ def set_register_filter(bridge: Any, text: str) -> dict[str, Any]:
 
     root_hwnd = pm.attached.hwnd
 
+    # Dismiss any modal dialogs before interacting
+    _dismiss_modal_dialogs(root_hwnd)
+
     def _read_text(h: int) -> str:
         tlen = _send_msg(h, WM_GETTEXTLENGTH, 0, 0)
         if tlen <= 0:
@@ -2983,8 +2986,14 @@ def set_register_filter(bridge: Any, text: str) -> dict[str, Any]:
         _send_msg(h, WM_GETTEXT, len(buf), ctypes.addressof(buf))
         return buf.value
 
-    # Find TxList and its parent QWMDI
-    all_ctrls: list[tuple[int, str, str]] = []
+    # Scope to the ACTIVE QWMDI to avoid silently switching accounts.
+    # Previously enumerated all root children — picking a TxList from
+    # an inactive tab would shift focus to that account.
+    mdi_h = _find_active_mdi(root_hwnd)
+    if mdi_h is None:
+        raise UIAError("No active QWMDI found.", code="REGISTER_NOT_FOUND")
+
+    mdi_children: list[tuple[int, str, str]] = []
     EnumCB = ctypes.WINFUNCTYPE(
         ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
     )
@@ -2992,33 +3001,23 @@ def set_register_filter(bridge: Any, text: str) -> dict[str, Any]:
     def _cb(h: int, _: int) -> bool:
         cls_buf = ctypes.create_unicode_buffer(256)
         user32.GetClassNameW(h, cls_buf, 256)
-        all_ctrls.append((h, cls_buf.value.lower(), _read_text(h)))
+        mdi_children.append((h, cls_buf.value.lower(), _read_text(h)))
         return True
 
-    user32.EnumChildWindows(root_hwnd, EnumCB(_cb), 0)
+    user32.EnumChildWindows(mdi_h, EnumCB(_cb), 0)
 
     txlist_h = next(
-        (h for h, c, _ in all_ctrls if c == "qwclass_transactionlist"
+        (h for h, c, _ in mdi_children if c == "qwclass_transactionlist"
          and user32.IsWindowVisible(h)), None
     )
     if txlist_h is None:
-        raise UIAError("No visible TxList found.", code="REGISTER_NOT_FOUND")
+        raise UIAError("No visible TxList found in active MDI.",
+                        code="REGISTER_NOT_FOUND")
 
     txlist_rect = ctypes.wintypes.RECT()
     user32.GetWindowRect(txlist_h, ctypes.byref(txlist_rect))
 
-    mdi_h = user32.GetParent(txlist_h)
-    mdi_children: list[tuple[int, str, str]] = []
-
-    def _cb2(h: int, _: int) -> bool:
-        cls_buf2 = ctypes.create_unicode_buffer(256)
-        user32.GetClassNameW(h, cls_buf2, 256)
-        mdi_children.append((h, cls_buf2.value.lower(), _read_text(h)))
-        return True
-
-    user32.EnumChildWindows(mdi_h, EnumCB(_cb2), 0)
-
-    # Find filter Edit above TxList
+    # Find filter Edit above TxList (within the same MDI)
     filter_h: int | None = None
     for h, c, _ in mdi_children:
         if c != "edit" or not user32.IsWindowVisible(h):
