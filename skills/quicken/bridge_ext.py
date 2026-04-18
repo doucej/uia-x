@@ -2158,17 +2158,24 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
                         user32.GetWindowTextW(root_hwnd, buf, 256)
                         post_bracket = _bracket_name(buf.value)
 
-                        # If blank or changed, poll for final title
-                        if not post_bracket or post_bracket != pre_bracket:
-                            if not post_bracket:
-                                for _poll in range(8):  # up to ~4s
-                                    time.sleep(0.5)
-                                    _dismiss_modal_dialogs(root_hwnd)
-                                    user32.GetWindowTextW(
-                                        root_hwnd, buf, 256)
-                                    post_bracket = _bracket_name(buf.value)
-                                    if post_bracket:
-                                        break
+                        if not post_bracket:
+                            # Blank title — investment account loading
+                            for _poll in range(8):  # up to ~4s
+                                time.sleep(0.5)
+                                _dismiss_modal_dialogs(root_hwnd)
+                                user32.GetWindowTextW(
+                                    root_hwnd, buf, 256)
+                                post_bracket = _bracket_name(buf.value)
+                                if post_bracket:
+                                    break
+                        elif post_bracket == pre_bracket:
+                            # Slow-loading account — brief recheck
+                            time.sleep(0.5)
+                            _dismiss_modal_dialogs(root_hwnd)
+                            user32.GetWindowTextW(root_hwnd, buf, 256)
+                            recheck = _bracket_name(buf.value)
+                            if recheck and recheck != pre_bracket:
+                                post_bracket = recheck
 
                         if post_bracket:
                             # Cache every discovered account
@@ -2183,19 +2190,12 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
 
         return None
 
-    # If the account is in the sidebar cache, we know it exists —
-    # try targeted sidebar navigation (fast path uses cached position).
-    if _sidebar_cache:
-        cached = _sidebar_lookup(account_name)
-        if cached:
-            result = _navigate_via_sidebar(account_name)
-            if result:
-                return result
-
     # ------------------------------------------------------------------
     # Phase 4: Direct targeted sidebar navigation.
     # Scrolls through the sidebar clicking items until the target opens.
-    # No pre-scan needed — _navigate_via_sidebar does its own scan.
+    # If a sidebar cache exists and has a hit, the function's fast path
+    # tries the cached screen position first before falling back to a
+    # full ListBox sweep.
     # ------------------------------------------------------------------
     result = _navigate_via_sidebar(account_name)
     if result:
