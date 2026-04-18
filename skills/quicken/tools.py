@@ -208,7 +208,7 @@ def register(
     def list_sidebar_accounts_tool(
         api_key: str = "",
         resume: bool = False,
-        max_seconds: float = 180.0,
+        max_seconds: float = 360.0,
     ) -> dict[str, Any]:
         auth_err = check_auth(api_key)
         if auth_err:

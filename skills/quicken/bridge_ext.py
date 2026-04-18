@@ -677,14 +677,14 @@ def _expand_sidebar_sections(holder: int) -> bool:
         mid_x = (r.right - r.left) // 2
         mid_y = (r.bottom - r.top) // 2
         lparam = (mid_y << 16) | (mid_x & 0xFFFF)
-        user32.SendMessageW(btn, WM_LBUTTONDOWN, MK_LBUTTON, lparam)
+        user32.PostMessageW(btn, WM_LBUTTONDOWN, MK_LBUTTON, lparam)
         _time.sleep(0.05)
-        user32.SendMessageW(btn, WM_LBUTTONUP, 0, lparam)
-        _time.sleep(0.5)
+        user32.PostMessageW(btn, WM_LBUTTONUP, 0, lparam)
+        _time.sleep(0.2)
         expanded = True
 
     if expanded:
-        _time.sleep(0.2)
+        _time.sleep(0.15)
     return expanded
 
 
@@ -754,9 +754,9 @@ def _expand_single_section(lb_hwnd: int, holder: int) -> bool:
     WM_LBUTTONDOWN = 0x0201
     WM_LBUTTONUP = 0x0202
     MK_LBUTTON = 0x0001
-    user32.SendMessageW(best_btn, WM_LBUTTONDOWN, MK_LBUTTON, lparam)
+    user32.PostMessageW(best_btn, WM_LBUTTONDOWN, MK_LBUTTON, lparam)
     _time.sleep(0.05)
-    user32.SendMessageW(best_btn, WM_LBUTTONUP, 0, lparam)
+    user32.PostMessageW(best_btn, WM_LBUTTONUP, 0, lparam)
     _time.sleep(0.3)
     return True
 
@@ -793,22 +793,37 @@ def _find_sidebar_accounts(root_hwnd: int) -> list[dict[str, Any]]:
     EnumCB = ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
 
     holder = _find_sidebar_holder(root_hwnd)
-    if not holder:
-        return []
-
-    # Ensure the sidebar is visible (investment views may hide it)
-    if not user32.IsWindowVisible(holder):
-        SW_SHOW = 5
-        h = holder
-        chain = []
-        while h and h != root_hwnd:
-            chain.append(h)
-            h = user32.GetParent(h)
-        for h in reversed(chain):
-            if not user32.IsWindowVisible(h):
-                user32.ShowWindow(h, SW_SHOW)
-        _time.sleep(0.2)
-        if not user32.IsWindowVisible(holder):
+    if not holder or not user32.IsWindowVisible(holder):
+        # Sidebar hidden — click the ACCOUNTS toolbar button to restore it
+        acct_cls = ctypes.create_unicode_buffer(64)
+        acct_txt = ctypes.create_unicode_buffer(256)
+        acct_btn: int = 0
+        def _find_acct_btn_old(ch: int, _: int) -> bool:
+            nonlocal acct_btn
+            user32.GetClassNameW(ch, acct_cls, 64)
+            if acct_cls.value != "QC_button":
+                return True
+            if not user32.IsWindowVisible(ch):
+                return True
+            user32.GetWindowTextW(ch, acct_txt, 256)
+            if acct_txt.value.upper() == "ACCOUNTS":
+                acct_btn = ch
+                return False
+            return True
+        user32.EnumChildWindows(root_hwnd, EnumCB(_find_acct_btn_old), 0)
+        if acct_btn:
+            wr = wt.RECT()
+            user32.GetWindowRect(acct_btn, ctypes.byref(wr))
+            mx = (wr.left + wr.right) // 2
+            my = (wr.top + wr.bottom) // 2
+            user32.SetForegroundWindow(root_hwnd)
+            user32.SetCursorPos(mx, my)
+            _time.sleep(0.05)
+            user32.mouse_event(0x0002, 0, 0, 0, 0)
+            user32.mouse_event(0x0004, 0, 0, 0, 0)
+            _time.sleep(0.8)
+        holder = _find_sidebar_holder(root_hwnd)
+        if not holder or not user32.IsWindowVisible(holder):
             return []
 
     user32.SetForegroundWindow(root_hwnd)
@@ -1443,6 +1458,7 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
     EnumCB = ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
 
     _holder = [_find_sidebar_holder(root_hwnd)]
+    _acct_btn = [0]  # cached ACCOUNTS button handle
     if not _holder[0]:
         return []
 
@@ -1450,20 +1466,109 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
         h = _holder[0]
         if not h or not user32.IsWindow(h) or not user32.IsWindowVisible(h):
             h = _find_sidebar_holder(root_hwnd)
-            if not h:
-                return False
-            _holder[0] = h
-        if not user32.IsWindowVisible(h):
-            chain: list[int] = []
-            p = h
-            while p and p != root_hwnd:
-                chain.append(p)
-                p = user32.GetParent(p)
-            for p in reversed(chain):
-                if not user32.IsWindowVisible(p):
-                    user32.ShowWindow(p, 5)
-            _time.sleep(0.2)
-        return user32.IsWindowVisible(_holder[0]) != 0
+            if h:
+                _holder[0] = h
+        if h and user32.IsWindowVisible(h):
+            return True
+        if _SIDEBAR_DEBUG:
+            print(f"  [ensure_vis] holder={_holder[0]:#x} "
+                  f"IsWindow={user32.IsWindow(_holder[0])} "
+                  f"IsVisible={user32.IsWindowVisible(_holder[0])}",
+                  flush=True, file=sys.stderr)
+        # Sidebar hidden — find the "ACCOUNTS" toolbar button and toggle it.
+        # PostMessageW is used because the button hides alongside the sidebar
+        # and SendMessage to invisible windows can stall.
+        BM_CLICK = 0x00F5
+
+        # Use cached ACCOUNTS button handle — only search if cache is invalid
+        acct_btn = _acct_btn[0]
+        if not acct_btn or not user32.IsWindow(acct_btn):
+            acct_cls = ctypes.create_unicode_buffer(64)
+            acct_txt = ctypes.create_unicode_buffer(256)
+            acct_btn = 0
+            def _find_acct_btn(ch: int, _: int) -> bool:
+                nonlocal acct_btn
+                user32.GetClassNameW(ch, acct_cls, 64)
+                if acct_cls.value != "QC_button":
+                    return True
+                user32.GetWindowTextW(ch, acct_txt, 256)
+                if acct_txt.value.upper() == "ACCOUNTS":
+                    acct_btn = ch
+                    return False
+                return True
+            user32.EnumChildWindows(root_hwnd, EnumCB(_find_acct_btn), 0)
+            _acct_btn[0] = acct_btn
+
+        if acct_btn:
+            user32.SetForegroundWindow(root_hwnd)
+            # Phase 1: Dismiss modals, send BM_CLICK, poll up to 20s.
+            # Investment accounts can take 15-20s to process; banking
+            # accounts complete in 3-5s.  The poll exits early on success.
+            _dismiss_modal_dialogs(root_hwnd)
+            if _SIDEBAR_DEBUG:
+                print(f"  [ensure_vis] BM_CLICK phase1 btn={acct_btn:#x}",
+                      flush=True, file=sys.stderr)
+            user32.PostMessageW(acct_btn, BM_CLICK, 0, 0)
+            cached_h = _holder[0]
+            for _poll in range(80):  # 80 × 0.25s = 20s max
+                _time.sleep(0.25)
+                # Fast check: just test visibility of cached handle
+                if cached_h and user32.IsWindow(cached_h) and user32.IsWindowVisible(cached_h):
+                    if _SIDEBAR_DEBUG:
+                        print(f"  [ensure_vis] restored phase1, "
+                              f"{(_poll+1)*0.25:.2f}s",
+                              flush=True, file=sys.stderr)
+                    return True
+                # Handle invalidated — re-find (rare)
+                if not cached_h or not user32.IsWindow(cached_h):
+                    h = _find_sidebar_holder(root_hwnd)
+                    if h:
+                        _holder[0] = h
+                        cached_h = h
+                        if user32.IsWindowVisible(h):
+                            if _SIDEBAR_DEBUG:
+                                print(f"  [ensure_vis] restored phase1 (re-find), "
+                                      f"{(_poll+1)*0.25:.2f}s",
+                                      flush=True, file=sys.stderr)
+                            return True
+            # Phase 2: Modal might have appeared during wait; dismiss + retry.
+            if _dismiss_modal_dialogs(root_hwnd):
+                if _SIDEBAR_DEBUG:
+                    print("  [ensure_vis] dismissed modal, BM_CLICK phase2",
+                          flush=True, file=sys.stderr)
+                user32.PostMessageW(acct_btn, BM_CLICK, 0, 0)
+                for _poll in range(12):
+                    _time.sleep(0.25)
+                    if cached_h and user32.IsWindow(cached_h) and user32.IsWindowVisible(cached_h):
+                        if _SIDEBAR_DEBUG:
+                            print(f"  [ensure_vis] restored phase2, "
+                                  f"{(_poll+1)*0.25:.2f}s",
+                                  flush=True, file=sys.stderr)
+                        return True
+                    if not cached_h or not user32.IsWindow(cached_h):
+                        h = _find_sidebar_holder(root_hwnd)
+                        if h:
+                            _holder[0] = h
+                            cached_h = h
+                            if user32.IsWindowVisible(h):
+                                if _SIDEBAR_DEBUG:
+                                    print(f"  [ensure_vis] restored phase2 (re-find), "
+                                          f"{(_poll+1)*0.25:.2f}s",
+                                          flush=True, file=sys.stderr)
+                                return True
+            if _SIDEBAR_DEBUG:
+                h2 = _find_sidebar_holder(root_hwnd)
+                v2 = user32.IsWindowVisible(h2) if h2 else -1
+                print(f"  [ensure_vis] FAILED: holder={h2:#x} vis={v2}",
+                      flush=True, file=sys.stderr)
+            h = _find_sidebar_holder(root_hwnd)
+            if h:
+                _holder[0] = h
+        else:
+            if _SIDEBAR_DEBUG:
+                print("  [ensure_vis] NO ACCOUNTS btn found!",
+                      flush=True, file=sys.stderr)
+        return bool(h) and user32.IsWindowVisible(h) != 0
 
     if not _ensure_sidebar_visible():
         return []
@@ -1514,6 +1619,22 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
             _holder[0], WM_VSCROLL, SB_ENDSCROLL, 0, timeout_ms=2000)
         _time.sleep(0.10)
 
+    MOUSEEVENTF_WHEEL = 0x0800
+
+    def _wheel_scroll(clicks: int = 5) -> None:
+        """Scroll the sidebar down using mouse wheel events.
+
+        *clicks* wheel notches to scroll (positive = down)."""
+        user32.GetWindowRect(_holder[0], ctypes.byref(hr))
+        cx = (hr.left + hr.right) // 2
+        cy = (hr.top + hr.bottom) // 2
+        user32.SetCursorPos(cx, cy)
+        _time.sleep(0.05)
+        for _ in range(clicks):
+            user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, -120, 0)
+            _time.sleep(0.05)
+        _time.sleep(0.30)
+
     hr = wt.RECT()
     user32.GetWindowRect(holder, ctypes.byref(hr))
     viewport_h = hr.bottom - hr.top
@@ -1527,14 +1648,18 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
     }
 
     accounts: dict[str, dict[str, Any]] = {}
+    _invest_lbs: set[int] = set()  # ListBoxes in investment sections
+    _clicked: set[tuple[int, int]] = set()  # (lb_h, item_idx) already clicked
+    _consec_dups: dict[int, int] = {}  # lb_h -> consecutive non-navigating clicks
     deadline = _time.monotonic() + max_seconds
     buf = ctypes.create_unicode_buffer(256)
     total_clicks = 0
 
     def _dblclick(sx: int, sy: int) -> None:
+        """Double-click to navigate; single click only selects."""
         user32.SetCursorPos(sx, sy)
         _time.sleep(0.02)
-        for _ in range(2):
+        for _dc in range(2):
             user32.mouse_event(0x0002, 0, 0, 0, 0)
             user32.mouse_event(0x0004, 0, 0, 0, 0)
             _time.sleep(0.02)
@@ -1573,42 +1698,89 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
                   flush=True, file=sys.stderr)
 
         scroll_pos = 0
+        sidebar_restored = False
+        restore_budget = 30  # max sidebar restores per pass (invest items need many)
+        _last_scroll = -1   # track last scroll position to skip redundant work
+        _cached_lbs: list[tuple[int, int]] | None = None
+        _t_loop_top = _time.monotonic()
         while scroll_pos <= max_scroll + step and _time.monotonic() < deadline:
+            _t_iter_start = _time.monotonic()
+            if _SIDEBAR_DEBUG:
+                print(f"  [while-top] scroll_pos={scroll_pos} max_scroll={max_scroll} "
+                      f"step={step} holder_vis={user32.IsWindowVisible(_holder[0])} "
+                      f"dt_since_last={_t_iter_start - _t_loop_top:.2f}s",
+                      flush=True, file=sys.stderr)
+            _t_loop_top = _t_iter_start
             actual_pos = min(scroll_pos, max_scroll)
             user32.SetForegroundWindow(root_hwnd)
-            _scroll_to(actual_pos)
-            _dismiss_modal_dialogs(root_hwnd)
+            # Only scroll + enumerate LBs if scroll position changed
+            if actual_pos != _last_scroll:
+                _scroll_to(actual_pos)
+                _dismiss_modal_dialogs(root_hwnd)
+                _last_scroll = actual_pos
+                _cached_lbs = None  # invalidate cache on scroll change
             user32.GetWindowRect(holder, ctypes.byref(hr))
             htop, hbot = hr.top, hr.bottom
 
-            # Enumerate visible ListBoxes at this scroll position
-            vis_lbs: list[tuple[int, int]] = []
+            if _cached_lbs is not None:
+                vis_lbs = _cached_lbs
+            else:
+                # Enumerate visible ListBoxes at this scroll position
+                vis_lbs = []
 
-            def _enum_lb(h: int, _: int) -> bool:
-                if _cls(h) != "ListBox":
+                def _enum_lb(h: int, _: int) -> bool:
+                    if _cls(h) != "ListBox":
+                        return True
+                    wr = wt.RECT()
+                    user32.GetWindowRect(h, ctypes.byref(wr))
+                    if wr.bottom - wr.top > 5:
+                        cnt = _send_msg_timeout(
+                            h, LB_GETCOUNT, 0, 0, timeout_ms=1500)
+                        if cnt and cnt > 0:
+                            vis_lbs.append((h, cnt))
                     return True
-                wr = wt.RECT()
-                user32.GetWindowRect(h, ctypes.byref(wr))
-                if wr.bottom - wr.top > 5:
-                    cnt = _send_msg_timeout(
-                        h, LB_GETCOUNT, 0, 0, timeout_ms=1500)
-                    if cnt and cnt > 0:
-                        vis_lbs.append((h, cnt))
-                return True
 
-            user32.EnumChildWindows(holder, EnumCB(_enum_lb), 0)
+                user32.EnumChildWindows(holder, EnumCB(_enum_lb), 0)
+                _cached_lbs = vis_lbs
 
+            if _SIDEBAR_DEBUG:
+                print(f"  [pass {pass_num}] scroll={actual_pos}: "
+                      f"{len(vis_lbs)} LBs, htop={htop} hbot={hbot}",
+                      flush=True, file=sys.stderr)
+
+            # Track ListBoxes in investment sections (cause sidebar hide)
             for lb_h, count in vis_lbs:
                 if _time.monotonic() >= deadline:
                     break
+                if _consec_dups.get(lb_h, 0) >= 3:
+                    if _SIDEBAR_DEBUG:
+                        print(f"  [skip-lb] lb={lb_h:#x}: "
+                              f"{_consec_dups[lb_h]} consecutive dups, "
+                              f"skipping rest",
+                              flush=True, file=sys.stderr)
+                    continue
                 for i in range(min(count, 30)):
                     if _time.monotonic() >= deadline:
                         break
+                    if _consec_dups.get(lb_h, 0) >= 3:
+                        if _SIDEBAR_DEBUG:
+                            print(f"  [skip-lb] lb={lb_h:#x}: "
+                                  f"{_consec_dups[lb_h]} consecutive dups, "
+                                  f"skipping rest",
+                                  flush=True, file=sys.stderr)
+                        break
+                    if (lb_h, i) in _clicked:
+                        continue  # already clicked this item
+                    _t_item_start = _time.monotonic()
                     ir = wt.RECT()
                     rc = _send_msg_timeout(
                         lb_h, LB_GETITEMRECT, i, ctypes.addressof(ir),
                         timeout_ms=1500)
                     if rc is None:
+                        if _SIDEBAR_DEBUG:
+                            print(f"  [skip] lb={lb_h:#x} i={i}: "
+                                  f"GETITEMRECT=None dt={_time.monotonic()-_t_item_start:.2f}s",
+                                  flush=True, file=sys.stderr)
                         continue
                     item_h = ir.bottom - ir.top
                     if item_h < 10:
@@ -1618,15 +1790,24 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
                                   (ir.top + ir.bottom) // 2)
                     user32.ClientToScreen(lb_h, ctypes.byref(pt))
                     if pt.y < htop or pt.y > hbot:
+                        if _SIDEBAR_DEBUG:
+                            print(f"  [skip] lb={lb_h:#x} i={i}: "
+                                  f"y={pt.y} outside [{htop},{hbot}]",
+                                  flush=True, file=sys.stderr)
                         continue
 
                     pre = _read_bracket()
                     if not pre:
                         # Title blank — try brief wait + modal dismiss
-                        _time.sleep(1.0)
+                        _time.sleep(0.5)
                         _dismiss_modal_dialogs(root_hwnd)
                         pre = _read_bracket()
                     if not pre:
+                        if _SIDEBAR_DEBUG:
+                            user32.GetWindowTextW(root_hwnd, buf, 256)
+                            print(f"  [skip] lb={lb_h:#x} i={i}: "
+                                  f"empty pre, title={buf.value!r}",
+                                  flush=True, file=sys.stderr)
                         continue
 
                     # Record pre-click account (already navigated there)
@@ -1634,37 +1815,60 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
                             and pre not in accounts):
                         accounts[pre] = {"name": pre, "section": ""}
 
+                    _clicked.add((lb_h, i))
+                    _t_click = _time.monotonic()
                     _dblclick(pt.x, pt.y)
                     total_clicks += 1
 
                     # Dismiss modals after click — investment accounts
                     # can spawn Securities Comparison Mismatch dialogs.
                     _dismiss_modal_dialogs(root_hwnd)
+                    _t_post_modal = _time.monotonic()
+
+                    # --- Determine post-click account name ---------------
+                    sidebar_still_up = user32.IsWindowVisible(_holder[0])
 
                     post = _read_bracket()
                     if not post:
-                        # Investment account loading — brief wait + retry
-                        _time.sleep(2.0)
-                        _dismiss_modal_dialogs(root_hwnd)
-                        post = _read_bracket()
-                    elif post == pre:
-                        # Might be a slow-loading investment account whose
-                        # title hasn't updated yet.  Brief recheck.
+                        # Title blank (loading) — poll up to 2s
+                        for _w in range(4):
+                            _time.sleep(0.5)
+                            _dismiss_modal_dialogs(root_hwnd)
+                            post = _read_bracket()
+                            if post:
+                                break
+                    elif post == pre and sidebar_still_up:
+                        # Banking item: re-clicking current account (0.5s poll)
                         _time.sleep(0.5)
                         _dismiss_modal_dialogs(root_hwnd)
                         recheck = _read_bracket()
                         if recheck and recheck != pre:
                             post = recheck
+                    _t_post_read = _time.monotonic()
+
+                    # When sidebar hides (investment click), the title bar
+                    # keeps the PREVIOUS account name until after sidebar
+                    # recovery.  The real account name will appear as the
+                    # "pre" value in the next iteration.  No need to poll
+                    # here — just proceed to sidebar recovery.
 
                     navigated = post and post != pre
                     name = post or pre
+                    if navigated:
+                        _consec_dups[lb_h] = 0
+                    elif sidebar_still_up:
+                        # Banking account dup (sidebar didn't hide)
+                        _consec_dups[lb_h] = _consec_dups.get(lb_h, 0) + 1
 
                     if _SIDEBAR_DEBUG:
                         tag = "NAV" if navigated else "dup"
+                        vis = "vis" if sidebar_still_up else "HID"
                         print(f"  [pass {pass_num}] #{total_clicks} "
-                              f"{tag}: pre={pre!r} post={post!r} "
+                              f"{tag}({vis}): pre={pre!r} post={post!r} "
                               f"(scroll={actual_pos} lb={lb_h} "
-                              f"i={i} y={pt.y} h={ir.bottom-ir.top})",
+                              f"i={i} y={pt.y} h={ir.bottom-ir.top}) "
+                              f"dt_click={_t_post_modal - _t_click:.2f}s "
+                              f"dt_post={_t_post_read - _t_post_modal:.2f}s",
                               flush=True, file=sys.stderr)
 
                     if name and name.lower() not in SECTION_NAMES:
@@ -1677,13 +1881,276 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
                             accounts[name]["nav_lb"] = lb_h
                             accounts[name]["nav_item"] = i
 
+                    # Mid-scan sidebar recovery: Quicken briefly hides the
+                    # sidebar (and its toolbar) during account transitions.
+                    # Known invest LBs never self-recover — skip straight
+                    # to BM_CLICK.  Others get a brief 1s poll.
+                    if not user32.IsWindowVisible(_holder[0]):
+                        _sidebar_ok = False
+                        _t_recov_start = _time.monotonic()
+                        if lb_h not in _invest_lbs:
+                            # Quick self-recovery poll using cached handle
+                            _cached_h = _holder[0]
+                            for _wait_i in range(4):
+                                _time.sleep(0.25)
+                                if _cached_h and user32.IsWindow(_cached_h) and user32.IsWindowVisible(_cached_h):
+                                    _sidebar_ok = True
+                                    break
+                            if not _sidebar_ok:
+                                # Handle may have been destroyed — re-find
+                                _h = _find_sidebar_holder(root_hwnd)
+                                if _h and user32.IsWindowVisible(_h):
+                                    _holder[0] = _h
+                                    holder = _h
+                                    _sidebar_ok = True
+                                    break
+                        if not _sidebar_ok:
+                            _h = _find_sidebar_holder(root_hwnd)
+                            if _h:
+                                _holder[0] = _h
+                                holder = _h
+                    if not user32.IsWindowVisible(_holder[0]):
+                        # Sidebar persistently hidden (investment account).
+                        _invest_lbs.add(lb_h)
+                        if _SIDEBAR_DEBUG:
+                            print(f"  [pass {pass_num}] sidebar HIDDEN after "
+                                  f"click #{total_clicks} ({name!r}), "
+                                  f"lb={lb_h:#x} i={i} marked invest "
+                                  f"dt_selfrecov={_time.monotonic() - _t_recov_start:.2f}s",
+                                  flush=True, file=sys.stderr)
+                        _t_bm = _time.monotonic()
+                        if restore_budget <= 0 or not _ensure_sidebar_visible():
+                            break
+                        restore_budget -= 1
+                        holder = _holder[0]
+                        user32.GetWindowRect(holder, ctypes.byref(hr))
+                        htop, hbot = hr.top, hr.bottom
+                        # Post-recovery title stabilization: the account
+                        # loaded by the click may not appear in the title
+                        # bar until after sidebar recovery.  Wait up to 1s
+                        # for the title to change from `pre`.
+                        new_name = _read_bracket()
+                        if new_name == pre or not new_name:
+                            for _tw in range(2):
+                                _time.sleep(0.5)
+                                _dismiss_modal_dialogs(root_hwnd)
+                                new_name = _read_bracket()
+                                if new_name and new_name != pre:
+                                    break
+                        if (new_name and new_name != pre
+                                and new_name.lower() not in SECTION_NAMES
+                                and new_name not in accounts):
+                            accounts[new_name] = {"name": new_name, "section": ""}
+                            _consec_dups[lb_h] = 0
+                            if _SIDEBAR_DEBUG:
+                                print(f"  [recovery] captured new account: "
+                                      f"{new_name!r}",
+                                      flush=True, file=sys.stderr)
+                        elif new_name and new_name != pre:
+                            _consec_dups[lb_h] = 0  # navigated to known account
+                        else:
+                            _consec_dups[lb_h] = _consec_dups.get(lb_h, 0) + 1
+                        if _SIDEBAR_DEBUG:
+                            print(f"  [recovery] BM_CLICK took "
+                                  f"{_time.monotonic() - _t_bm:.2f}s "
+                                  f"title={new_name!r}",
+                                  flush=True, file=sys.stderr)
+                        sidebar_restored = True
+                        break  # break item loop; re-enumerate LBs
+                else:
+                    continue  # item loop finished normally
+                break  # item loop broken — break LB loop too
+
             if _SIDEBAR_DEBUG:
                 print(f"  [pass {pass_num}] scroll={actual_pos} done, "
-                      f"accounts={len(accounts)}",
+                      f"accounts={len(accounts)} restored={sidebar_restored}",
                       flush=True, file=sys.stderr)
+
+            if sidebar_restored:
+                sidebar_restored = False
+                if _SIDEBAR_DEBUG:
+                    remaining = deadline - _time.monotonic()
+                    print(f"  [continue] scroll_pos={scroll_pos} "
+                          f"remaining={remaining:.1f}s",
+                          flush=True, file=sys.stderr)
+                continue  # re-do same scroll position
+
+            # If sidebar is hidden after a failed recovery, the BM_CLICK
+            # from the inner recovery is likely still being processed.
+            # DO NOT send another BM_CLICK (it would toggle sidebar OFF).
+            # Just poll for the pending BM_CLICK to take effect.
+            if not user32.IsWindowVisible(_holder[0]):
+                _poll_ok = False
+                _cached_h = _holder[0]
+                for _lp in range(32):  # poll up to 8s
+                    _time.sleep(0.25)
+                    if _cached_h and user32.IsWindow(_cached_h) and user32.IsWindowVisible(_cached_h):
+                        _poll_ok = True
+                        break
+                    if not _cached_h or not user32.IsWindow(_cached_h):
+                        _h = _find_sidebar_holder(root_hwnd)
+                        if _h:
+                            _holder[0] = _h
+                            _cached_h = _h
+                            if user32.IsWindowVisible(_h):
+                                _poll_ok = True
+                                break
+                if _poll_ok:
+                    holder = _holder[0]
+                    if _SIDEBAR_DEBUG:
+                        print(f"  [late-recover] poll succeeded after "
+                              f"{(_lp+1)*0.25:.2f}s, re-doing scroll={actual_pos}",
+                              flush=True, file=sys.stderr)
+                    continue  # re-do same scroll position with recovered sidebar
+                else:
+                    if _SIDEBAR_DEBUG:
+                        print(f"  [late-recover] poll FAILED after 8s, advancing scroll",
+                              flush=True, file=sys.stderr)
 
             scroll_pos += step
 
+        # --- Wheel-scroll extension ---
+        # When GetScrollInfo returns max_scroll=0 (Quicken's custom sidebar
+        # doesn't expose a standard scrollbar range), use mouse-wheel
+        # events to reach accounts below the fold.
+        if max_scroll == 0 and _time.monotonic() < deadline:
+            _wheel_passes = 0
+            _max_wheel_passes = 8  # 5 notches × 8 = 40 notches total
+            while _wheel_passes < _max_wheel_passes and _time.monotonic() < deadline:
+                _pre_wheel = len(accounts)
+                if not _ensure_sidebar_visible():
+                    break
+                holder = _holder[0]
+                _wheel_scroll(clicks=5)
+                _dismiss_modal_dialogs(root_hwnd)
+                _wheel_passes += 1
+                # Invalidate cached LBs since scroll changed
+                _cached_lbs = None
+                user32.GetWindowRect(holder, ctypes.byref(hr))
+                htop, hbot = hr.top, hr.bottom
+
+                # Re-enumerate visible ListBoxes
+                vis_lbs = []
+
+                def _enum_lb_wheel(h: int, _: int) -> bool:
+                    if _cls(h) != "ListBox":
+                        return True
+                    wr = wt.RECT()
+                    user32.GetWindowRect(h, ctypes.byref(wr))
+                    if wr.bottom - wr.top > 5:
+                        cnt = _send_msg_timeout(
+                            h, LB_GETCOUNT, 0, 0, timeout_ms=1500)
+                        if cnt and cnt > 0:
+                            vis_lbs.append((h, cnt))
+                    return True
+
+                user32.EnumChildWindows(holder, EnumCB(_enum_lb_wheel), 0)
+
+                if _SIDEBAR_DEBUG:
+                    print(f"  [wheel {_wheel_passes}] "
+                          f"{len(vis_lbs)} LBs, htop={htop} hbot={hbot}",
+                          flush=True, file=sys.stderr)
+
+                _found_new_in_wheel = False
+                for lb_h, count in vis_lbs:
+                    if _time.monotonic() >= deadline:
+                        break
+                    if _consec_dups.get(lb_h, 0) >= 3:
+                        continue
+                    for i in range(min(count, 30)):
+                        if _time.monotonic() >= deadline:
+                            break
+                        if _consec_dups.get(lb_h, 0) >= 3:
+                            break
+                        if (lb_h, i) in _clicked:
+                            continue
+                        ir = wt.RECT()
+                        rc = _send_msg_timeout(
+                            lb_h, LB_GETITEMRECT, i, ctypes.addressof(ir),
+                            timeout_ms=1500)
+                        if rc is None:
+                            continue
+                        item_h = ir.bottom - ir.top
+                        if item_h < 10:
+                            continue
+                        pt = wt.POINT((ir.left + ir.right) // 2,
+                                      (ir.top + ir.bottom) // 2)
+                        user32.ClientToScreen(lb_h, ctypes.byref(pt))
+                        if pt.y < htop or pt.y > hbot:
+                            continue
+                        pre = _read_bracket()
+                        if not pre:
+                            _time.sleep(0.5)
+                            _dismiss_modal_dialogs(root_hwnd)
+                            pre = _read_bracket()
+                        if not pre:
+                            continue
+                        if (pre.lower() not in SECTION_NAMES
+                                and pre not in accounts):
+                            accounts[pre] = {"name": pre, "section": ""}
+                        _clicked.add((lb_h, i))
+                        _t_click = _time.monotonic()
+                        _dblclick(pt.x, pt.y)
+                        total_clicks += 1
+                        _dismiss_modal_dialogs(root_hwnd)
+                        _time.sleep(0.30)
+                        post = _read_bracket()
+                        navigated = (post and post != pre)
+                        sidebar_still_up = user32.IsWindowVisible(_holder[0])
+                        if navigated:
+                            if (post.lower() not in SECTION_NAMES
+                                    and post not in accounts):
+                                accounts[post] = {"name": post, "section": ""}
+                                _found_new_in_wheel = True
+                            _consec_dups[lb_h] = 0
+                        elif sidebar_still_up:
+                            _consec_dups[lb_h] = _consec_dups.get(lb_h, 0) + 1
+                        if not sidebar_still_up:
+                            # Sidebar hidden — need recovery
+                            if _SIDEBAR_DEBUG:
+                                print(f"  [wheel {_wheel_passes}] "
+                                      f"sidebar hidden after click, recovering",
+                                      flush=True, file=sys.stderr)
+                            if not _ensure_sidebar_visible():
+                                break
+                            holder = _holder[0]
+                            new_name = _read_bracket()
+                            if (new_name and new_name != pre
+                                    and new_name.lower() not in SECTION_NAMES
+                                    and new_name not in accounts):
+                                accounts[new_name] = {"name": new_name,
+                                                      "section": ""}
+                                _found_new_in_wheel = True
+                                _consec_dups[lb_h] = 0
+                            elif new_name and new_name != pre:
+                                _consec_dups[lb_h] = 0
+                            else:
+                                _consec_dups[lb_h] = (
+                                    _consec_dups.get(lb_h, 0) + 1)
+                            # Re-scroll to same position
+                            _wheel_scroll(clicks=5 * _wheel_passes)
+                            _dismiss_modal_dialogs(root_hwnd)
+                            break  # break item loop, retry
+
+                if _SIDEBAR_DEBUG:
+                    _post_wheel = len(accounts)
+                    print(f"  [wheel {_wheel_passes}] "
+                          f"+{_post_wheel - _pre_wheel} accounts "
+                          f"(total {_post_wheel})",
+                          flush=True, file=sys.stderr)
+
+                # Stop wheel scrolling if no new items found in 2 passes
+                if _wheel_passes >= 2 and len(accounts) == _pre_wheel:
+                    if _SIDEBAR_DEBUG:
+                        print(f"  [wheel] no new accounts in pass "
+                              f"{_wheel_passes}, stopping wheel scan",
+                              flush=True, file=sys.stderr)
+                    break
+
+        if _SIDEBAR_DEBUG:
+            print(f"  [while-exit] scroll_pos={scroll_pos} "
+                  f"deadline_reached={_time.monotonic() >= deadline}",
+                  flush=True, file=sys.stderr)
         new_accounts = len(accounts) - accts_before
         if _SIDEBAR_DEBUG:
             print(f"  [pass {pass_num}] done: +{new_accounts} "
@@ -1697,6 +2164,29 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
         elapsed = max_seconds - (deadline - _time.monotonic())
         print(f"  [sweep] DONE: {len(accounts)} accounts, {total_clicks} clicks, "
               f"{elapsed:.1f}s",
+              flush=True, file=sys.stderr)
+
+    # Supplement with MDI tabs — investment accounts that are open as tabs
+    # but couldn't be discovered via sidebar clicking.
+    mdi_cls = ctypes.create_unicode_buffer(64)
+    mdi_txt = ctypes.create_unicode_buffer(256)
+
+    def _enum_mdi(h: int, _: int) -> bool:
+        user32.GetClassNameW(h, mdi_cls, 64)
+        if mdi_cls.value != "QWMDI":
+            return True
+        user32.GetWindowTextW(h, mdi_txt, 256)
+        name = mdi_txt.value.strip()
+        if name and name.lower() not in SECTION_NAMES and name != "Home":
+            if name not in accounts:
+                accounts[name] = {"name": name, "section": "",
+                                  "source": "mdi_tab"}
+        return True
+
+    user32.EnumChildWindows(root_hwnd, EnumCB(_enum_mdi), 0)
+
+    if _SIDEBAR_DEBUG:
+        print(f"  [sweep] after MDI supplement: {len(accounts)} accounts",
               flush=True, file=sys.stderr)
 
     return list(accounts.values())
