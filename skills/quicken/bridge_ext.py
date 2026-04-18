@@ -53,81 +53,162 @@ def _acct_match(candidate: str, query: str) -> bool:
     return False
 
 
-def _dismiss_modal_dialogs(root_hwnd: int) -> bool:
+def _dismiss_modal_dialogs(root_hwnd: int, *, max_rounds: int = 3) -> bool:
     """Find and dismiss any modal dialogs owned by the Quicken window.
 
     Looks for top-level ``QWinDlg``, ``QWinPopup``, or ``#32770`` windows
     owned by *root_hwnd* and sends them a dismiss command.
 
-    Strategy:
-      1. Click a visible dismiss button (Done, Close, OK, Cancel, Yes, …)
-      2. If no button found, send ``WM_CLOSE`` as fallback.
+    Strategy per dialog:
+      1. Find a visible child with dismiss-like text.
+      2. Click it via physical ``mouse_event`` (``SetForegroundWindow`` +
+         ``SetCursorPos`` + left-click).  This is the only reliable method
+         for Quicken's custom ``QC_button`` controls, which ignore
+         ``BM_CLICK`` and stall on ``SendMessageW`` inside modal loops.
+      3. Fall back to ``WM_CLOSE`` if no button found.
+      4. Loop up to *max_rounds* to catch chained dialogs.
 
-    Returns True if a dialog was dismissed.
+    Returns True if at least one dialog was dismissed.
     """
     import ctypes  # noqa: PLC0415
+    import ctypes.wintypes as wt  # noqa: PLC0415
     import time as _time  # noqa: PLC0415
 
     user32 = ctypes.windll.user32
-    WM_COMMAND = 0x0111
     WM_CLOSE = 0x0010
-    dismissed = False
+    any_dismissed = False
 
     _DIALOG_CLASSES = {"QWinDlg", "QWinPopup", "#32770"}
-    _DISMISS_LABELS = frozenset({
+
+    # Exact-match labels (after lowering, stripping &)
+    _DISMISS_LABELS_EXACT = frozenset({
         "done", "close", "ok", "cancel", "yes", "dismiss",
         "continue", "accept", "no thanks", "no", "ignore", "skip",
-        "not now", "later", "remind me later",
+        "not now", "later", "remind me later", "accept all",
+        "keep", "update", "replace", "use quicken data",
+        "use online data", "finish later", "got it",
     })
 
-    # Collect visible top-level dialogs owned by root
-    dialogs: list[int] = []
-    def _enum_cb(h: int, _: Any) -> bool:
-        if not user32.IsWindowVisible(h):
-            return True
-        owner = user32.GetWindow(h, 4)  # GW_OWNER
-        if owner != root_hwnd:
-            return True
-        cls = ctypes.create_unicode_buffer(64)
-        user32.GetClassNameW(h, cls, 64)
-        if cls.value in _DIALOG_CLASSES:
-            dialogs.append(h)
-        return True
+    # Substring patterns — if button text *contains* any of these, click it.
+    # Ordered by preference: safer/more-specific first.
+    _DISMISS_SUBSTRINGS = (
+        "accept", "done", "close", "ok", "cancel", "dismiss",
+        "continue", "finish", "keep", "ignore", "skip",
+    )
+
+    # Classes likely to be clickable dismiss buttons
+    _CLICKABLE_CLASSES = {"button", "qc_button"}
 
     WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p,
                                      ctypes.POINTER(ctypes.c_int))
-    user32.EnumWindows(WNDENUMPROC(_enum_cb), None)
 
-    for dlg in dialogs:
-        # Find a dismiss button
-        dismiss_btn = 0
-        def _btn_cb(h: int, _: Any) -> bool:
-            nonlocal dismiss_btn
+    MOUSEEVENTF_LEFTDOWN = 0x0002
+    MOUSEEVENTF_LEFTUP = 0x0004
+
+    def _click_control(h: int, dlg: int) -> None:
+        """Dismiss a button via physical mouse click.
+
+        Message-based approaches (SendMessageW, PostMessageW) fail on
+        Quicken's custom ``QC_button`` controls whose message loop stalls
+        inside modal dialogs.  A physical mouse_event is the only
+        reliable method.
+        """
+        # Bring dialog to foreground so it can receive input
+        user32.SetForegroundWindow(dlg)
+        _time.sleep(0.1)
+
+        r = wt.RECT()
+        user32.GetWindowRect(h, ctypes.byref(r))
+        cx = (r.left + r.right) // 2
+        cy = (r.top + r.bottom) // 2
+
+        if r.left == 0 and r.top == 0 and r.right == 0 and r.bottom == 0:
+            # Button rect invalid (UI thread hung) — click dialog centre
+            user32.GetWindowRect(dlg, ctypes.byref(r))
+            cx = (r.left + r.right) // 2
+            cy = (r.top + r.bottom) // 2
+
+        user32.SetCursorPos(cx, cy)
+        _time.sleep(0.05)
+        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        _time.sleep(0.05)
+        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+
+    for _round in range(max_rounds):
+        # Collect visible top-level dialogs owned by root
+        dialogs: list[int] = []
+
+        def _enum_cb(h: int, _: Any) -> bool:
             if not user32.IsWindowVisible(h):
                 return True
-            buf = ctypes.create_unicode_buffer(64)
-            user32.GetWindowTextW(h, buf, 64)
-            # Strip Windows accelerator prefix (&) for comparison
-            text = buf.value.strip().replace("&", "").lower()
-            if text in _DISMISS_LABELS:
-                dismiss_btn = h
-                return False  # stop enumeration
+            owner = user32.GetWindow(h, 4)  # GW_OWNER
+            if owner != root_hwnd:
+                return True
+            cls = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(h, cls, 64)
+            if cls.value in _DIALOG_CLASSES:
+                dialogs.append(h)
             return True
 
-        user32.EnumChildWindows(dlg, WNDENUMPROC(_btn_cb), None)
-        if dismiss_btn:
-            ctrl_id = user32.GetDlgCtrlID(dismiss_btn)
-            user32.PostMessageW(dlg, WM_COMMAND, ctrl_id, dismiss_btn)
-            _time.sleep(0.5)
-            dismissed = True
-        else:
-            # No recognized button — try WM_CLOSE as fallback
-            user32.PostMessageW(dlg, WM_CLOSE, 0, 0)
-            _time.sleep(0.5)
-            if not user32.IsWindowVisible(dlg):
-                dismissed = True
+        user32.EnumWindows(WNDENUMPROC(_enum_cb), None)
 
-    return dismissed
+        if not dialogs:
+            break  # no dialogs visible — done
+
+        dismissed_this_round = False
+        for dlg in dialogs:
+            # Collect ALL visible children with text, noting class
+            buttons: list[tuple[int, str, str]] = []  # (hwnd, text, class)
+
+            def _btn_cb(h: int, _: Any) -> bool:
+                if not user32.IsWindowVisible(h):
+                    return True
+                ccls = ctypes.create_unicode_buffer(64)
+                user32.GetClassNameW(h, ccls, 64)
+                buf = ctypes.create_unicode_buffer(128)
+                user32.GetWindowTextW(h, buf, 128)
+                text = buf.value.strip()
+                if text and ccls.value.lower() in _CLICKABLE_CLASSES:
+                    buttons.append((h, text, ccls.value))
+                return True
+
+            user32.EnumChildWindows(dlg, WNDENUMPROC(_btn_cb), None)
+
+            dismiss_btn = 0
+            # Phase 1: exact match on cleaned text
+            for btn_h, raw_text, _cls in buttons:
+                cleaned = raw_text.replace("&", "").strip().lower()
+                if cleaned in _DISMISS_LABELS_EXACT:
+                    dismiss_btn = btn_h
+                    break
+
+            # Phase 2: substring match
+            if not dismiss_btn:
+                for sub in _DISMISS_SUBSTRINGS:
+                    for btn_h, raw_text, _cls in buttons:
+                        if sub in raw_text.replace("&", "").strip().lower():
+                            dismiss_btn = btn_h
+                            break
+                    if dismiss_btn:
+                        break
+
+            if dismiss_btn:
+                _click_control(dismiss_btn, dlg)
+                _time.sleep(0.4)
+                dismissed_this_round = True
+                any_dismissed = True
+            else:
+                # No recognized button — try WM_CLOSE
+                user32.PostMessageW(dlg, WM_CLOSE, 0, 0)
+                _time.sleep(0.4)
+                if not user32.IsWindowVisible(dlg):
+                    dismissed_this_round = True
+                    any_dismissed = True
+
+        if not dismissed_this_round:
+            break  # couldn't dismiss anything — stop looping
+
+    return any_dismissed
 
 
 def _send_msg(hwnd: int, msg: int, wp: int, lp: int) -> int:
@@ -1285,7 +1366,7 @@ def _sidebar_dblclick(root_hwnd: int, screen_x: int, screen_y: int,
     return buf.value
 
 
-def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 120.0) -> list[dict[str, Any]]:
+def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict[str, Any]]:
     """Discover sidebar accounts by scrolling and clicking ListBox items.
 
     Uses per-item targeting via LB_GETITEMRECT to click only actual ListBox
@@ -1407,15 +1488,6 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 120.0) -> list[dict
         user32.GetWindowTextW(root_hwnd, buf, 256)
         return _bracket_name(buf.value)
 
-    def _wait_for_title(max_wait: float = 4.0) -> str:
-        t0 = _time.monotonic()
-        while _time.monotonic() - t0 < max_wait:
-            b = _read_bracket()
-            if b:
-                return b
-            _time.sleep(0.4)
-        return ""
-
     MAX_PASSES = 4
     for pass_num in range(MAX_PASSES):
         if _time.monotonic() >= deadline:
@@ -1489,7 +1561,10 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 120.0) -> list[dict
 
                     pre = _read_bracket()
                     if not pre:
-                        pre = _wait_for_title(1.5)
+                        # Title blank — try brief wait + modal dismiss
+                        _time.sleep(1.0)
+                        _dismiss_modal_dialogs(root_hwnd)
+                        pre = _read_bracket()
                     if not pre:
                         continue
 
@@ -1498,16 +1573,19 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 120.0) -> list[dict
                             and pre not in accounts):
                         accounts[pre] = {"name": pre, "section": ""}
 
-                    if total_clicks % 15 == 0:
-                        _dismiss_modal_dialogs(root_hwnd)
-
                     _dblclick(pt.x, pt.y)
                     total_clicks += 1
 
+                    # Dismiss modals after click — investment accounts
+                    # can spawn Securities Comparison Mismatch dialogs.
+                    _dismiss_modal_dialogs(root_hwnd)
+
                     post = _read_bracket()
                     if not post:
-                        post = _wait_for_title(3.0)
+                        # Investment account loading — brief wait + retry
+                        _time.sleep(2.0)
                         _dismiss_modal_dialogs(root_hwnd)
+                        post = _read_bracket()
 
                     navigated = post and post != pre
                     name = post or pre
@@ -1555,7 +1633,7 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 120.0) -> list[dict
 
 
 def list_sidebar_accounts(bridge: Any, resume: bool = False,
-                           max_seconds: float = 120.0) -> dict[str, Any]:
+                           max_seconds: float = 300.0) -> dict[str, Any]:
     """Discover sidebar accounts by scrolling through and clicking visible items.
 
     Uses a scroll-sweep approach: walks the sidebar holder's scroll range in
@@ -1856,15 +1934,23 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
         buf = ctypes.create_unicode_buffer(256)
 
         def _check_match() -> str | None:
-            """Read title bracket, wait for blank, return if target matches."""
+            """Read title bracket, wait for blank, return if target matches.
+
+            Dismisses modal dialogs (Securities Comparison Mismatch etc.)
+            that may appear during investment-account navigation.
+            """
+            _dismiss_modal_dialogs(root_hwnd)
             user32.GetWindowTextW(root_hwnd, buf, 256)
             bracket = _bracket_name(buf.value)
             if not bracket:
-                # Investment account loading — wait
-                time.sleep(3.0)
-                _dismiss_modal_dialogs(root_hwnd)
-                user32.GetWindowTextW(root_hwnd, buf, 256)
-                bracket = _bracket_name(buf.value)
+                # Investment account loading — poll with modal dismissal
+                for _poll in range(6):  # up to ~3s
+                    time.sleep(0.5)
+                    _dismiss_modal_dialogs(root_hwnd)
+                    user32.GetWindowTextW(root_hwnd, buf, 256)
+                    bracket = _bracket_name(buf.value)
+                    if bracket:
+                        break
             if bracket and _acct_match(bracket, target_name):
                 return bracket
             return None
