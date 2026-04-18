@@ -1863,215 +1863,140 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
             return {"ok": True, "account": sel_text, "method": "combo_filter"}
 
     # ------------------------------------------------------------------
-    # Phase 3: Sidebar — use cached entries if available.
-    # Does NOT trigger a full sidebar scan (takes 200+ s).  Agents should
-    # call list_sidebar_accounts explicitly if they need the full list.
+    # Phase 3: Targeted sidebar scan — scroll through and click items
+    # until we navigate to the target account.  Much faster than a full
+    # scan because we stop as soon as we find the target.
     # ------------------------------------------------------------------
-    cached = _sidebar_lookup(account_name) if _sidebar_cache else None
-
-    def _try_sidebar_click(cached_entry: dict) -> dict | None:
-        """Click-and-search sidebar navigation with fuzzy index recovery.
-
-        Quicken's owner-drawn virtual ListBoxes can shift item indices
-        between the scan and subsequent navigations.  This function:
-
-        1. Scrolls to the cached ``content_y_lb`` position.
-        2. Re-resolves the nearest visible ListBox.
-        3. Tries the cached ``item_index`` first (fast path).
-        4. If the wrong account opens, searches ±4 nearby indices.
-        5. Skips header/separator items (height < 10 px).
-        6. Updates the sidebar cache entry on success.
-
-        The search is deliberately limited (1 ListBox, ±4 indices) to
-        keep latency under ~30 seconds.  If it fails, Phase 4 will do
-        a full incremental rescan.
-        """
-        holder = cached_entry.get("holder_hwnd", 0)
-        cy_lb = cached_entry.get("content_y_lb", 0)
-        idx = cached_entry["item_index"]
-
+    def _navigate_via_sidebar(target_name: str) -> dict | None:
+        """Scroll through sidebar, clicking items until target opens."""
+        holder = _find_sidebar_holder(root_hwnd)
         if not holder or not _is_valid_hwnd(holder):
             return None
 
-        # Scroll the section into view
-        if cy_lb > 0:
-            _scroll_holder_to_content_y(holder, cy_lb)
-            time.sleep(0.2)
+        _expand_sidebar_sections(holder)
+        _dismiss_modal_dialogs(root_hwnd)
 
-        # Enumerate ALL visible ListBoxes in the holder with their
-        # content-Y and item counts.
         import ctypes.wintypes as wt  # noqa: PLC0415
-        _EnumCB = ctypes.WINFUNCTYPE(
-            ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
 
         class _SI(ctypes.Structure):
-            _fields_ = [("cbSize", ctypes.c_uint), ("fMask", ctypes.c_uint),
-                        ("nMin", ctypes.c_int), ("nMax", ctypes.c_int),
-                        ("nPage", ctypes.c_uint), ("nPos", ctypes.c_int),
-                        ("nTrackPos", ctypes.c_int)]
+            _fields_ = [
+                ("cbSize", ctypes.c_uint), ("fMask", ctypes.c_uint),
+                ("nMin", ctypes.c_int), ("nMax", ctypes.c_int),
+                ("nPage", ctypes.c_uint), ("nPos", ctypes.c_int),
+                ("nTrackPos", ctypes.c_int),
+            ]
+
+        SB_VERT = 1
+        SIF_ALL = 0x17
+        SBM_SETPOS = 0x00E0
+        WM_VSCROLL = 0x0115
+        SB_THUMBPOSITION = 4
 
         si = _SI()
         si.cbSize = ctypes.sizeof(si)
-        si.fMask = 0x17
-        user32.GetScrollInfo(holder, 1, ctypes.byref(si))
+        si.fMask = SIF_ALL
 
-        hr = wt.RECT()
-        user32.GetWindowRect(holder, ctypes.byref(hr))
+        scrollbar_h = 0
+        _EnumCB = ctypes.WINFUNCTYPE(
+            ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
 
-        all_lbs: list[tuple[int, int, int]] = []  # (hwnd, content_y, count)
-
-        def _collect_lbs(h: int, _: int) -> bool:
-            cls = ctypes.create_unicode_buffer(64)
-            user32.GetClassNameW(h, cls, 64)
-            if cls.value != "ListBox" or not user32.IsWindowVisible(h):
-                return True
-            cnt = _send_msg(h, 0x018B, 0, 0)  # LB_GETCOUNT
-            if cnt < 1:
-                return True
-            r = wt.RECT()
-            user32.GetWindowRect(h, ctypes.byref(r))
-            lb_cy = r.top - hr.top + si.nPos
-            all_lbs.append((h, lb_cy, cnt))
+        def _find_sb(h: int, _: int) -> bool:
+            nonlocal scrollbar_h
+            cls_b = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(h, cls_b, 64)
+            if cls_b.value == "ScrollBar" and user32.IsWindowVisible(h):
+                scrollbar_h = h
+                return False
             return True
 
-        user32.EnumChildWindows(holder, _EnumCB(_collect_lbs), 0)
+        user32.EnumChildWindows(holder, _EnumCB(_find_sb), 0)
 
-        if not all_lbs:
-            return None
+        def _scroll_to(pos: int) -> None:
+            if scrollbar_h:
+                user32.SendMessageW(scrollbar_h, SBM_SETPOS, pos, 1)
+            user32.SendMessageW(
+                holder, WM_VSCROLL,
+                (pos << 16) | SB_THUMBPOSITION, scrollbar_h)
+            time.sleep(0.15)
 
-        # Sort by distance from cached content_y_lb
-        all_lbs.sort(key=lambda x: abs(x[1] - cy_lb))
+        user32.GetScrollInfo(holder, SB_VERT, ctypes.byref(si))
+        max_scroll = max(0, si.nMax - int(si.nPage) + 1)
+        hr = wt.RECT()
+        user32.GetWindowRect(holder, ctypes.byref(hr))
+        viewport_h = hr.bottom - hr.top
+        step_size = max(50, viewport_h // 2)
 
-        LB_GETITEMRECT = 0x0198
+        buf = ctypes.create_unicode_buffer(256)
+        deadline = time.monotonic() + 60  # 60s max for targeted nav
 
-        def _item_height(lb_h: int, item_idx: int) -> int:
-            """Return pixel height of a ListBox item (0 on error)."""
-            ir2 = wt.RECT()
-            ret = _send_msg(lb_h, LB_GETITEMRECT, item_idx,
-                            ctypes.addressof(ir2))
-            if ret == 0:
-                return 0
-            return max(0, ir2.bottom - ir2.top)
-
-        def _click_and_check(lb_h: int, item_idx: int) -> dict | None:
-            """Double-click item and verify the opened account name."""
-            cur_buf = ctypes.create_unicode_buffer(256)
-            user32.GetWindowTextW(root_hwnd, cur_buf, 256)
-            pre_title = cur_buf.value
-
-            title = _sidebar_dblclick(
-                root_hwnd, 0, 0, timeout=3.0,
-                lb_hwnd=lb_h, item_index=item_idx,
-                pre_title=pre_title,
-                content_y_lb=cy_lb,
-                holder_hwnd=holder,
-                bail_early=0.2,
-            )
-
+        scroll_pos = 0
+        while scroll_pos <= max_scroll + step_size and time.monotonic() < deadline:
+            actual_pos = min(scroll_pos, max_scroll)
+            user32.SetForegroundWindow(root_hwnd)
+            _scroll_to(actual_pos)
             _dismiss_modal_dialogs(root_hwnd)
 
-            # Re-read title in case dismiss changed it
-            if title == pre_title:
-                time.sleep(0.4)
-                user32.GetWindowTextW(root_hwnd, cur_buf, 256)
-                title = cur_buf.value
+            user32.GetWindowRect(holder, ctypes.byref(hr))
+            sx = (hr.left + hr.right) // 2
+            y_start = hr.top + 25
+            y_end = hr.bottom - 10
 
-            opened = ""
-            if "[" in title and "]" in title:
-                opened = title[title.rfind("[") + 1 : title.rfind("]")]
-                try:
-                    opened = opened.encode("cp1252").decode("utf-8")
-                except (UnicodeEncodeError, UnicodeDecodeError):
-                    pass
+            for y in range(y_start, y_end, 45):
+                if time.monotonic() >= deadline:
+                    break
 
-            if opened and _acct_match(opened, account_name):
-                # Update cache to reflect correct index for next time
-                cached_entry["item_index"] = item_idx
-                cached_entry["lb_hwnd"] = lb_h
-                return {"ok": True, "account": opened, "method": "sidebar"}
+                # Physical double-click
+                user32.SetCursorPos(sx, y)
+                time.sleep(0.02)
+                for _dc in range(2):
+                    user32.mouse_event(0x0002, 0, 0, 0, 0)
+                    user32.mouse_event(0x0004, 0, 0, 0, 0)
+                    time.sleep(0.02)
+                time.sleep(0.15)
 
-            # Also check active MDI title
-            mdi_h = _find_active_mdi(root_hwnd)
-            if mdi_h:
-                mdi_buf = ctypes.create_unicode_buffer(256)
-                user32.GetWindowTextW(mdi_h, mdi_buf, 256)
-                mdi_name = mdi_buf.value.strip()
-                if _acct_match(mdi_name, account_name):
-                    cached_entry["item_index"] = item_idx
-                    cached_entry["lb_hwnd"] = lb_h
-                    return {"ok": True, "account": mdi_name,
-                            "method": "sidebar"}
+                user32.GetWindowTextW(root_hwnd, buf, 256)
+                bracket = _bracket_name(buf.value)
 
-            return None
+                if not bracket:
+                    # Investment loading — wait
+                    time.sleep(2.0)
+                    _dismiss_modal_dialogs(root_hwnd)
+                    user32.GetWindowTextW(root_hwnd, buf, 256)
+                    bracket = _bracket_name(buf.value)
 
-        def _search_order(center: int, count: int, radius: int = 4) -> list[int]:
-            """Build search order: center first, then ±radius outward."""
-            order = [center] if 0 <= center < count else []
-            for delta in range(1, radius + 1):
-                if center - delta >= 0:
-                    order.append(center - delta)
-                if center + delta < count:
-                    order.append(center + delta)
-            return order
+                if bracket and _acct_match(bracket, target_name):
+                    return {
+                        "ok": True, "account": bracket,
+                        "method": "sidebar_scan",
+                    }
 
-        # Search the nearest ListBox only, ±8 indices from cached position.
-        # This keeps worst-case latency under ~50s (17 items × 3s each).
-        if not all_lbs:
-            return None
-        lb_h, lb_cy, lb_cnt = all_lbs[0]
-        for item_i in _search_order(idx, lb_cnt, radius=8):
-            # Skip tiny header/separator items
-            if _item_height(lb_h, item_i) < 10:
-                continue
-            result = _click_and_check(lb_h, item_i)
-            if result:
-                return result
-
-        # If not found in primary ListBox, try the next closest one
-        if len(all_lbs) > 1:
-            lb_h2, lb_cy2, lb_cnt2 = all_lbs[1]
-            for item_i in _search_order(0, lb_cnt2, radius=8):
-                if _item_height(lb_h2, item_i) < 10:
-                    continue
-                result = _click_and_check(lb_h2, item_i)
-                if result:
-                    return result
+            scroll_pos += step_size
 
         return None
 
-    if cached:
-        result = _try_sidebar_click(cached)
-        if result:
-            return result
-        # Don't invalidate the whole cache — just this entry might be stale
+    # If the account is in the sidebar cache, we know it exists —
+    # try targeted sidebar navigation.
+    if _sidebar_cache:
+        cached = _sidebar_lookup(account_name)
+        if cached:
+            result = _navigate_via_sidebar(account_name)
+            if result:
+                return result
 
     # ------------------------------------------------------------------
-    # Phase 4: Auto-rebuild sidebar cache and retry (one attempt).
-    # Runs when the cache is empty, when the account wasn't in the cache,
-    # OR when Phase 3 found a cache entry but the click search failed
-    # (the item may have moved to a different section entirely).
+    # Phase 4: Full sidebar scan + targeted navigation.
+    # Runs when the cache is empty or account wasn't found in cache.
     # ------------------------------------------------------------------
-    scan_done = _scan_state.get("done", False)
-    if not scan_done:
+    if not _sidebar_cache:
         try:
-            if not _scan_state.get("items"):
-                _scan_state = {}
-            for _attempt in range(15):  # max 15 batches (~7 min cap)
-                resume = _attempt > 0 or bool(_scan_state.get("items"))
-                res = list_sidebar_accounts(bridge, resume=resume,
-                                            max_seconds=30)
-                # Check if we found the target yet
-                found = _sidebar_lookup(account_name)
-                if found and (not cached or found is not cached):
-                    # New/different cache entry — try clicking it
-                    result = _try_sidebar_click(found)
-                    if result:
-                        return result
-                    break  # found in cache but click failed
-                if res.get("done"):
-                    break
+            list_sidebar_accounts(bridge, max_seconds=60)
         except Exception:  # noqa: BLE001
-            pass  # sidebar scan failed — fall through to error
+            pass
+
+    # Try targeted navigation regardless of cache state
+    result = _navigate_via_sidebar(account_name)
+    if result:
+        return result
 
     raise UIAError(
         f"Account {account_name!r} not found via combo or sidebar cache.  "
@@ -2132,11 +2057,12 @@ def read_register_state(bridge: Any) -> dict[str, Any]:
 
     # Find the active QWMDI and scope child enumeration to it.
     # Retry briefly — after navigation the MDI may still be loading.
+    # Investment accounts can take 2-8s, so we retry more aggressively.
     mdi_h = _find_active_mdi(root_hwnd)
     if mdi_h is None:
         import time as _time  # noqa: PLC0415
-        for _retry in range(3):
-            _time.sleep(0.5)
+        for _retry in range(8):
+            _time.sleep(1.0)
             _dismiss_modal_dialogs(root_hwnd)
             mdi_h = _find_active_mdi(root_hwnd)
             if mdi_h is not None:
