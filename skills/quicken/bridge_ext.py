@@ -149,6 +149,25 @@ def _send_msg(hwnd: int, msg: int, wp: int, lp: int) -> int:
     return _fn(hwnd, msg, wp, lp)
 
 
+def _post_msg(hwnd: int, msg: int, wp: int, lp: int) -> bool:
+    """Non-blocking ``PostMessageW`` — queues the message and returns."""
+    import ctypes  # noqa: PLC0415
+
+    _fn = ctypes.windll.user32.PostMessageW
+    if not hasattr(_fn, "_typed"):
+        import ctypes.wintypes  # noqa: PLC0415
+
+        _fn.argtypes = [
+            ctypes.wintypes.HWND,
+            ctypes.wintypes.UINT,
+            ctypes.wintypes.WPARAM,
+            ctypes.wintypes.LPARAM,
+        ]
+        _fn.restype = ctypes.wintypes.BOOL
+        _fn._typed = True  # type: ignore[attr-defined]
+    return bool(_fn(hwnd, msg, wp, lp))
+
+
 def _combo_get_items(hwnd: int) -> list[str]:
     """Read all items from a Win32 combobox via CB_GETCOUNT/CB_GETLBTEXT."""
     import ctypes  # noqa: PLC0415
@@ -542,6 +561,79 @@ def _expand_sidebar_sections(holder: int) -> bool:
     return expanded
 
 
+def _expand_single_section(lb_hwnd: int, holder: int) -> bool:
+    """Expand only the sidebar section that contains *lb_hwnd*.
+
+    This is much faster than ``_expand_sidebar_sections`` (which iterates
+    ALL sections) — it finds the ``QWListViewer`` parent of lb_hwnd, locates
+    the nearest ``QC_button`` toggle button above it, and clicks that button
+    if the section appears collapsed.
+
+    Returns True if a section was expanded.
+    """
+    import ctypes  # noqa: PLC0415
+    import ctypes.wintypes as wt  # noqa: PLC0415
+    import time as _time  # noqa: PLC0415
+
+    user32 = ctypes.windll.user32
+    cls_buf = ctypes.create_unicode_buffer(64)
+
+    def _cls(h: int) -> str:
+        user32.GetClassNameW(h, cls_buf, 64)
+        return cls_buf.value
+
+    # Walk up: ListBox → QWListViewer
+    lv = user32.GetParent(lb_hwnd) if lb_hwnd else 0
+    if not lv or _cls(lv) != "QWListViewer":
+        return False
+
+    # Get the QWListViewer's vertical position
+    lv_rect = wt.RECT()
+    user32.GetWindowRect(lv, ctypes.byref(lv_rect))
+    lv_top = lv_rect.top
+
+    # Find the nearest QC_button ABOVE this QWListViewer in the holder
+    EnumCB = ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
+    best_btn = 0
+    best_y = -999999
+
+    def _find_btn(h: int, _: int) -> bool:
+        nonlocal best_btn, best_y
+        if user32.GetParent(h) != holder:
+            return True
+        if _cls(h) != "QC_button":
+            return True
+        if not user32.IsWindowVisible(h):
+            return True
+        r = wt.RECT()
+        user32.GetWindowRect(h, ctypes.byref(r))
+        btn_top = r.top
+        if btn_top < lv_top and btn_top > best_y:
+            best_btn = h
+            best_y = btn_top
+        return True
+
+    user32.EnumChildWindows(holder, EnumCB(_find_btn), 0)
+
+    if not best_btn:
+        return False
+
+    # Click the button to toggle the section
+    r = wt.RECT()
+    user32.GetWindowRect(best_btn, ctypes.byref(r))
+    mid_x = (r.right - r.left) // 2
+    mid_y = (r.bottom - r.top) // 2
+    lparam = (mid_y << 16) | (mid_x & 0xFFFF)
+    WM_LBUTTONDOWN = 0x0201
+    WM_LBUTTONUP = 0x0202
+    MK_LBUTTON = 0x0001
+    user32.SendMessageW(best_btn, WM_LBUTTONDOWN, MK_LBUTTON, lparam)
+    _time.sleep(0.05)
+    user32.SendMessageW(best_btn, WM_LBUTTONUP, 0, lparam)
+    _time.sleep(0.3)
+    return True
+
+
 def _find_sidebar_accounts(root_hwnd: int) -> list[dict[str, Any]]:
     """Discover sidebar accounts by scanning QWAcctBarHolder ListBox items.
 
@@ -767,6 +859,18 @@ def _find_sidebar_accounts(root_hwnd: int) -> list[dict[str, Any]]:
 _SIDEBAR_DEBUG = False  # set True temporarily to diagnose timing
 
 
+def _bracket_name(title: str) -> str:
+    """Extract the bracketed account name from a Quicken window title."""
+    if "[" in title and "]" in title:
+        raw = title[title.rfind("[") + 1 : title.rfind("]")]
+        try:
+            raw = raw.encode("cp1252").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+        return raw
+    return ""
+
+
 def _scroll_holder_for_lb(lb_hwnd: int) -> None:
     """Scroll QWAcctBarHolder so that lb_hwnd is within its visible viewport.
 
@@ -936,54 +1040,144 @@ def _sidebar_dblclick(root_hwnd: int, screen_x: int, screen_y: int,
     import ctypes  # noqa: PLC0415
     import ctypes.wintypes as wt  # noqa: PLC0415
     import time as _time  # noqa: PLC0415
+    import sys  # noqa: PLC0415
 
     user32 = ctypes.windll.user32
 
-    def _bracket_name(t: str) -> str:
-        if "[" in t and "]" in t:
-            raw = t[t.rfind("[") + 1 : t.rfind("]")]
-            try:
-                raw = raw.encode("cp1252").decode("utf-8")
-            except (UnicodeEncodeError, UnicodeDecodeError):
-                pass
-            return raw
-        return ""
-
     # Scroll the sidebar container so lb_hwnd is visible, then scroll the
     # ListBox to bring item_index to the top and recalculate screen coords.
+    _lb_visible = True  # default: assume visible for non-lb paths
+    client_x = client_y = 0
+    _t0 = _time.monotonic()
     if lb_hwnd and item_index >= 0 and _is_valid_hwnd(lb_hwnd):
-        # If the ListBox's section is collapsed, expand it first.
-        if not user32.IsWindowVisible(lb_hwnd) and holder_hwnd:
-            _expand_sidebar_sections(holder_hwnd)
-            _time.sleep(0.15)
-        # Prefer content_y_lb-based scrolling (works even if lb is hidden).
-        # Fall back to GetWindowRect-based for old callers without content_y_lb.
+        # Scroll first — Quicken shows hidden ListBoxes once in viewport.
         if content_y_lb > 0 and holder_hwnd:
             _scroll_holder_to_content_y(holder_hwnd, content_y_lb)
         else:
             _scroll_holder_for_lb(lb_hwnd)
-        LB_SETTOPINDEX = 0x0197
-        LB_GETITEMRECT = 0x0198
-        _send_msg(lb_hwnd, LB_SETTOPINDEX, max(0, item_index - 1), 0)
-        _time.sleep(0.05)
-        ir = wt.RECT()
-        _send_msg(lb_hwnd, LB_GETITEMRECT, item_index, ctypes.addressof(ir))
-        pt = wt.POINT((ir.left + ir.right) // 2, (ir.top + ir.bottom) // 2)
-        user32.ClientToScreen(lb_hwnd, ctypes.byref(pt))
-        screen_x, screen_y = pt.x, pt.y
+        # Give Quicken time to make the ListBox visible after scrolling.
+        _time.sleep(0.3)
+        if _SIDEBAR_DEBUG:
+            print(f"  [dblclk] scroll={_time.monotonic()-_t0:.2f}s vis={user32.IsWindowVisible(lb_hwnd)}",
+                  flush=True, file=sys.stderr)
+        # Only expand if the LB is STILL hidden after scrolling (rare).
+        # Use a targeted approach: just expand the parent section, not all.
+        if not user32.IsWindowVisible(lb_hwnd) and holder_hwnd:
+            _expand_single_section(lb_hwnd, holder_hwnd)
+            _time.sleep(0.3)
+            if _SIDEBAR_DEBUG:
+                print(f"  [dblclk] expand={_time.monotonic()-_t0:.2f}s",
+                      flush=True, file=sys.stderr)
+            # Re-scroll after expansion shifts positions
+            if content_y_lb > 0:
+                _scroll_holder_to_content_y(holder_hwnd, content_y_lb)
+
+        _lb_visible = bool(user32.IsWindowVisible(lb_hwnd))
+        _was_visible = _lb_visible  # remember original visibility for fallback
+
+        if _lb_visible:
+            # ListBox is visible — scroll it and get screen coords for a
+            # physical mouse click.  Use SendMessageTimeoutW to avoid blocking
+            # for 10+ seconds when Quicken is loading account data.
+            LB_SETTOPINDEX = 0x0197
+            LB_GETITEMRECT = 0x0198
+            _SMT = user32.SendMessageTimeoutW
+            _SMT.argtypes = [wt.HWND, ctypes.c_uint, wt.WPARAM, wt.LPARAM,
+                             ctypes.c_uint, ctypes.c_uint,
+                             ctypes.POINTER(ctypes.c_size_t)]
+            _SMT.restype = wt.LPARAM
+            SMTO_ABORTIFHUNG = 0x0002
+            _smto_result = ctypes.c_size_t(0)
+            ret = _SMT(lb_hwnd, LB_SETTOPINDEX, max(0, item_index - 1), 0,
+                       SMTO_ABORTIFHUNG, 3000, ctypes.byref(_smto_result))
+            if ret == 0:
+                # Timed out — keep _lb_visible True and use the original
+                # screen_x/screen_y (from _find_sidebar_accounts) for a
+                # physical click.  The item is on screen, just non-responsive.
+                if _SIDEBAR_DEBUG:
+                    print(f"  [dblclk] LB_SETTOPINDEX timeout, using original coords",
+                          flush=True, file=sys.stderr)
+            else:
+                _time.sleep(0.05)
+                ir = wt.RECT()
+                ret2 = _SMT(lb_hwnd, LB_GETITEMRECT, item_index,
+                             ctypes.addressof(ir),
+                             SMTO_ABORTIFHUNG, 2000, ctypes.byref(_smto_result))
+                if ret2 == 0:
+                    # Use original screen coords — item is visible
+                    if _SIDEBAR_DEBUG:
+                        print(f"  [dblclk] LB_GETITEMRECT timeout, using original coords",
+                              flush=True, file=sys.stderr)
+                else:
+                    pt = wt.POINT((ir.left + ir.right) // 2,
+                                  (ir.top + ir.bottom) // 2)
+                    client_x, client_y = pt.x, pt.y
+                    user32.ClientToScreen(lb_hwnd, ctypes.byref(pt))
+                    screen_x, screen_y = pt.x, pt.y
+        # else: ListBox hidden — skip LB_SETTOPINDEX/LB_GETITEMRECT entirely;
+        # the msg-click path uses LB_SETCURSEL by index, no coords needed.
+
+        if _SIDEBAR_DEBUG:
+            print(f"  [dblclk] setup_done={_time.monotonic()-_t0:.2f}s vis2={int(_lb_visible)}",
+                  flush=True, file=sys.stderr)
 
     user32.SetForegroundWindow(root_hwnd)
     _time.sleep(0.05)
 
     # Dismiss any pre-existing modal dialogs before clicking
     _dismiss_modal_dialogs(root_hwnd)
+    if _SIDEBAR_DEBUG:
+        print(f"  [dblclk] pre_click={_time.monotonic()-_t0:.2f}s",
+              flush=True, file=sys.stderr)
 
-    user32.SetCursorPos(screen_x, screen_y)
-    _time.sleep(0.03)
-    for _ in range(2):
-        user32.mouse_event(0x0002, 0, 0, 0, 0)
-        user32.mouse_event(0x0004, 0, 0, 0, 0)
+    # Choose click strategy based on ListBox visibility.
+    # When the ListBox is hidden (Quicken's virtual viewport hides off-screen
+    # sections), physical mouse clicks miss it entirely.  Fall back to sending
+    # WM_LBUTTONDBLCLK directly to the ListBox window proc — this works even
+    # when the window is hidden because the message is delivered directly.
+    _use_msg_click = (lb_hwnd and item_index >= 0 and not _lb_visible)
+    if _use_msg_click:
+        # Select the item first, then send double-click message.
+        # Use SendMessageTimeoutW for LB_SETCURSEL because SendMessage can
+        # block 10+ seconds when Quicken is loading investment data.
+        LB_SETCURSEL = 0x0186
+        _SMT = user32.SendMessageTimeoutW
+        _SMT.argtypes = [wt.HWND, ctypes.c_uint, wt.WPARAM, wt.LPARAM,
+                         ctypes.c_uint, ctypes.c_uint,
+                         ctypes.POINTER(ctypes.c_size_t)]
+        _SMT.restype = wt.LPARAM
+        SMTO_ABORTIFHUNG = 0x0002
+        _smto_result = ctypes.c_size_t(0)
+        ret = _SMT(lb_hwnd, LB_SETCURSEL, item_index, 0,
+                   SMTO_ABORTIFHUNG, 3000, ctypes.byref(_smto_result))
+        if ret == 0:
+            if _SIDEBAR_DEBUG:
+                print(f"  [dblclk] LB_SETCURSEL timeout, skipping",
+                      flush=True, file=sys.stderr)
+            return pre_title or ""
+        _time.sleep(0.02)
+        # Instead of sending WM_LBUTTONDBLCLK (which uses coordinates to
+        # determine the clicked item — wrong when the ListBox isn't scrolled
+        # to show our item), send WM_COMMAND(LBN_DBLCLK) to the parent.
+        # This is what the ListBox normally sends after a double-click.
+        # The parent uses LB_GETCURSEL (set by our LB_SETCURSEL above) to
+        # determine which item was activated.
+        LBN_DBLCLK = 2
+        WM_COMMAND = 0x0111
+        ctrl_id = user32.GetDlgCtrlID(lb_hwnd) & 0xFFFF
+        parent_hwnd = user32.GetParent(lb_hwnd)
+        wp_cmd = (LBN_DBLCLK << 16) | ctrl_id
+        _post_msg(parent_hwnd, WM_COMMAND, wp_cmd, lb_hwnd)
+        if _SIDEBAR_DEBUG:
+            print(f"  [dblclk] msg_click lb={lb_hwnd} i={item_index} cx={client_x} cy={client_y}",
+                  flush=True, file=sys.stderr)
+    else:
+        user32.SetCursorPos(screen_x, screen_y)
         _time.sleep(0.03)
+        for _ in range(2):
+            user32.mouse_event(0x0002, 0, 0, 0, 0)
+            user32.mouse_event(0x0004, 0, 0, 0, 0)
+            _time.sleep(0.03)
 
     buf = ctypes.create_unicode_buffer(256)
 
@@ -1037,7 +1231,7 @@ def _sidebar_dblclick(root_hwnd: int, screen_x: int, screen_y: int,
     # as full-budget: the early-exit below will catch the same-bracket return.
     no_change = (phase1_bracket == pre_bracket)
     if no_change:
-        phase2_budget = min(1.0, timeout - bail_early)
+        phase2_budget = min(0.15, timeout - bail_early)
     else:
         phase2_budget = timeout - bail_early
 
@@ -1091,47 +1285,380 @@ def _sidebar_dblclick(root_hwnd: int, screen_x: int, screen_y: int,
     return buf.value
 
 
+def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 120.0) -> list[dict[str, Any]]:
+    """Discover sidebar accounts by scrolling and clicking items sequentially.
+
+    Key design points:
+    * Quicken destroys/recreates ListBox hwnds after each navigation.
+    * Enumeration of 40+ ListBoxes is expensive (~14s with naive approach).
+    * Optimisation: skip ListBoxes whose window rect is outside the viewport.
+    * Collect items ONCE per scroll position; after a detected navigation
+      (title bracket changed), re-collect because the sidebar rebuilt.
+    * Uses bail_early=0.5 so Phase 1 catches most banking navigations
+      (which complete in ~0.5-1.0s).
+
+    Returns a list of ``{name, section}`` dicts.
+    """
+    import ctypes  # noqa: PLC0415
+    import ctypes.wintypes as wt  # noqa: PLC0415
+    import time as _time  # noqa: PLC0415
+    import sys  # noqa: PLC0415
+
+    user32 = ctypes.windll.user32
+    SM = user32.SendMessageW
+    SM.argtypes = [wt.HWND, ctypes.c_uint, wt.WPARAM, wt.LPARAM]
+    SM.restype = wt.LPARAM
+    EnumCB = ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
+
+    _holder = [_find_sidebar_holder(root_hwnd)]
+    if not _holder[0]:
+        return []
+
+    def _ensure_sidebar_visible() -> bool:
+        """Re-find holder if stale, show it, return True if visible."""
+        h = _holder[0]
+        if not h or not user32.IsWindow(h) or not user32.IsWindowVisible(h):
+            h = _find_sidebar_holder(root_hwnd)
+            if not h:
+                return False
+            _holder[0] = h
+        if not user32.IsWindowVisible(h):
+            chain_vis: list[int] = []
+            p = h
+            while p and p != root_hwnd:
+                chain_vis.append(p)
+                p = user32.GetParent(p)
+            for p in reversed(chain_vis):
+                if not user32.IsWindowVisible(p):
+                    user32.ShowWindow(p, 5)  # SW_SHOW
+            _time.sleep(0.2)
+        return user32.IsWindowVisible(_holder[0]) != 0
+
+    if not _ensure_sidebar_visible():
+        return []
+
+    holder = _holder[0]
+    user32.SetForegroundWindow(root_hwnd)
+    _expand_sidebar_sections(holder)
+
+    cls_buf = ctypes.create_unicode_buffer(64)
+    txt_buf = ctypes.create_unicode_buffer(256)
+
+    def _cls(h: int) -> str:
+        user32.GetClassNameW(h, cls_buf, 64)
+        return cls_buf.value
+
+    def _txt(h: int) -> str:
+        user32.GetWindowTextW(h, txt_buf, 256)
+        return txt_buf.value
+
+    class _SI(ctypes.Structure):  # SCROLLINFO
+        _fields_ = [("cbSize", ctypes.c_uint), ("fMask", ctypes.c_uint),
+                    ("nMin", ctypes.c_int), ("nMax", ctypes.c_int),
+                    ("nPage", ctypes.c_uint), ("nPos", ctypes.c_int),
+                    ("nTrackPos", ctypes.c_int)]
+
+    WM_VSCROLL = 0x0115
+    SB_THUMBPOSITION = 4
+    SB_ENDSCROLL = 8
+    LB_GETCOUNT = 0x018B
+    LB_GETITEMRECT = 0x0198
+
+    def _get_si() -> _SI:
+        si = _SI(); si.cbSize = ctypes.sizeof(si); si.fMask = 0x17
+        user32.GetScrollInfo(_holder[0], 1, ctypes.byref(si))
+        return si
+
+    def _scroll_to(pos: int) -> None:
+        SM(_holder[0], WM_VSCROLL, (pos << 16) | SB_THUMBPOSITION, 0)
+        _time.sleep(0.25)
+        SM(_holder[0], WM_VSCROLL, SB_ENDSCROLL, 0)
+        _time.sleep(0.10)
+
+    hr = wt.RECT()
+    lb_rect = wt.RECT()
+    user32.GetWindowRect(holder, ctypes.byref(hr))
+    viewport_h = hr.bottom - hr.top
+    step = max(50, viewport_h // 2)
+
+    # SendMessageTimeoutW for non-blocking LB queries in _collect_visible.
+    _SMT_cv = user32.SendMessageTimeoutW
+    _SMT_cv.argtypes = [wt.HWND, ctypes.c_uint, wt.WPARAM, wt.LPARAM,
+                        ctypes.c_uint, ctypes.c_uint,
+                        ctypes.POINTER(ctypes.c_size_t)]
+    _SMT_cv.restype = wt.LPARAM
+    _SMTO_ABORTIFHUNG = 0x0002
+    _smt_out = ctypes.c_size_t(0)
+    _SMT_TIMEOUT_MS = 250  # aggressive but OK — we iterate all scroll positions
+
+    def _smt(hwnd: int, msg: int, wp: int, lp: int) -> int:
+        """SendMessage with timeout — returns result or -1 on timeout."""
+        ret = _SMT_cv(hwnd, msg, wp, lp,
+                      _SMTO_ABORTIFHUNG, _SMT_TIMEOUT_MS,
+                      ctypes.byref(_smt_out))
+        if ret == 0:
+            return -1
+        return _smt_out.value
+
+    def _collect_visible() -> list[tuple[int, int, str, int, int]]:
+        """Enumerate ListBoxes and return items in the holder viewport.
+
+        Uses SendMessageTimeoutW (500ms) to avoid blocking when Quicken's
+        message pump is busy.  Auto-retries once if >5 LBs timed out.
+        """
+        for attempt in range(2):
+            t_start = _time.monotonic()
+            current_lbs: list[tuple[int, str]] = []
+            cur_seen: set[int] = set()
+
+            def _enum(h: int, _: int) -> bool:
+                if h in cur_seen:
+                    return True
+                if _cls(h) != "ListBox":
+                    return True
+                parent = user32.GetParent(h)
+                if _cls(parent) != "QWListViewer":
+                    return True
+                section = _txt(parent)
+                cur_seen.add(h)
+                current_lbs.append((h, section))
+                return True
+
+            user32.EnumChildWindows(_holder[0], EnumCB(_enum), 0)
+            user32.GetWindowRect(_holder[0], ctypes.byref(hr))
+            margin = 50
+
+            skipped_lbs = 0
+            timed_out_lbs = 0
+            total_items_checked = 0
+            items: list[tuple[int, int, str, int, int]] = []
+            for lb_h, section in current_lbs:
+                user32.GetWindowRect(lb_h, ctypes.byref(lb_rect))
+                if lb_rect.bottom < hr.top - margin or lb_rect.top > hr.bottom + margin:
+                    skipped_lbs += 1
+                    continue
+
+                count = _smt(lb_h, LB_GETCOUNT, 0, 0)
+                if count <= 0:
+                    if count == -1:
+                        timed_out_lbs += 1
+                    continue
+                count = min(count, 30)
+                for i in range(count):
+                    ir = wt.RECT()
+                    rc = _smt(lb_h, LB_GETITEMRECT, i, ctypes.addressof(ir))
+                    if rc == -1:
+                        timed_out_lbs += 1
+                        break
+                    total_items_checked += 1
+                    if ir.bottom - ir.top <= 5:
+                        continue
+                    pt = wt.POINT((ir.left + ir.right) // 2,
+                                  (ir.top + ir.bottom) // 2)
+                    user32.ClientToScreen(lb_h, ctypes.byref(pt))
+                    if pt.y > hr.bottom + margin:
+                        break
+                    if hr.top - margin <= pt.y <= hr.bottom + margin:
+                        items.append((lb_h, i, section, pt.x, pt.y))
+            items.sort(key=lambda x: x[4])
+            if _SIDEBAR_DEBUG:
+                elapsed = _time.monotonic() - t_start
+                print(f"  [collect] {len(current_lbs)} LBs, {skipped_lbs} skip, "
+                      f"{timed_out_lbs} timeout, {total_items_checked} checked, "
+                      f"{len(items)} vis, {elapsed:.3f}s (attempt {attempt})",
+                      flush=True, file=sys.stderr)
+
+            # Accept first-pass results — retrying is expensive (10-12s)
+            # and only gains 1-2 items.  Caller should settle before collecting.
+            return items
+        return items  # unreachable but satisfies type checker
+
+    if _SIDEBAR_DEBUG:
+        si_init = _get_si()
+        ms = max(0, si_init.nMax - int(si_init.nPage) + 1)
+        print(f"  [sweep] viewport={viewport_h}, max_scroll={ms}, step={step}",
+              flush=True, file=sys.stderr)
+
+    # ------------------------------------------------------------------
+    SECTION_NAMES = {
+        "banking", "investing", "property & debt", "separate",
+        "rental property", "business", "savings goals",
+        "home",  # Quicken Home tab
+    }
+
+    accounts: dict[str, dict[str, Any]] = {}
+    deadline = _time.monotonic() + max_seconds
+    buf = ctypes.create_unicode_buffer(256)
+    total_clicks = 0
+
+    def _wait_for_title(max_wait: float = 4.0) -> str:
+        """Wait until the window title bracket is non-blank, up to *max_wait*."""
+        t0 = _time.monotonic()
+        while _time.monotonic() - t0 < max_wait:
+            user32.GetWindowTextW(root_hwnd, buf, 256)
+            b = _bracket_name(buf.value)
+            if b:
+                return b
+            _time.sleep(0.4)
+        return ""
+
+    LB_SETCURSEL = 0x0186
+    WM_COMMAND_MSG = 0x0111
+    LBN_DBLCLK = 2
+
+    MAX_SWEEPS = 6
+    for sweep_num in range(MAX_SWEEPS):
+        if _time.monotonic() >= deadline:
+            break
+        accts_before = len(accounts)
+
+        if not _ensure_sidebar_visible():
+            _time.sleep(0.5)
+            if not _ensure_sidebar_visible():
+                break
+        holder = _holder[0]
+
+        _expand_sidebar_sections(holder)
+
+        si_fresh = _get_si()
+        max_scroll = max(0, si_fresh.nMax - int(si_fresh.nPage) + 1)
+        user32.GetWindowRect(holder, ctypes.byref(hr))
+        viewport_h = hr.bottom - hr.top
+        step = max(50, viewport_h // 2)
+
+        scroll_pos = 0
+        while scroll_pos <= max_scroll + step and _time.monotonic() < deadline:
+            actual_pos = min(scroll_pos, max_scroll)
+
+            user32.SetForegroundWindow(root_hwnd)
+            _scroll_to(actual_pos)
+            _dismiss_modal_dialogs(root_hwnd)
+
+            # Click at regular Y intervals across the viewport.
+            # No _collect_visible needed — physical mouse clicks target
+            # whatever ListBox item is at each position.
+            user32.GetWindowRect(holder, ctypes.byref(hr))
+            sx = (hr.left + hr.right) // 2
+            y_base = hr.top + 25
+            y_end = hr.bottom - 10
+            y_step = 45  # tight spacing for better coverage
+            # Jitter start per sweep so different sweeps hit different items
+            jitter = (sweep_num * 23) % y_step
+            y_start = y_base + jitter
+
+            for y in range(y_start, y_end, y_step):
+                if _time.monotonic() >= deadline:
+                    break
+
+                # Ensure title is non-blank before clicking
+                pre_bracket = _wait_for_title(1.5)
+                if not pre_bracket:
+                    continue
+
+                # Record the name we see before clicking (if new)
+                if (pre_bracket.lower() not in SECTION_NAMES
+                        and pre_bracket not in accounts):
+                    accounts[pre_bracket] = {
+                        "name": pre_bracket, "section": "",
+                    }
+
+                # Dismiss modals periodically
+                if total_clicks % 10 == 0:
+                    _dismiss_modal_dialogs(root_hwnd)
+
+                # Physical double-click at (sx, y)
+                user32.SetCursorPos(sx, y)
+                _time.sleep(0.02)
+                for _dc in range(2):
+                    user32.mouse_event(0x0002, 0, 0, 0, 0)
+                    user32.mouse_event(0x0004, 0, 0, 0, 0)
+                    _time.sleep(0.02)
+                _time.sleep(0.05)
+
+                user32.GetWindowTextW(root_hwnd, buf, 256)
+                probe_bracket = _bracket_name(buf.value)
+                total_clicks += 1
+
+                if probe_bracket and probe_bracket != pre_bracket:
+                    name = probe_bracket
+                    navigated = True
+                elif not probe_bracket:
+                    # Blank — investment account loading
+                    name = _wait_for_title(3.0)
+                    _dismiss_modal_dialogs(root_hwnd)
+                    navigated = bool(name and name != pre_bracket)
+                else:
+                    name = probe_bracket
+                    navigated = False
+
+                if _SIDEBAR_DEBUG:
+                    print(f"  [sweep {sweep_num}] #{total_clicks}: "
+                          f"name={name!r} y={y} nav={navigated}",
+                          flush=True, file=sys.stderr)
+
+                if name and name.lower() not in SECTION_NAMES:
+                    if name not in accounts:
+                        accounts[name] = {"name": name, "section": ""}
+
+                # After navigation, the title won't change for remaining
+                # clicks at this scroll position — move to next position.
+                if navigated:
+                    break
+
+            if _SIDEBAR_DEBUG:
+                print(f"  [sweep {sweep_num}] scroll={actual_pos} done, "
+                      f"accounts={len(accounts)}",
+                      flush=True, file=sys.stderr)
+
+            scroll_pos += step
+
+        new_accounts = len(accounts) - accts_before
+        if _SIDEBAR_DEBUG:
+            print(f"  [sweep {sweep_num}] pass done: +{new_accounts} "
+                  f"(total {len(accounts)})",
+                  flush=True, file=sys.stderr)
+
+        if new_accounts == 0:
+            break
+
+    if _SIDEBAR_DEBUG:
+        elapsed = max_seconds - (deadline - _time.monotonic())
+        print(f"  [sweep] DONE: {len(accounts)} accounts, {total_clicks} clicks, "
+              f"{elapsed:.1f}s",
+              flush=True, file=sys.stderr)
+
+    return list(accounts.values())
+
+
 def list_sidebar_accounts(bridge: Any, resume: bool = False,
-                           max_seconds: float = 20.0) -> dict[str, Any]:
-    """Discover sidebar accounts by clicking each item and reading window titles.
+                           max_seconds: float = 120.0) -> dict[str, Any]:
+    """Discover sidebar accounts by scrolling through and clicking visible items.
 
-    Because Quicken's sidebar is owner-drawn, the only reliable way to read
-    account names is to click each item and watch the window title.  Investment
-    accounts can take 2-7 seconds each, so a single full scan would exceed HTTP
-    timeouts.
-
-    **Resumable / time-bounded scan**
-
-    Call repeatedly until ``done`` is ``True``::
-
-        result = list_sidebar_accounts(bridge, resume=False)   # fresh start
-        while not result["done"]:
-            result = list_sidebar_accounts(bridge, resume=True)
-        all_accounts = result["accounts"]
+    Uses a scroll-sweep approach: walks the sidebar holder's scroll range in
+    overlapping viewport-sized steps, clicking only physically-visible items
+    at each position.  This avoids stale content-Y estimates and unreliable
+    message-based clicks on hidden ListBoxes.
 
     Parameters
     ----------
     bridge
         Active UIABridge instance (unused directly; used for pm attachment).
     resume
-        If *False* (default), restart scan from the beginning.
-        If *True*, continue from where the last call left off.
+        Accepted for API compatibility but ignored — the sweep scan always
+        starts fresh and completes in a single call.
     max_seconds
-        Seconds budget per call (default 20).  When the budget expires the
-        function returns immediately with ``done=False`` so the caller can
-        resume in a fresh HTTP request.
+        Seconds budget for the entire scan (default 120).
 
     Returns
     -------
     dict with keys:
         ``ok`` -- always ``True`` on success.
-        ``accounts`` -- list of ``{name, section}`` dicts discovered so far.
-        ``scanned`` -- number of sidebar items processed so far (across calls).
-        ``total`` -- total sidebar items enumerated.
-        ``done`` -- ``True`` when all items have been processed.
+        ``accounts`` -- list of ``{name, section}`` dicts discovered.
+        ``scanned`` -- number of sidebar items clicked.
+        ``total`` -- total sidebar items (estimated).
+        ``done`` -- always ``True`` (sweep completes in one call).
     """
     import time as _time  # noqa: PLC0415
-    import ctypes  # noqa: PLC0415
 
     from server.process_manager import get_process_manager  # noqa: PLC0415
     pm = get_process_manager()
@@ -1139,126 +1666,17 @@ def list_sidebar_accounts(bridge: Any, resume: bool = False,
         raise TargetNotFoundError("Use select_window to attach first.")
     root = pm.attached.hwnd
 
-    user32 = ctypes.windll.user32
-    buf = ctypes.create_unicode_buffer(256)
-
-    global _scan_state  # noqa: PLW0603
-
-    if not resume or not _scan_state.get("items"):
-        sidebar_items = _find_sidebar_accounts(root)
-        _scan_state = {
-            "items": sidebar_items,
-            "idx": 0,
-            "results": [],
-            "seen_names": set(),
-            "done": False,
-            "last_bracket": "",
-        }
-
-    items = _scan_state["items"]
-    idx = _scan_state["idx"]
-    results: list[dict[str, Any]] = _scan_state["results"]
-    seen_names: set[str] = _scan_state["seen_names"]
-    last_bracket: str = _scan_state.get("last_bracket", "")
-
-    deadline = _time.monotonic() + max_seconds
-
-    # Re-expand collapsed sections on every resume call — navigating to
-    # accounts in other sections may collapse the current one.
-    holder = _find_sidebar_holder(root)
-    if holder:
-        _expand_sidebar_sections(holder)
-
-    consecutive_same = 0  # count of sub-rows for current account
-
-    while idx < len(items) and _time.monotonic() < deadline:
-        item = items[idx]
-        idx += 1
-
-        # Optimisation: if at least TWO previous clicks produced the same
-        # bracket name, this adjacent item is likely another sub-row.  Skip
-        # without clicking (saves 1-5s per sub-row).  Require >= 2 to avoid
-        # skipping single-row accounts adjacent to multi-row ones.  Cap at 3
-        # consecutive skips to ensure we eventually click again.
-        if consecutive_same >= 2 and consecutive_same < 5:
-            # Peek: is this the same ListBox and adjacent item_index?
-            prev = items[idx - 2] if idx >= 2 else None
-            if (prev and prev["lb_hwnd"] == item["lb_hwnd"]
-                    and abs(prev["item_index"] - item["item_index"]) <= 1):
-                consecutive_same += 1
-                continue
-
-        user32.GetWindowTextW(root, buf, 256)
-        title_before = buf.value
-
-        # Dismiss any modal dialog that may have popped during previous click
-        _dismiss_modal_dialogs(root)
-
-        title = _sidebar_dblclick(
-            root, item["screen_x"], item["screen_y"], timeout=6.0,
-            lb_hwnd=item["lb_hwnd"], item_index=item["item_index"],
-            pre_title=title_before,
-            content_y_lb=item.get("content_y_lb", 0),
-            holder_hwnd=item.get("holder_hwnd", 0),
-        )
-
-        def _bracket(t: str) -> str:
-            if "[" in t and "]" in t:
-                raw = t[t.rfind("[") + 1 : t.rfind("]")]
-                # Fix UTF-8 double-encoding artifacts (e.g. "Â®" → "®")
-                try:
-                    raw = raw.encode("cp1252").decode("utf-8")
-                except (UnicodeEncodeError, UnicodeDecodeError):
-                    pass
-                return raw
-            return ""
-
-        name = _bracket(title)
-        if not name:
-            consecutive_same = 0
-            continue
-
-        if name == last_bracket:
-            consecutive_same += 1
-        else:
-            consecutive_same = 0
-        last_bracket = name
-
-        # Filter section summary rows — match against ALL known section
-        # names, not just the current section (which may be misclassified).
-        _SECTION_NAMES = {
-            "banking", "investing", "property & debt", "separate",
-            "rental property", "business", "savings goals",
-        }
-        if name.lower() in _SECTION_NAMES or _acct_match(name, item["section"]):
-            continue  # section summary row
-        if name not in seen_names:
-            seen_names.add(name)
-            results.append({
-                "name": name,
-                "section": item["section"],
-                "lb_hwnd": item["lb_hwnd"],
-                "item_index": item["item_index"],
-                "content_y_lb": item.get("content_y_lb", 0),
-                "item_content_y": item.get("item_content_y", 0),
-                "holder_hwnd": item.get("holder_hwnd", 0),
-                "screen_x": item["screen_x"],
-                "screen_y": item["screen_y"],
-            })
-
-    _scan_state["idx"] = idx
-    _scan_state["last_bracket"] = last_bracket
-    _scan_state["done"] = idx >= len(items)
+    results = _sweep_scan_sidebar(root, max_seconds=max_seconds)
 
     global _sidebar_cache  # noqa: PLW0603
     _sidebar_cache = list(results)
 
     return {
         "ok": True,
-        "accounts": list(results),
-        "scanned": idx,
-        "total": len(items),
-        "done": _scan_state["done"],
+        "accounts": results,
+        "scanned": len(results),
+        "total": len(results),
+        "done": True,
     }
 
 
@@ -1596,18 +2014,28 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
                     order.append(center + delta)
             return order
 
-        # Search the nearest ListBox only, ±4 indices from cached position.
-        # This keeps worst-case latency under ~30s (9 items × 3s each).
+        # Search the nearest ListBox only, ±8 indices from cached position.
+        # This keeps worst-case latency under ~50s (17 items × 3s each).
         if not all_lbs:
             return None
         lb_h, lb_cy, lb_cnt = all_lbs[0]
-        for item_i in _search_order(idx, lb_cnt):
+        for item_i in _search_order(idx, lb_cnt, radius=8):
             # Skip tiny header/separator items
             if _item_height(lb_h, item_i) < 10:
                 continue
             result = _click_and_check(lb_h, item_i)
             if result:
                 return result
+
+        # If not found in primary ListBox, try the next closest one
+        if len(all_lbs) > 1:
+            lb_h2, lb_cy2, lb_cnt2 = all_lbs[1]
+            for item_i in _search_order(0, lb_cnt2, radius=8):
+                if _item_height(lb_h2, item_i) < 10:
+                    continue
+                result = _click_and_check(lb_h2, item_i)
+                if result:
+                    return result
 
         return None
 

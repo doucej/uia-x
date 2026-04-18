@@ -197,30 +197,28 @@ def register(
     @mcp.tool(
         name="list_sidebar_accounts",
         description=(
-            "Discover all accounts in the Quicken sidebar by physically clicking "
-            "each item and reading the resulting window title.  Investment accounts "
-            "take 2-7 seconds each, so the scan is time-bounded: each call processes "
-            "items for up to max_seconds (default 20s) then returns with done=False. "
-            "Call repeatedly with resume=True until done=True to get all accounts. "
-            "The 'accounts' list accumulates across calls. "
-            "Example: call with resume=False, then keep calling with resume=True "
-            "until done=True. "
+            "Discover all accounts in the Quicken sidebar by scrolling through "
+            "and clicking visible items.  Uses a scroll-sweep approach that is "
+            "reliable for all account types including investments.  "
             "Returns {ok, accounts:[{name,section}], scanned, total, done}. "
+            "The scan completes in a single call (up to max_seconds).  "
             "Windows-only.  [Quicken skill]"
         ),
     )
     def list_sidebar_accounts_tool(
         api_key: str = "",
         resume: bool = False,
-        max_seconds: float = 20.0,
+        max_seconds: float = 180.0,
     ) -> dict[str, Any]:
         auth_err = check_auth(api_key)
         if auth_err:
             return auth_err
         try:
             bridge = get_bridge()
-            return bridge_ext.list_sidebar_accounts(bridge, resume=resume,
-                                                    max_seconds=max_seconds)
+            result = bridge_ext.list_sidebar_accounts(
+                bridge, resume=resume, max_seconds=max_seconds,
+            )
+            return result
         except UIAError as exc:
             return {"ok": False, "error": str(exc), "code": exc.code}
         except Exception as exc:  # noqa: BLE001
