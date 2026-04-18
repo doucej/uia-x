@@ -1286,18 +1286,16 @@ def _sidebar_dblclick(root_hwnd: int, screen_x: int, screen_y: int,
 
 
 def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 120.0) -> list[dict[str, Any]]:
-    """Discover sidebar accounts by scrolling and clicking items sequentially.
+    """Discover sidebar accounts by scrolling and clicking ListBox items.
 
-    Key design points:
-    * Quicken destroys/recreates ListBox hwnds after each navigation.
-    * Enumeration of 40+ ListBoxes is expensive (~14s with naive approach).
-    * Optimisation: skip ListBoxes whose window rect is outside the viewport.
-    * Collect items ONCE per scroll position; after a detected navigation
-      (title bracket changed), re-collect because the sidebar rebuilt.
-    * Uses bail_early=0.5 so Phase 1 catches most banking navigations
-      (which complete in ~0.5-1.0s).
+    Uses per-item targeting via LB_GETITEMRECT to click only actual ListBox
+    items — never random pixel positions.  This avoids accidentally collapsing
+    sidebar sections (which happens with grid-click approaches).
 
-    Returns a list of ``{name, section}`` dicts.
+    Between passes, re-expands all sidebar sections to recover any that may
+    have collapsed due to Quicken state changes.
+
+    Returns a list of ``{name, section, nav_scroll, nav_y, ...}`` dicts.
     """
     import ctypes  # noqa: PLC0415
     import ctypes.wintypes as wt  # noqa: PLC0415
@@ -1315,7 +1313,6 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 120.0) -> list[dict
         return []
 
     def _ensure_sidebar_visible() -> bool:
-        """Re-find holder if stale, show it, return True if visible."""
         h = _holder[0]
         if not h or not user32.IsWindow(h) or not user32.IsWindowVisible(h):
             h = _find_sidebar_holder(root_hwnd)
@@ -1323,14 +1320,14 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 120.0) -> list[dict
                 return False
             _holder[0] = h
         if not user32.IsWindowVisible(h):
-            chain_vis: list[int] = []
+            chain: list[int] = []
             p = h
             while p and p != root_hwnd:
-                chain_vis.append(p)
+                chain.append(p)
                 p = user32.GetParent(p)
-            for p in reversed(chain_vis):
+            for p in reversed(chain):
                 if not user32.IsWindowVisible(p):
-                    user32.ShowWindow(p, 5)  # SW_SHOW
+                    user32.ShowWindow(p, 5)
             _time.sleep(0.2)
         return user32.IsWindowVisible(_holder[0]) != 0
 
@@ -1339,7 +1336,12 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 120.0) -> list[dict
 
     holder = _holder[0]
     user32.SetForegroundWindow(root_hwnd)
+
+    # Expand sections twice — first pass may miss some due to layout shifts
     _expand_sidebar_sections(holder)
+    _time.sleep(0.3)
+    _expand_sidebar_sections(holder)
+    _time.sleep(0.2)
 
     cls_buf = ctypes.create_unicode_buffer(64)
     txt_buf = ctypes.create_unicode_buffer(256)
@@ -1352,7 +1354,7 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 120.0) -> list[dict
         user32.GetWindowTextW(h, txt_buf, 256)
         return txt_buf.value
 
-    class _SI(ctypes.Structure):  # SCROLLINFO
+    class _SI(ctypes.Structure):
         _fields_ = [("cbSize", ctypes.c_uint), ("fMask", ctypes.c_uint),
                     ("nMin", ctypes.c_int), ("nMax", ctypes.c_int),
                     ("nPage", ctypes.c_uint), ("nPos", ctypes.c_int),
@@ -1371,119 +1373,20 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 120.0) -> list[dict
 
     def _scroll_to(pos: int) -> None:
         SM(_holder[0], WM_VSCROLL, (pos << 16) | SB_THUMBPOSITION, 0)
-        _time.sleep(0.25)
+        _time.sleep(0.20)
         SM(_holder[0], WM_VSCROLL, SB_ENDSCROLL, 0)
         _time.sleep(0.10)
 
     hr = wt.RECT()
-    lb_rect = wt.RECT()
     user32.GetWindowRect(holder, ctypes.byref(hr))
     viewport_h = hr.bottom - hr.top
-    step = max(50, viewport_h // 2)
+    # Use 1/3 viewport steps for overlapping coverage
+    step = max(50, viewport_h // 3)
 
-    # SendMessageTimeoutW for non-blocking LB queries in _collect_visible.
-    _SMT_cv = user32.SendMessageTimeoutW
-    _SMT_cv.argtypes = [wt.HWND, ctypes.c_uint, wt.WPARAM, wt.LPARAM,
-                        ctypes.c_uint, ctypes.c_uint,
-                        ctypes.POINTER(ctypes.c_size_t)]
-    _SMT_cv.restype = wt.LPARAM
-    _SMTO_ABORTIFHUNG = 0x0002
-    _smt_out = ctypes.c_size_t(0)
-    _SMT_TIMEOUT_MS = 250  # aggressive but OK — we iterate all scroll positions
-
-    def _smt(hwnd: int, msg: int, wp: int, lp: int) -> int:
-        """SendMessage with timeout — returns result or -1 on timeout."""
-        ret = _SMT_cv(hwnd, msg, wp, lp,
-                      _SMTO_ABORTIFHUNG, _SMT_TIMEOUT_MS,
-                      ctypes.byref(_smt_out))
-        if ret == 0:
-            return -1
-        return _smt_out.value
-
-    def _collect_visible() -> list[tuple[int, int, str, int, int]]:
-        """Enumerate ListBoxes and return items in the holder viewport.
-
-        Uses SendMessageTimeoutW (500ms) to avoid blocking when Quicken's
-        message pump is busy.  Auto-retries once if >5 LBs timed out.
-        """
-        for attempt in range(2):
-            t_start = _time.monotonic()
-            current_lbs: list[tuple[int, str]] = []
-            cur_seen: set[int] = set()
-
-            def _enum(h: int, _: int) -> bool:
-                if h in cur_seen:
-                    return True
-                if _cls(h) != "ListBox":
-                    return True
-                parent = user32.GetParent(h)
-                if _cls(parent) != "QWListViewer":
-                    return True
-                section = _txt(parent)
-                cur_seen.add(h)
-                current_lbs.append((h, section))
-                return True
-
-            user32.EnumChildWindows(_holder[0], EnumCB(_enum), 0)
-            user32.GetWindowRect(_holder[0], ctypes.byref(hr))
-            margin = 50
-
-            skipped_lbs = 0
-            timed_out_lbs = 0
-            total_items_checked = 0
-            items: list[tuple[int, int, str, int, int]] = []
-            for lb_h, section in current_lbs:
-                user32.GetWindowRect(lb_h, ctypes.byref(lb_rect))
-                if lb_rect.bottom < hr.top - margin or lb_rect.top > hr.bottom + margin:
-                    skipped_lbs += 1
-                    continue
-
-                count = _smt(lb_h, LB_GETCOUNT, 0, 0)
-                if count <= 0:
-                    if count == -1:
-                        timed_out_lbs += 1
-                    continue
-                count = min(count, 30)
-                for i in range(count):
-                    ir = wt.RECT()
-                    rc = _smt(lb_h, LB_GETITEMRECT, i, ctypes.addressof(ir))
-                    if rc == -1:
-                        timed_out_lbs += 1
-                        break
-                    total_items_checked += 1
-                    if ir.bottom - ir.top <= 5:
-                        continue
-                    pt = wt.POINT((ir.left + ir.right) // 2,
-                                  (ir.top + ir.bottom) // 2)
-                    user32.ClientToScreen(lb_h, ctypes.byref(pt))
-                    if pt.y > hr.bottom + margin:
-                        break
-                    if hr.top - margin <= pt.y <= hr.bottom + margin:
-                        items.append((lb_h, i, section, pt.x, pt.y))
-            items.sort(key=lambda x: x[4])
-            if _SIDEBAR_DEBUG:
-                elapsed = _time.monotonic() - t_start
-                print(f"  [collect] {len(current_lbs)} LBs, {skipped_lbs} skip, "
-                      f"{timed_out_lbs} timeout, {total_items_checked} checked, "
-                      f"{len(items)} vis, {elapsed:.3f}s (attempt {attempt})",
-                      flush=True, file=sys.stderr)
-
-            # Accept first-pass results — retrying is expensive (10-12s)
-            # and only gains 1-2 items.  Caller should settle before collecting.
-            return items
-        return items  # unreachable but satisfies type checker
-
-    if _SIDEBAR_DEBUG:
-        si_init = _get_si()
-        ms = max(0, si_init.nMax - int(si_init.nPage) + 1)
-        print(f"  [sweep] viewport={viewport_h}, max_scroll={ms}, step={step}",
-              flush=True, file=sys.stderr)
-
-    # ------------------------------------------------------------------
     SECTION_NAMES = {
         "banking", "investing", "property & debt", "separate",
-        "rental property", "business", "savings goals",
-        "home",  # Quicken Home tab
+        "rental property", "business", "savings goals", "home",
+        "all transactions",
     }
 
     accounts: dict[str, dict[str, Any]] = {}
@@ -1491,23 +1394,30 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 120.0) -> list[dict
     buf = ctypes.create_unicode_buffer(256)
     total_clicks = 0
 
+    def _dblclick(sx: int, sy: int) -> None:
+        user32.SetCursorPos(sx, sy)
+        _time.sleep(0.02)
+        for _ in range(2):
+            user32.mouse_event(0x0002, 0, 0, 0, 0)
+            user32.mouse_event(0x0004, 0, 0, 0, 0)
+            _time.sleep(0.02)
+        _time.sleep(0.20)
+
+    def _read_bracket() -> str:
+        user32.GetWindowTextW(root_hwnd, buf, 256)
+        return _bracket_name(buf.value)
+
     def _wait_for_title(max_wait: float = 4.0) -> str:
-        """Wait until the window title bracket is non-blank, up to *max_wait*."""
         t0 = _time.monotonic()
         while _time.monotonic() - t0 < max_wait:
-            user32.GetWindowTextW(root_hwnd, buf, 256)
-            b = _bracket_name(buf.value)
+            b = _read_bracket()
             if b:
                 return b
             _time.sleep(0.4)
         return ""
 
-    LB_SETCURSEL = 0x0186
-    WM_COMMAND_MSG = 0x0111
-    LBN_DBLCLK = 2
-
-    MAX_SWEEPS = 6
-    for sweep_num in range(MAX_SWEEPS):
+    MAX_PASSES = 4
+    for pass_num in range(MAX_PASSES):
         if _time.monotonic() >= deadline:
             break
         accts_before = len(accounts)
@@ -1518,95 +1428,109 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 120.0) -> list[dict
                 break
         holder = _holder[0]
 
-        _expand_sidebar_sections(holder)
+        # Re-expand sections each pass (navigations may collapse some)
+        if pass_num > 0:
+            _expand_sidebar_sections(holder)
+            _time.sleep(0.3)
 
-        si_fresh = _get_si()
-        max_scroll = max(0, si_fresh.nMax - int(si_fresh.nPage) + 1)
+        si = _get_si()
+        max_scroll = max(0, si.nMax - int(si.nPage) + 1)
         user32.GetWindowRect(holder, ctypes.byref(hr))
         viewport_h = hr.bottom - hr.top
-        step = max(50, viewport_h // 2)
+        step = max(50, viewport_h // 3)
+
+        if _SIDEBAR_DEBUG:
+            print(f"  [pass {pass_num}] viewport={viewport_h}, "
+                  f"max_scroll={max_scroll}, step={step}",
+                  flush=True, file=sys.stderr)
 
         scroll_pos = 0
         while scroll_pos <= max_scroll + step and _time.monotonic() < deadline:
             actual_pos = min(scroll_pos, max_scroll)
-
             user32.SetForegroundWindow(root_hwnd)
             _scroll_to(actual_pos)
             _dismiss_modal_dialogs(root_hwnd)
-
-            # Click at regular Y intervals across the viewport.
-            # No _collect_visible needed — physical mouse clicks target
-            # whatever ListBox item is at each position.
             user32.GetWindowRect(holder, ctypes.byref(hr))
-            sx = (hr.left + hr.right) // 2
-            y_base = hr.top + 25
-            y_end = hr.bottom - 10
-            y_step = 45  # tight spacing for better coverage
-            # Jitter start per sweep so different sweeps hit different items
-            jitter = (sweep_num * 23) % y_step
-            y_start = y_base + jitter
+            htop, hbot = hr.top, hr.bottom
 
-            for y in range(y_start, y_end, y_step):
+            # Enumerate visible ListBoxes at this scroll position
+            vis_lbs: list[tuple[int, int]] = []
+
+            def _enum_lb(h: int, _: int) -> bool:
+                if _cls(h) != "ListBox":
+                    return True
+                wr = wt.RECT()
+                user32.GetWindowRect(h, ctypes.byref(wr))
+                if wr.bottom - wr.top > 5:
+                    cnt = SM(h, LB_GETCOUNT, 0, 0)
+                    if cnt > 0:
+                        vis_lbs.append((h, cnt))
+                return True
+
+            user32.EnumChildWindows(holder, EnumCB(_enum_lb), 0)
+
+            for lb_h, count in vis_lbs:
                 if _time.monotonic() >= deadline:
                     break
+                for i in range(min(count, 30)):
+                    if _time.monotonic() >= deadline:
+                        break
+                    ir = wt.RECT()
+                    SM(lb_h, LB_GETITEMRECT, i, ctypes.addressof(ir))
+                    item_h = ir.bottom - ir.top
+                    if item_h < 10:
+                        continue
 
-                # Ensure title is non-blank before clicking
-                pre_bracket = _wait_for_title(1.5)
-                if not pre_bracket:
-                    continue
+                    pt = wt.POINT((ir.left + ir.right) // 2,
+                                  (ir.top + ir.bottom) // 2)
+                    user32.ClientToScreen(lb_h, ctypes.byref(pt))
+                    if pt.y < htop or pt.y > hbot:
+                        continue
 
-                # Record the name we see before clicking (if new)
-                if (pre_bracket.lower() not in SECTION_NAMES
-                        and pre_bracket not in accounts):
-                    accounts[pre_bracket] = {
-                        "name": pre_bracket, "section": "",
-                    }
+                    pre = _read_bracket()
+                    if not pre:
+                        pre = _wait_for_title(1.5)
+                    if not pre:
+                        continue
 
-                # Dismiss modals periodically
-                if total_clicks % 10 == 0:
-                    _dismiss_modal_dialogs(root_hwnd)
+                    # Record pre-click account (already navigated there)
+                    if (pre.lower() not in SECTION_NAMES
+                            and pre not in accounts):
+                        accounts[pre] = {"name": pre, "section": ""}
 
-                # Physical double-click at (sx, y)
-                user32.SetCursorPos(sx, y)
-                _time.sleep(0.02)
-                for _dc in range(2):
-                    user32.mouse_event(0x0002, 0, 0, 0, 0)
-                    user32.mouse_event(0x0004, 0, 0, 0, 0)
-                    _time.sleep(0.02)
-                _time.sleep(0.05)
+                    if total_clicks % 15 == 0:
+                        _dismiss_modal_dialogs(root_hwnd)
 
-                user32.GetWindowTextW(root_hwnd, buf, 256)
-                probe_bracket = _bracket_name(buf.value)
-                total_clicks += 1
+                    _dblclick(pt.x, pt.y)
+                    total_clicks += 1
 
-                if probe_bracket and probe_bracket != pre_bracket:
-                    name = probe_bracket
-                    navigated = True
-                elif not probe_bracket:
-                    # Blank — investment account loading
-                    name = _wait_for_title(3.0)
-                    _dismiss_modal_dialogs(root_hwnd)
-                    navigated = bool(name and name != pre_bracket)
-                else:
-                    name = probe_bracket
-                    navigated = False
+                    post = _read_bracket()
+                    if not post:
+                        post = _wait_for_title(3.0)
+                        _dismiss_modal_dialogs(root_hwnd)
 
-                if _SIDEBAR_DEBUG:
-                    print(f"  [sweep {sweep_num}] #{total_clicks}: "
-                          f"name={name!r} y={y} nav={navigated}",
-                          flush=True, file=sys.stderr)
+                    navigated = post and post != pre
+                    name = post or pre
 
-                if name and name.lower() not in SECTION_NAMES:
-                    if name not in accounts:
-                        accounts[name] = {"name": name, "section": ""}
+                    if _SIDEBAR_DEBUG:
+                        if navigated:
+                            print(f"  [pass {pass_num}] #{total_clicks}: "
+                                  f"{name!r} (scroll={actual_pos} lb={lb_h} "
+                                  f"i={i} y={pt.y})",
+                                  flush=True, file=sys.stderr)
 
-                # After navigation, the title won't change for remaining
-                # clicks at this scroll position — move to next position.
-                if navigated:
-                    break
+                    if name and name.lower() not in SECTION_NAMES:
+                        if name not in accounts:
+                            accounts[name] = {"name": name, "section": ""}
+                        if navigated:
+                            accounts[name]["nav_scroll"] = actual_pos
+                            accounts[name]["nav_y"] = pt.y
+                            accounts[name]["nav_sx"] = pt.x
+                            accounts[name]["nav_lb"] = lb_h
+                            accounts[name]["nav_item"] = i
 
             if _SIDEBAR_DEBUG:
-                print(f"  [sweep {sweep_num}] scroll={actual_pos} done, "
+                print(f"  [pass {pass_num}] scroll={actual_pos} done, "
                       f"accounts={len(accounts)}",
                       flush=True, file=sys.stderr)
 
@@ -1614,7 +1538,7 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 120.0) -> list[dict
 
         new_accounts = len(accounts) - accts_before
         if _SIDEBAR_DEBUG:
-            print(f"  [sweep {sweep_num}] pass done: +{new_accounts} "
+            print(f"  [pass {pass_num}] done: +{new_accounts} "
                   f"(total {len(accounts)})",
                   flush=True, file=sys.stderr)
 
@@ -1868,7 +1792,12 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
     # scan because we stop as soon as we find the target.
     # ------------------------------------------------------------------
     def _navigate_via_sidebar(target_name: str) -> dict | None:
-        """Scroll through sidebar, clicking items until target opens."""
+        """Scroll through sidebar, clicking items until target opens.
+
+        If the sidebar cache has a recorded click position for this account,
+        try that specific position first (fast path).  Otherwise, do a full
+        scroll-and-click scan.
+        """
         holder = _find_sidebar_holder(root_hwnd)
         if not holder or not _is_valid_hwnd(holder):
             return None
@@ -1891,10 +1820,6 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
         SBM_SETPOS = 0x00E0
         WM_VSCROLL = 0x0115
         SB_THUMBPOSITION = 4
-
-        si = _SI()
-        si.cbSize = ctypes.sizeof(si)
-        si.fMask = SIF_ALL
 
         scrollbar_h = 0
         _EnumCB = ctypes.WINFUNCTYPE(
@@ -1919,58 +1844,137 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
                 (pos << 16) | SB_THUMBPOSITION, scrollbar_h)
             time.sleep(0.15)
 
+        def _dblclick(sx_: int, y_: int) -> None:
+            user32.SetCursorPos(sx_, y_)
+            time.sleep(0.02)
+            for _dc in range(2):
+                user32.mouse_event(0x0002, 0, 0, 0, 0)
+                user32.mouse_event(0x0004, 0, 0, 0, 0)
+                time.sleep(0.02)
+            time.sleep(0.20)
+
+        buf = ctypes.create_unicode_buffer(256)
+
+        def _check_match() -> str | None:
+            """Read title bracket, wait for blank, return if target matches."""
+            user32.GetWindowTextW(root_hwnd, buf, 256)
+            bracket = _bracket_name(buf.value)
+            if not bracket:
+                # Investment account loading — wait
+                time.sleep(3.0)
+                _dismiss_modal_dialogs(root_hwnd)
+                user32.GetWindowTextW(root_hwnd, buf, 256)
+                bracket = _bracket_name(buf.value)
+            if bracket and _acct_match(bracket, target_name):
+                return bracket
+            return None
+
+        # --- Fast path: try the cached click position ---
+        cached = _sidebar_lookup(target_name) if _sidebar_cache else None
+        if cached and "nav_scroll" in cached:
+            user32.SetForegroundWindow(root_hwnd)
+            _scroll_to(cached["nav_scroll"])
+            _dismiss_modal_dialogs(root_hwnd)
+
+            # Click at the stored position and nearby offsets
+            sx_ = cached.get("nav_sx", 0)
+            nav_y = cached["nav_y"]
+            hr = wt.RECT()
+            user32.GetWindowRect(holder, ctypes.byref(hr))
+            if not sx_:
+                sx_ = (hr.left + hr.right) // 2
+
+            for y_off in [0, -20, 20, -40, 40]:
+                y_ = nav_y + y_off
+                if y_ < hr.top or y_ > hr.bottom:
+                    continue
+                _dblclick(sx_, y_)
+                match = _check_match()
+                if match:
+                    return {"ok": True, "account": match,
+                            "method": "sidebar_cached"}
+
+        # --- Slow path: per-item ListBox scan ---
+        _expand_sidebar_sections(holder)
+        time.sleep(0.3)
+
+        LB_GETCOUNT = 0x018B
+        LB_GETITEMRECT = 0x0198
+
+        si = _SI()
+        si.cbSize = ctypes.sizeof(si)
+        si.fMask = SIF_ALL
         user32.GetScrollInfo(holder, SB_VERT, ctypes.byref(si))
         max_scroll = max(0, si.nMax - int(si.nPage) + 1)
         hr = wt.RECT()
         user32.GetWindowRect(holder, ctypes.byref(hr))
         viewport_h = hr.bottom - hr.top
-        step_size = max(50, viewport_h // 2)
+        step_size = max(50, viewport_h // 3)
+        deadline = time.monotonic() + 90
 
-        buf = ctypes.create_unicode_buffer(256)
-        deadline = time.monotonic() + 60  # 60s max for targeted nav
+        _nav_EnumCB = ctypes.WINFUNCTYPE(
+            ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
 
-        scroll_pos = 0
-        while scroll_pos <= max_scroll + step_size and time.monotonic() < deadline:
-            actual_pos = min(scroll_pos, max_scroll)
-            user32.SetForegroundWindow(root_hwnd)
-            _scroll_to(actual_pos)
-            _dismiss_modal_dialogs(root_hwnd)
+        for sweep in range(3):
+            if sweep > 0:
+                _expand_sidebar_sections(holder)
+                time.sleep(0.2)
+                user32.GetScrollInfo(holder, SB_VERT, ctypes.byref(si))
+                max_scroll = max(0, si.nMax - int(si.nPage) + 1)
 
-            user32.GetWindowRect(holder, ctypes.byref(hr))
-            sx = (hr.left + hr.right) // 2
-            y_start = hr.top + 25
-            y_end = hr.bottom - 10
+            scroll_pos = 0
+            while (scroll_pos <= max_scroll + step_size
+                   and time.monotonic() < deadline):
+                actual_pos = min(scroll_pos, max_scroll)
+                user32.SetForegroundWindow(root_hwnd)
+                _scroll_to(actual_pos)
+                _dismiss_modal_dialogs(root_hwnd)
 
-            for y in range(y_start, y_end, 45):
-                if time.monotonic() >= deadline:
-                    break
+                user32.GetWindowRect(holder, ctypes.byref(hr))
+                htop, hbot = hr.top, hr.bottom
 
-                # Physical double-click
-                user32.SetCursorPos(sx, y)
-                time.sleep(0.02)
-                for _dc in range(2):
-                    user32.mouse_event(0x0002, 0, 0, 0, 0)
-                    user32.mouse_event(0x0004, 0, 0, 0, 0)
-                    time.sleep(0.02)
-                time.sleep(0.15)
+                vis_lbs: list[tuple[int, int]] = []
 
-                user32.GetWindowTextW(root_hwnd, buf, 256)
-                bracket = _bracket_name(buf.value)
+                def _enum_nav(h: int, _: int) -> bool:
+                    cls_b = ctypes.create_unicode_buffer(64)
+                    user32.GetClassNameW(h, cls_b, 64)
+                    if cls_b.value == "ListBox":
+                        wr = wt.RECT()
+                        user32.GetWindowRect(h, ctypes.byref(wr))
+                        if wr.bottom - wr.top > 5:
+                            cnt = user32.SendMessageW(h, LB_GETCOUNT, 0, 0)
+                            if cnt > 0:
+                                vis_lbs.append((h, cnt))
+                    return True
 
-                if not bracket:
-                    # Investment loading — wait
-                    time.sleep(2.0)
-                    _dismiss_modal_dialogs(root_hwnd)
-                    user32.GetWindowTextW(root_hwnd, buf, 256)
-                    bracket = _bracket_name(buf.value)
+                user32.EnumChildWindows(
+                    holder, _nav_EnumCB(_enum_nav), 0)
 
-                if bracket and _acct_match(bracket, target_name):
-                    return {
-                        "ok": True, "account": bracket,
-                        "method": "sidebar_scan",
-                    }
+                for lb_h, count in vis_lbs:
+                    if time.monotonic() >= deadline:
+                        break
+                    for i in range(min(count, 30)):
+                        if time.monotonic() >= deadline:
+                            break
+                        ir = wt.RECT()
+                        user32.SendMessageW(
+                            lb_h, LB_GETITEMRECT, i,
+                            ctypes.addressof(ir))
+                        if ir.bottom - ir.top < 10:
+                            continue
+                        pt = wt.POINT(
+                            (ir.left + ir.right) // 2,
+                            (ir.top + ir.bottom) // 2)
+                        user32.ClientToScreen(lb_h, ctypes.byref(pt))
+                        if pt.y < htop or pt.y > hbot:
+                            continue
+                        _dblclick(pt.x, pt.y)
+                        match = _check_match()
+                        if match:
+                            return {"ok": True, "account": match,
+                                    "method": "sidebar_scan"}
 
-            scroll_pos += step_size
+                scroll_pos += step_size
 
         return None
 
