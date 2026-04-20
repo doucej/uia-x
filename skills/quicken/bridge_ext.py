@@ -2287,13 +2287,18 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
 
 
 def list_sidebar_accounts(bridge: Any, resume: bool = False,
-                           max_seconds: float = 300.0) -> dict[str, Any]:
+                           max_seconds: float = 300.0,
+                           force_rescan: bool = False) -> dict[str, Any]:
     """Discover sidebar accounts by scrolling through and clicking visible items.
 
     Uses a scroll-sweep approach: walks the sidebar holder's scroll range in
     overlapping viewport-sized steps, clicking only physically-visible items
     at each position.  This avoids stale content-Y estimates and unreliable
     message-based clicks on hidden ListBoxes.
+
+    When a previous scan has populated the cache, returns cached results
+    immediately unless ``force_rescan`` is set.  This avoids the 300-second
+    full scan on every call.
 
     Parameters
     ----------
@@ -2303,7 +2308,9 @@ def list_sidebar_accounts(bridge: Any, resume: bool = False,
         Accepted for API compatibility but ignored — the sweep scan always
         starts fresh and completes in a single call.
     max_seconds
-        Seconds budget for the entire scan (default 120).
+        Seconds budget for the entire scan (default 300).
+    force_rescan
+        If True, discard the cache and run a fresh scan.
 
     Returns
     -------
@@ -2313,6 +2320,7 @@ def list_sidebar_accounts(bridge: Any, resume: bool = False,
         ``scanned`` -- number of sidebar items clicked.
         ``total`` -- total sidebar items (estimated).
         ``done`` -- always ``True`` (sweep completes in one call).
+        ``cached`` -- ``True`` if results were served from cache.
     """
     import time as _time  # noqa: PLC0415
 
@@ -2322,9 +2330,22 @@ def list_sidebar_accounts(bridge: Any, resume: bool = False,
         raise TargetNotFoundError("Use select_window to attach first.")
     root = pm.attached.hwnd
 
-    results = _sweep_scan_sidebar(root, max_seconds=max_seconds)
-
     global _sidebar_cache  # noqa: PLW0603
+
+    # Return cached results when available (avoids 300s rescan)
+    if _sidebar_cache and not force_rescan:
+        accts = [{"name": e["name"], "section": e.get("section", "")}
+                 for e in _sidebar_cache]
+        return {
+            "ok": True,
+            "accounts": accts,
+            "scanned": len(accts),
+            "total": len(accts),
+            "done": True,
+            "cached": True,
+        }
+
+    results = _sweep_scan_sidebar(root, max_seconds=max_seconds)
     _sidebar_cache = list(results)
 
     return {
@@ -2333,6 +2354,7 @@ def list_sidebar_accounts(bridge: Any, resume: bool = False,
         "scanned": len(results),
         "total": len(results),
         "done": True,
+        "cached": False,
     }
 
 
@@ -2428,9 +2450,80 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
     # Dismiss any modal dialogs that may be blocking interaction
     _dismiss_modal_dialogs(root_hwnd)
 
+    target_name = account_name  # convenience alias
+
     EnumCB = ctypes.WINFUNCTYPE(
         ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
     )
+
+    def _activate_mdi(mdi_h: int) -> None:
+        """Activate a QWMDI child.
+
+        BringWindowToTop + SetFocus is the reliable mechanism in Quicken's
+        MDI architecture.  WM_MDIACTIVATE (sent to MDIClient) does not work
+        — Quicken ignores it.
+        """
+        user32.BringWindowToTop(mdi_h)
+        user32.SetFocus(mdi_h)
+
+    def _verify_and_stabilize(result: dict) -> dict:
+        """Post-navigate stabilization.
+
+        After any successful navigation, verify that the active account
+        matches what we expect.  If Quicken has already switched away
+        (common after sidebar clicks), re-activate the target QWMDI.
+        """
+        if not result.get("ok"):
+            return result
+        expected = result.get("account", "")
+        if not expected:
+            return result
+
+        time.sleep(0.3)
+        _dismiss_modal_dialogs(root_hwnd)
+
+        # Check title bar bracket
+        _vbuf = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(root_hwnd, _vbuf, 256)
+        current = _bracket_name(_vbuf.value)
+        if current and _acct_match(current, target_name):
+            return result
+
+        # Bracket doesn't match — Quicken switched away.  Try to find
+        # the target QWMDI and re-activate it.
+        _target_mdi: list[int] = []
+
+        def _find_target(h: int, _: int) -> bool:
+            cls = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(h, cls, 64)
+            if cls.value != "QWMDI" or not user32.IsWindowVisible(h):
+                return True
+            _tbuf = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(h, _tbuf, 256)
+            if _tbuf.value.strip().lower() == expected.lower():
+                _target_mdi.append(h)
+                return False
+            if _acct_match(_tbuf.value.strip(), expected):
+                _target_mdi.append(h)
+            return True
+
+        user32.EnumChildWindows(root_hwnd, EnumCB(_find_target), 0)
+        if _target_mdi:
+            _activate_mdi(_target_mdi[0])
+            time.sleep(0.3)
+            user32.GetWindowTextW(root_hwnd, _vbuf, 256)
+            current = _bracket_name(_vbuf.value)
+            if current and _acct_match(current, target_name):
+                return result
+
+        # Still wrong — report it but don't fail (navigation DID happen
+        # momentarily; Quicken just switched away)
+        result["warning"] = (
+            f"Navigate succeeded but Quicken switched to "
+            f"'{current or 'unknown'}' afterward.  Use existing_tab "
+            f"or retry."
+        )
+        return result
 
     # ------------------------------------------------------------------
     # Phase 1: Check if there's already a QWMDI child showing this acct.
@@ -2464,8 +2557,8 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
 
     existing_mdi = exact_mdi or fuzzy_mdi
     if existing_mdi:
-        user32.BringWindowToTop(existing_mdi)
-        user32.SetFocus(existing_mdi)
+        _activate_mdi(existing_mdi)
+        time.sleep(0.3)
         _mtitle = ctypes.create_unicode_buffer(256)
         user32.GetWindowTextW(existing_mdi, _mtitle, 256)
         matched_name = _mtitle.value.strip() or account_name
@@ -2476,8 +2569,19 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
         if not exact_mdi and len(matched_name) > len(account_name) + 3:
             pass  # skip — fall through to combo/sidebar for better match
         else:
-            return {"ok": True, "account": matched_name,
-                    "method": "existing_tab"}
+            # Verify the root title bracket actually changed
+            _vbuf_et = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(root_hwnd, _vbuf_et, 256)
+            bracket_et = _bracket_name(_vbuf_et.value)
+            if not bracket_et or not _acct_match(bracket_et, target_name):
+                # BringWindowToTop didn't activate — try
+                # SetForegroundWindow first, then re-activate
+                user32.SetForegroundWindow(root_hwnd)
+                _activate_mdi(existing_mdi)
+                time.sleep(0.3)
+            return _verify_and_stabilize(
+                {"ok": True, "account": matched_name,
+                 "method": "existing_tab"})
 
     # ------------------------------------------------------------------
     # Phase 2: Try combo selector first (fast — no sidebar scan needed).
@@ -2501,8 +2605,7 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
             _cls = ctypes.create_unicode_buffer(64)
             user32.GetClassNameW(_mdi, _cls, 64)
             if _cls.value == "QWMDI":
-                user32.BringWindowToTop(_mdi)
-                user32.SetFocus(_mdi)
+                _activate_mdi(_mdi)
                 break
             _mdi = user32.GetParent(_mdi)
 
@@ -2528,14 +2631,16 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
             except (UnicodeEncodeError, UnicodeDecodeError):
                 pass
             if _acct_match(opened, account_name):
-                return {"ok": True, "account": opened, "method": "combo"}
+                return _verify_and_stabilize(
+                    {"ok": True, "account": opened, "method": "combo"})
 
         # For category-view combos (Property & Debt, etc.), the title
         # bracket won't change to the account name.  Verify by reading
         # the combo selection text instead.
         sel_text = _combo_cur_text(combo_h)
         if _acct_match(sel_text, account_name):
-            return {"ok": True, "account": sel_text, "method": "combo_filter"}
+            return _verify_and_stabilize(
+                {"ok": True, "account": sel_text, "method": "combo_filter"})
 
     # ------------------------------------------------------------------
     # Phase 3: Targeted sidebar scan — scroll through and click items
@@ -2699,8 +2804,9 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
                         _dblclick(pt_fp.x, pt_fp.y)
                         match = _check_match()
                         if match:
-                            return {"ok": True, "account": match,
-                                    "method": "sidebar_cached_lb"}
+                            return _verify_and_stabilize(
+                                {"ok": True, "account": match,
+                                 "method": "sidebar_cached_lb"})
 
             # Fallback: scroll to cached position and click at stored coords
             if "nav_scroll" in cached:
@@ -2719,8 +2825,9 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
                     _dblclick(sx_, y_)
                     match = _check_match()
                     if match:
-                        return {"ok": True, "account": match,
-                                "method": "sidebar_cached"}
+                        return _verify_and_stabilize(
+                            {"ok": True, "account": match,
+                             "method": "sidebar_cached"})
 
         # --- Slow path: scroll + wheel-scroll sidebar scan ---
         _expand_sidebar_sections(holder)
@@ -2841,9 +2948,10 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
                         _dblclick(pt.x, pt.y)
                         match = _check_match()
                         if match:
-                            return {"ok": True,
-                                    "account": match,
-                                    "method": "sidebar_scan"}
+                            return _verify_and_stabilize(
+                                {"ok": True,
+                                 "account": match,
+                                 "method": "sidebar_scan"})
 
                         # Cache any non-target discovered account
                         user32.GetWindowTextW(root_hwnd, buf, 256)
@@ -3874,11 +3982,31 @@ def set_register_filter(bridge: Any, text: str) -> dict[str, Any]:
 
     # Verify Quicken didn't silently switch accounts (a known side-effect
     # of triggering EN_CHANGE on some filter controls).
+    # BringWindowToTop + SetFocus is the reliable mechanism in Quicken —
+    # WM_MDIACTIVATE (sent to MDIClient) does not work.
     post_mdi = _find_active_mdi(root_hwnd)
     if post_mdi and post_mdi != mdi_h:
         user32.BringWindowToTop(mdi_h)
         user32.SetFocus(mdi_h)
-        time.sleep(0.2)
+        time.sleep(0.3)
+
+        # Re-check — if MDI *still* doesn't match, fail loudly so the
+        # caller knows the filter may have been applied to the wrong
+        # account rather than silently returning wrong data.
+        post_mdi2 = _find_active_mdi(root_hwnd)
+        if post_mdi2 and post_mdi2 != mdi_h:
+            return {
+                "ok": False,
+                "error": "focus_shifted",
+                "detail": (
+                    "Applying the filter caused Quicken to switch "
+                    "to a different account register.  The filter "
+                    "text was applied but may be on the wrong "
+                    "account.  Clear the filter and re-navigate."
+                ),
+                "filter": text,
+                "count": "",
+            }
 
     # Read updated count
     count_static = next(
@@ -3896,7 +4024,16 @@ def set_register_filter(bridge: Any, text: str) -> dict[str, Any]:
                     count_static = t2
                     break
 
-    return {"ok": True, "filter": text, "count": count_static}
+    # Read the account name from the root title bar so the caller can
+    # verify which account the filter was applied to.
+    _acct_buf = ctypes.create_unicode_buffer(512)
+    user32.GetWindowTextW(root_hwnd, _acct_buf, 512)
+    import re as _re  # noqa: PLC0415
+    _acct_m = _re.search(r"\[(.+?)\]\s*$", _acct_buf.value)
+    _acct_name = _acct_m.group(1).strip() if _acct_m else ""
+
+    return {"ok": True, "filter": text, "count": count_static,
+            "account": _acct_name}
 
 
 def open_reconcile(

@@ -200,8 +200,10 @@ def register(
             "Discover all accounts in the Quicken sidebar by scrolling through "
             "and clicking visible items.  Uses a scroll-sweep approach that is "
             "reliable for all account types including investments.  "
-            "Returns {ok, accounts:[{name,section}], scanned, total, done}. "
-            "The scan completes in a single call (up to max_seconds).  "
+            "Returns {ok, accounts:[{name,section}], scanned, total, done, cached}. "
+            "The first call runs a full scan (up to max_seconds).  Subsequent "
+            "calls return cached results instantly — set force_rescan=true to "
+            "discard the cache and re-scan.  "
             "Windows-only.  [Quicken skill]"
         ),
     )
@@ -209,6 +211,7 @@ def register(
         api_key: str = "",
         resume: bool = False,
         max_seconds: float = 360.0,
+        force_rescan: bool = False,
     ) -> dict[str, Any]:
         auth_err = check_auth(api_key)
         if auth_err:
@@ -217,6 +220,7 @@ def register(
             bridge = get_bridge()
             result = bridge_ext.list_sidebar_accounts(
                 bridge, resume=resume, max_seconds=max_seconds,
+                force_rescan=force_rescan,
             )
             return result
         except UIAError as exc:
