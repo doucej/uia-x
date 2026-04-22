@@ -2364,6 +2364,22 @@ _sidebar_cache: list[dict[str, Any]] = []
 # Resumable scan state for list_sidebar_accounts
 _scan_state: dict[str, Any] = {}
 
+# Last successful navigate_to_account result: hwnd + name, used by
+# read_register_state to re-activate the target MDI before reading.
+# Cleared after first use so it doesn't affect unrelated reads.
+_last_nav: dict[str, Any] = {}  # {"hwnd": int, "name": str}
+
+
+def _activate_mdi(mdi_h: int) -> None:
+    """Activate a QWMDI child window.
+
+    BringWindowToTop + SetFocus is the reliable mechanism in Quicken's
+    MDI architecture.  WM_MDIACTIVATE (sent to MDIClient) does not work.
+    """
+    import ctypes as _ct  # noqa: PLC0415
+    _ct.windll.user32.BringWindowToTop(mdi_h)
+    _ct.windll.user32.SetFocus(mdi_h)
+
 
 def _sidebar_cache_add(name: str, scroll: int, y: int, sx: int,
                        lb: int, item: int) -> None:
@@ -2456,22 +2472,14 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
         ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
     )
 
-    def _activate_mdi(mdi_h: int) -> None:
-        """Activate a QWMDI child.
-
-        BringWindowToTop + SetFocus is the reliable mechanism in Quicken's
-        MDI architecture.  WM_MDIACTIVATE (sent to MDIClient) does not work
-        — Quicken ignores it.
-        """
-        user32.BringWindowToTop(mdi_h)
-        user32.SetFocus(mdi_h)
-
     def _verify_and_stabilize(result: dict) -> dict:
-        """Post-navigate stabilization.
+        """Post-navigate stabilization with retry loop.
 
-        After any successful navigation, verify that the active account
-        matches what we expect.  If Quicken has already switched away
-        (common after sidebar clicks), re-activate the target QWMDI.
+        After any successful navigation, verify the active account
+        matches what we expect.  If Quicken switched away (common
+        after sidebar clicks that trigger MDI activations in the
+        background), re-activate the target QWMDI — up to 4 attempts
+        with increasing wait times to let Quicken settle.
         """
         if not result.get("ok"):
             return result
@@ -2479,45 +2487,110 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
         if not expected:
             return result
 
-        time.sleep(0.3)
-        _dismiss_modal_dialogs(root_hwnd)
-
-        # Check title bar bracket
         _vbuf = ctypes.create_unicode_buffer(256)
-        user32.GetWindowTextW(root_hwnd, _vbuf, 256)
-        current = _bracket_name(_vbuf.value)
-        if current and _acct_match(current, target_name):
-            return result
 
-        # Bracket doesn't match — Quicken switched away.  Try to find
-        # the target QWMDI and re-activate it.
-        _target_mdi: list[int] = []
-
-        def _find_target(h: int, _: int) -> bool:
-            cls = ctypes.create_unicode_buffer(64)
-            user32.GetClassNameW(h, cls, 64)
-            if cls.value != "QWMDI" or not user32.IsWindowVisible(h):
-                return True
-            _tbuf = ctypes.create_unicode_buffer(256)
-            user32.GetWindowTextW(h, _tbuf, 256)
-            if _tbuf.value.strip().lower() == expected.lower():
-                _target_mdi.append(h)
-                return False
-            if _acct_match(_tbuf.value.strip(), expected):
-                _target_mdi.append(h)
-            return True
-
-        user32.EnumChildWindows(root_hwnd, EnumCB(_find_target), 0)
-        if _target_mdi:
-            _activate_mdi(_target_mdi[0])
-            time.sleep(0.3)
+        def _bracket_ok() -> bool:
+            _dismiss_modal_dialogs(root_hwnd)
             user32.GetWindowTextW(root_hwnd, _vbuf, 256)
-            current = _bracket_name(_vbuf.value)
-            if current and _acct_match(current, target_name):
+            cur = _bracket_name(_vbuf.value)
+            return bool(cur and _acct_match(cur, target_name))
+
+        def _find_target_mdi() -> int:
+            """Find a visible QWMDI whose title matches expected."""
+            _found: list[int] = []
+
+            def _ft(h: int, _: int) -> bool:
+                cls = ctypes.create_unicode_buffer(64)
+                user32.GetClassNameW(h, cls, 64)
+                if cls.value != "QWMDI" or not user32.IsWindowVisible(h):
+                    return True
+                _tb = ctypes.create_unicode_buffer(256)
+                user32.GetWindowTextW(h, _tb, 256)
+                if _tb.value.strip().lower() == expected.lower():
+                    _found.append(h)
+                    return False
+                if _acct_match(_tb.value.strip(), expected):
+                    _found.append(h)
+                return True
+
+            user32.EnumChildWindows(root_hwnd, EnumCB(_ft), 0)
+            return _found[0] if _found else 0
+
+        def _lock_in(mdi_h: int) -> None:
+            """Re-activate target MDI and record it for read_register_state.
+
+            Called just before returning success so that the QWMDI activation
+            is the very last operation, giving read_register_state the best
+            chance of seeing the correct account even if Quicken tries to
+            switch away afterward.
+            """
+            if mdi_h:
+                _activate_mdi(mdi_h)
+            else:
+                # No QWMDI title matches expected — Quicken may have reused
+                # an existing QWMDI without updating its title.  Try
+                # WM_MDIGETACTIVE to get the currently active QWMDI, which
+                # is likely showing the target account's content.
+                WM_MDIGETACTIVE_LI = 0x0229
+                _mc_li: list[int] = []
+
+                def _fmc_li(h: int, _: int) -> bool:
+                    _cls_li = ctypes.create_unicode_buffer(64)
+                    user32.GetClassNameW(h, _cls_li, 64)
+                    if _cls_li.value == "MDIClient":
+                        _mc_li.append(h)
+                        return False
+                    return True
+
+                user32.EnumChildWindows(root_hwnd, EnumCB(_fmc_li), 0)
+                if _mc_li:
+                    _active_li = _send_msg_timeout(
+                        _mc_li[0], WM_MDIGETACTIVE_LI, 0, 0, timeout_ms=1500)
+                    if _active_li and user32.IsWindow(_active_li):
+                        mdi_h = _active_li
+                if mdi_h:
+                    _activate_mdi(mdi_h)
+            _last_nav["hwnd"] = mdi_h
+            _last_nav["name"] = expected
+
+        # First check — give Quicken a moment to settle.
+        time.sleep(0.5)
+        if _bracket_ok():
+            # Confirm stable — Quicken sometimes shows the right account
+            # briefly then switches away (race with MDI reactivation).
+            time.sleep(0.5)
+            if _bracket_ok():
+                mdi_h = _find_target_mdi()
+                _lock_in(mdi_h)
                 return result
 
-        # Still wrong — report it but don't fail (navigation DID happen
-        # momentarily; Quicken just switched away)
+        # Retry loop: find target QWMDI, re-activate, verify.
+        delays = [0.5, 0.8, 1.0, 1.5]
+        for attempt, delay in enumerate(delays):
+            mdi_h = _find_target_mdi()
+            if mdi_h:
+                _activate_mdi(mdi_h)
+                time.sleep(delay)
+                if _bracket_ok():
+                    time.sleep(0.5)
+                    if _bracket_ok():
+                        _lock_in(mdi_h)
+                        return result
+                # Extra force — SetForegroundWindow + re-activate
+                user32.SetForegroundWindow(root_hwnd)
+                _activate_mdi(mdi_h)
+                time.sleep(delay)
+                if _bracket_ok():
+                    time.sleep(0.5)
+                    if _bracket_ok():
+                        _lock_in(mdi_h)
+                        return result
+            else:
+                time.sleep(delay)
+
+        # All retries exhausted — report with warning.
+        user32.GetWindowTextW(root_hwnd, _vbuf, 256)
+        current = _bracket_name(_vbuf.value)
         result["warning"] = (
             f"Navigate succeeded but Quicken switched to "
             f"'{current or 'unknown'}' afterward.  Use existing_tab "
@@ -2655,43 +2728,54 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
         scroll-and-click scan.
         """
         holder = _find_sidebar_holder(root_hwnd)
-        if not holder or not _is_valid_hwnd(holder):
-            return None
 
-        # Ensure sidebar is visible (may be hidden after investment nav)
-        if not user32.IsWindowVisible(holder):
-            BM_CLICK = 0x00F5
-            _acls = ctypes.create_unicode_buffer(64)
-            _atxt = ctypes.create_unicode_buffer(256)
-            _abtn = 0
+        # Ensure sidebar is visible — the sidebar is hidden when an investment
+        # account is active.  Try the ACCOUNTS toolbar button to restore it.
+        # This also covers the case where _find_sidebar_holder returns None
+        # (completely hidden — holder not in window tree yet).
+        def _restore_sidebar_btn() -> bool:
+            nonlocal holder
+            BM_CLICK_SB = 0x00F5
+            _acls_sb = ctypes.create_unicode_buffer(64)
+            _atxt_sb = ctypes.create_unicode_buffer(256)
+            _abtn_sb = 0
+
             def _find_abtn(ch: int, _: int) -> bool:
-                nonlocal _abtn
-                user32.GetClassNameW(ch, _acls, 64)
-                if _acls.value != "QC_button":
+                nonlocal _abtn_sb
+                user32.GetClassNameW(ch, _acls_sb, 64)
+                if _acls_sb.value != "QC_button":
                     return True
-                user32.GetWindowTextW(ch, _atxt, 256)
-                if _atxt.value.upper() == "ACCOUNTS":
-                    _abtn = ch
+                user32.GetWindowTextW(ch, _atxt_sb, 256)
+                if _atxt_sb.value.upper() == "ACCOUNTS":
+                    _abtn_sb = ch
                     return False
                 return True
+
             _EnumCB_nav = ctypes.WINFUNCTYPE(
                 ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
-            user32.EnumChildWindows(
-                root_hwnd, _EnumCB_nav(_find_abtn), 0)
-            if _abtn:
-                user32.SetForegroundWindow(root_hwnd)
-                _dismiss_modal_dialogs(root_hwnd)
-                user32.PostMessageW(_abtn, BM_CLICK, 0, 0)
-                for _poll in range(80):
-                    time.sleep(0.25)
-                    if user32.IsWindow(holder) and user32.IsWindowVisible(holder):
-                        break
-                    h2 = _find_sidebar_holder(root_hwnd)
-                    if h2 and user32.IsWindowVisible(h2):
-                        holder = h2
-                        break
-                else:
-                    return None  # sidebar unrecoverable
+            user32.EnumChildWindows(root_hwnd, _EnumCB_nav(_find_abtn), 0)
+            if not _abtn_sb:
+                return False
+            user32.SetForegroundWindow(root_hwnd)
+            _dismiss_modal_dialogs(root_hwnd)
+            user32.PostMessageW(_abtn_sb, BM_CLICK_SB, 0, 0)
+            for _poll in range(80):  # up to 20s — investment accounts take 15-20s
+                time.sleep(0.25)
+                cur = holder if holder and user32.IsWindow(holder) else 0
+                if cur and user32.IsWindowVisible(cur):
+                    return True
+                h2 = _find_sidebar_holder(root_hwnd)
+                if h2 and user32.IsWindowVisible(h2):
+                    holder = h2
+                    return True
+            return False
+
+        sidebar_ok = (
+            holder and _is_valid_hwnd(holder) and user32.IsWindowVisible(holder)
+        )
+        if not sidebar_ok:
+            if not _restore_sidebar_btn():
+                return None  # sidebar unrecoverable
 
         _expand_sidebar_sections(holder)
         _dismiss_modal_dialogs(root_hwnd)
@@ -2893,7 +2977,7 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
                 return False
             _dismiss_modal_dialogs(root_hwnd)
             user32.PostMessageW(_rbtn, BM_CLICK_R, 0, 0)
-            for _rp in range(24):  # up to ~6s
+            for _rp in range(80):  # up to ~20s — investment accounts take 15-20s
                 time.sleep(0.25)
                 if (user32.IsWindow(holder)
                         and user32.IsWindowVisible(holder)):
@@ -3122,6 +3206,29 @@ def read_register_state(bridge: Any) -> dict[str, Any]:
     # Dismiss any modal dialogs before reading state
     _dismiss_modal_dialogs(root_hwnd)
 
+    # Consume any pending navigate hint BEFORE the slow _find_active_mdi
+    # retry loop so we capture the bracket name while it's still fresh.
+    _nav_info = _last_nav.copy()
+    _last_nav.clear()
+
+    # Read bracket NOW (right after navigate_to_account returned) so we
+    # get the "just navigated" state before any async Quicken switch.
+    import re as _re_rrs  # noqa: PLC0415
+    _rb_buf = ctypes.create_unicode_buffer(512)
+    ctypes.windll.user32.GetWindowTextW(root_hwnd, _rb_buf, 512)
+    _bm_early = _re_rrs.search(r"\[(.+?)\]\s*$", _rb_buf.value)
+    _early_bracket = _bm_early.group(1).strip() if _bm_early else ""
+
+    # If a navigate just ran and the bracket matches, record it so we can
+    # override a stale QWMDI title later.  Also re-activate the stored
+    # QWMDI hwnd (if valid) to hold the window in place.
+    _nav_bracket_override = ""
+    if _nav_info.get("name") and _early_bracket:
+        if _acct_match(_early_bracket, _nav_info["name"]):
+            _nav_bracket_override = _early_bracket
+    if _nav_info.get("hwnd") and ctypes.windll.user32.IsWindow(_nav_info["hwnd"]):
+        _activate_mdi(_nav_info["hwnd"])
+
     def _read_text(h: int) -> str:
         tlen = _send_msg_timeout(h, WM_GETTEXTLENGTH, 0, 0, timeout_ms=1500)
         if not tlen or tlen <= 0:
@@ -3227,6 +3334,11 @@ def read_register_state(bridge: Any) -> dict[str, Any]:
                     and br.top <= mdi_rect.top + 60):
                 _invest_buttons.append(t.strip())
 
+        # Apply nav bracket override if the MDI title is stale.
+        if (_nav_bracket_override
+                and not _acct_match(mdi_title or "", _nav_bracket_override)):
+            mdi_title = _nav_bracket_override
+
         return {
             "ok": True,
             "account": mdi_title if mdi_title else "",
@@ -3307,6 +3419,10 @@ def read_register_state(bridge: Any) -> dict[str, Any]:
     # Account name — prefer the QWMDI window title (present in account
     # register views like "My Checking"), fall back to the first visible
     # QWComboBox selection (works in Spending / All Transactions tab).
+    # When navigate_to_account just ran (_nav_info consumed above), also
+    # check the root bracket: if it matches the navigated account name and
+    # the QWMDI title is stale (Quicken reused a QWMDI without updating its
+    # title), use the bracket / nav name as the authoritative account name.
     mdi_title = _read_text(mdi_h)
     acct_combo_h = next(
         (h for h, c, t in mdi_children
@@ -3318,6 +3434,16 @@ def read_register_state(bridge: Any) -> dict[str, Any]:
         current_account = _combo_cur_text(acct_combo_h)
     else:
         current_account = ""
+
+    # Bracket-override: when navigate_to_account just ran and we captured
+    # the bracket as "DCU Checking" early on (before any async switch),
+    # but the QWMDI title is stale (Quicken reused a QWMDI without updating
+    # its title), prefer the early bracket name as the account name.
+    if (
+        _nav_bracket_override
+        and not _acct_match(current_account, _nav_bracket_override)
+    ):
+        current_account = _nav_bracket_override
 
     # Reconcile active? "C" button and "Reset" button both visible in header
     c_btn_visible = any(
