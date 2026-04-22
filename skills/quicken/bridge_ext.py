@@ -3703,8 +3703,12 @@ def read_register_rows(
     user32.SetForegroundWindow(root_hwnd)
     _time.sleep(0.3)
 
-    # Overall timeout guard — prevent infinite loops if keyboard nav breaks
-    deadline = _time.monotonic() + 60  # 60 second hard limit
+    # Overall timeout guard — prevent infinite loops if keyboard nav breaks.
+    # Each loan/split row takes ~7-10 s (SendMessage overhead) so give ample
+    # time: at least 300 s or 20 s × max_rows, whichever is larger.
+    import os as _os_loop
+    _t0 = _time.monotonic()
+    deadline = _t0 + max(300, max_rows * 20)
 
     # --- Ensure keyboard focus is inside the register, not the sidebar ---
     txlist_h = _find_txlist_hwnd(root_hwnd)
@@ -3797,19 +3801,32 @@ def read_register_rows(
         if date_cls.lower() != "qredit":
             return []
         date_hwnd = date_h
+        date_x = _dx  # x-position of the date column
 
         text_fields: list[tuple[int, str]] = []
         money_fields: list[tuple[int, str]] = []
 
-        for _fi in range(14):
+        for _fi in range(25):
             _tab()
             h, cls_name, txt, x, _y, _w = _get_focused()
             if cls_name.lower() != "qredit":
                 break
             if h == date_hwnd:
-                if money_fields:
+                # Loan/amortization registers share one HWND for ALL fields.
+                # Detect money columns by x-position relative to the date column:
+                #   payment sits just LEFT of date (e.g. x≈271 vs date_x≈293)
+                #   balance sits far RIGHT (> date_x + 300, e.g. x≈650 vs date_x≈293)
+                # Using 300px threshold avoids misclassifying check# (~175px) and
+                # category (~266px) columns as money fields.
+                _is_left = x < date_x - 5
+                _is_right = x > date_x + 300
+                if _is_left or _is_right:
+                    money_fields.append((x, txt))
+                elif money_fields:
+                    # Wrapped back to a text column after money → row end
                     break
-                text_fields.append((x, txt))
+                else:
+                    text_fields.append((x, txt))
             else:
                 money_fields.append((x, txt))
 
@@ -3830,10 +3847,11 @@ def read_register_rows(
         """Read all fields of the current row.  Returns None if on a blank row.
 
         Uses x-position of each field to determine its column role.
-        Text fields share one HWND; money fields share a different HWND.
-        Quicken skips empty money columns in tab order, so we match
-        x-positions against the reference layout learned from the blank
-        new-transaction row.
+        In standard banking registers, text fields share one HWND while money
+        fields share a different HWND.  In loan/amortization registers ALL
+        fields share the same HWND, so money columns are identified by their
+        x-position relative to the date column (payment sits just left of
+        date; balance sits far right).
 
         Money field semantics:
           payment = debit / outflow (checking withdrawal, credit charge)
@@ -3843,21 +3861,51 @@ def read_register_rows(
         date_h, date_cls, date_txt, _dx, _dy, _dw = _get_focused()
         if date_cls.lower() != "qredit":
             return None
+
+        # In loan/amortization registers, pressing Down can land on the balance
+        # column (money HWND) instead of the date column (text HWND).  Detect
+        # this by checking if the current field content looks like a numeric
+        # amount (e.g. "437.53").  If so, Tab once to advance to the text HWND.
+        import re as _re_check  # noqa: PLC0415
+        _is_money_first = bool(
+            date_txt and _re_check.match(r'^-?[\d,]+\.\d+$', date_txt.strip())
+        )
+        if _is_money_first:
+            _tab()
+            date_h, date_cls, date_txt, _dx, _dy, _dw = _get_focused()
+            if date_cls.lower() != "qredit":
+                return None
+
         date_hwnd = date_h
+        date_x = _dx  # x-position of the date column
 
         # Collect (x_position, value) for text and money fields
         text_fields: list[tuple[int, str]] = []  # (x, value)
         money_fields: list[tuple[int, str]] = []  # tab order preserved
 
-        for _fi in range(14):
+        for _fi in range(25):
             _tab()
             h, cls_name, txt, x, _y, _w = _get_focused()
             if cls_name.lower() != "qredit":
                 break
             if h == date_hwnd:
-                if money_fields:
+                # Loan/amortization registers share one HWND for ALL fields.
+                # Detect money columns by x-position relative to the date column:
+                #   payment sits just LEFT of date (e.g. x≈271 vs date_x≈293)
+                #   balance sits far RIGHT (> date_x + 300, e.g. x≈650 vs date_x≈293)
+                # Using 300px threshold avoids misclassifying check# (~175px) and
+                # category (~266px) columns as money fields.
+                _is_left = x < date_x - 5
+                _is_right = x > date_x + 300
+                if _is_left or _is_right:
+                    money_fields.append((x, txt))
+                elif money_fields:
+                    # Wrapped back to a text column after money → row end.
+                    # (Focus is at the current field; outer read_register_rows
+                    # will send a single Escape to return to the date field.)
                     break
-                text_fields.append((x, txt))
+                else:
+                    text_fields.append((x, txt))
             else:
                 money_fields.append((x, txt))
 
@@ -3953,9 +4001,13 @@ def read_register_rows(
         except Exception:
             pass
 
-        effective_max = min(max_rows, expected_count) if expected_count else max_rows
+        # Use max_rows as the true limit; expected_count is informational only.
+        # It can be wrong for loan/investment registers (status-bar count
+        # doesn't always match the number of tabbable rows).
+        effective_max = max_rows
 
         # Ctrl+Home → first row (typically the new-transaction entry row)
+        _nav_key = 0x28  # default: Down navigation (banking + loan-top)
         _ctrl(0x24)
         _time.sleep(0.5)
 
@@ -3971,8 +4023,21 @@ def read_register_rows(
                 _press(0x1B, 0.2)
                 _learn_columns_from_row()
             _press(0x1B, 0.2)
-            _press(0x28, 0.3)  # Down → first data row
+            _press(0x28, 0.3)  # Down → first data row attempt
             _time.sleep(0.3)
+            # Loan/amortization registers place the new-transaction form at the
+            # bottom of the list; Down stays on the blank form instead of
+            # advancing.  Detect this by peeking at the row after Down.
+            _nav_peek = _read_one_row()
+            if _nav_peek is None:
+                # Down kept us on the blank form → switch to Up (newest→oldest)
+                _press(0x1B, 0.2)
+                _press(0x26, 0.3)  # Up → first real row (most recent)
+                _time.sleep(0.3)
+                _nav_key = 0x26  # use Up for all subsequent row advances
+            else:
+                # Down successfully advanced to a real row; treat it as first_row
+                first_row = _nav_peek
 
         prev_row_sig: tuple[str, ...] | None = None
         dup_count = 0
@@ -3989,16 +4054,43 @@ def read_register_rows(
             )
             start_offset = 1
             # After _read_one_row, focus is on a button (Save/More).
-            # Escape back to the QREdit date field, then Down to advance.
+            # Two Escapes: first exits split-detail mode, second exits row-edit
+            # mode.  For non-split rows the second Escape is a no-op.
             _press(0x1B, 0.2)
-            _press(0x28, 0.3)  # Down → next row
+            _press(0x1B, 0.1)
+            _press(_nav_key, 0.3)  # Down or Up depending on register type
             _time.sleep(0.3)
 
-        for _ in range(effective_max - start_offset):
+        # Track whether we've already attempted to flip navigation direction.
+        # Handles the case where Ctrl+Home lands on the newest (last) real row
+        # and Down immediately hits the blank new-transaction row.
+        _direction_flipped = False
+
+        for _loop_i in range(effective_max - start_offset):
+            if _os_loop.environ.get('UIAX_ROR_DEBUG'):
+                print(f"[loop iter={_loop_i}/{effective_max - start_offset}] t={_time.monotonic()-_t0:.1f}s", flush=True)
             if _time.monotonic() > deadline:
+                if _os_loop.environ.get('UIAX_ROR_DEBUG'):
+                    print("[loop] DEADLINE HIT", flush=True)
                 break  # hard timeout
             row = _read_one_row()
             if row is None:
+                # First hit on a blank row while using Down → this means
+                # Ctrl+Home landed on the newest real row and Down falls into the
+                # blank new-transaction form at the bottom.  Flip to Up mode.
+                if _loop_i == 0 and _nav_key == 0x28 and not _direction_flipped:
+                    _direction_flipped = True
+                    _nav_key = 0x26
+                    # Escape to stable state, then skip back past first_row.
+                    # Two Escapes needed for split rows (first exits split-detail,
+                    # second exits row-edit to view mode before Up can navigate).
+                    _press(0x1B, 0.2)   # leave blank form (QC_button → row-edit)
+                    _press(0x26, 0.3)   # Up → first_row (enters edit/split-detail)
+                    _press(0x1B, 0.2)   # exit split-detail → row-edit mode
+                    _press(0x1B, 0.1)   # exit row-edit → view mode
+                    _press(0x26, 0.3)   # Up → row before first_row
+                    _time.sleep(0.3)
+                    continue
                 break
 
             # Content-based stuck detection — always check to avoid
@@ -4011,15 +4103,22 @@ def read_register_rows(
                 dup_count += 1
                 if dup_count >= 2:
                     break
+                # First duplicate: navigation has stalled (we've hit the last
+                # real row).  Skip appending but keep dup_count so the next
+                # iteration's dup_count >= 2 check terminates the loop cleanly.
+                continue
             else:
                 dup_count = 0
             prev_row_sig = row_sig
 
             rows.append(row)
 
-            # Move to next row
-            _press(0x1B, 0.2)
-            _press(0x28, 0.3)
+            # Move to next row.  Two Escapes are needed for split rows because
+            # the first exits split-detail mode and the second exits row-edit
+            # mode; for non-split rows the second is a no-op.
+            _press(0x1B, 0.2)   # exit split-detail → row-edit mode
+            _press(0x1B, 0.1)   # exit row-edit → view mode
+            _press(_nav_key, 0.3)
             _time.sleep(0.3)
 
         return {"ok": True, "rows": rows, "count": len(rows)}
