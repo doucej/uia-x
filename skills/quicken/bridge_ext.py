@@ -2565,17 +2565,22 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
                 return result
 
         # Retry loop: find target QWMDI, re-activate, verify.
+        # For investment accounts _find_target_mdi() returns 0 (empty QWMDI
+        # title), so we fall through to _lock_in(0) which uses WM_MDIGETACTIVE.
+        # In all cases, once the bracket is confirmed we return immediately —
+        # we do NOT need a matching QWMDI title for success.
         delays = [0.5, 0.8, 1.0, 1.5]
         for attempt, delay in enumerate(delays):
             mdi_h = _find_target_mdi()
             if mdi_h:
                 _activate_mdi(mdi_h)
-                time.sleep(delay)
+            time.sleep(delay)
+            if _bracket_ok():
+                time.sleep(0.5)
                 if _bracket_ok():
-                    time.sleep(0.5)
-                    if _bracket_ok():
-                        _lock_in(mdi_h)
-                        return result
+                    _lock_in(mdi_h)
+                    return result
+            if mdi_h:
                 # Extra force — SetForegroundWindow + re-activate
                 user32.SetForegroundWindow(root_hwnd)
                 _activate_mdi(mdi_h)
@@ -2585,10 +2590,10 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
                     if _bracket_ok():
                         _lock_in(mdi_h)
                         return result
-            else:
-                time.sleep(delay)
 
-        # All retries exhausted — report with warning.
+        # All retries exhausted — lock in via WM_MDIGETACTIVE so read_register_state
+        # still has a valid _last_nav to work with, then report with warning.
+        _lock_in(0)
         user32.GetWindowTextW(root_hwnd, _vbuf, 256)
         current = _bracket_name(_vbuf.value)
         result["warning"] = (
@@ -2759,7 +2764,7 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
             user32.SetForegroundWindow(root_hwnd)
             _dismiss_modal_dialogs(root_hwnd)
             user32.PostMessageW(_abtn_sb, BM_CLICK_SB, 0, 0)
-            for _poll in range(80):  # up to 20s — investment accounts take 15-20s
+            for _poll in range(40):  # up to ~10s (investment sidebar restores in 3-8s)
                 time.sleep(0.25)
                 cur = holder if holder and user32.IsWindow(holder) else 0
                 if cur and user32.IsWindowVisible(cur):
@@ -2977,8 +2982,15 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
                 return False
             _dismiss_modal_dialogs(root_hwnd)
             user32.PostMessageW(_rbtn, BM_CLICK_R, 0, 0)
+            _rsbuf = ctypes.create_unicode_buffer(512)
             for _rp in range(80):  # up to ~20s — investment accounts take 15-20s
                 time.sleep(0.25)
+                # Early-exit: bracket already shows the target account —
+                # navigation succeeded even if sidebar isn't visible yet.
+                user32.GetWindowTextW(root_hwnd, _rsbuf, 512)
+                _rbc = _bracket_name(_rsbuf.value)
+                if _rbc and _acct_match(_rbc, target_name):
+                    return True
                 if (user32.IsWindow(holder)
                         and user32.IsWindowVisible(holder)):
                     return True
@@ -4037,6 +4049,13 @@ def set_register_filter(bridge: Any, text: str) -> dict[str, Any]:
     # Dismiss any modal dialogs before interacting
     _dismiss_modal_dialogs(root_hwnd)
 
+    # Capture bracket NOW so we can verify account hasn't shifted after filter.
+    import re as _re_srf  # noqa: PLC0415
+    _sbuf_srf = ctypes.create_unicode_buffer(512)
+    user32.GetWindowTextW(root_hwnd, _sbuf_srf, 512)
+    _bm_srf = _re_srf.search(r"\[(.+?)\]\s*$", _sbuf_srf.value)
+    _expected_acct = _bm_srf.group(1).strip() if _bm_srf else ""
+
     def _read_text(h: int) -> str:
         tlen = _send_msg_timeout(h, WM_GETTEXTLENGTH, 0, 0, timeout_ms=1500)
         if not tlen or tlen <= 0:
@@ -4098,40 +4117,48 @@ def set_register_filter(bridge: Any, text: str) -> dict[str, Any]:
     buf = ctypes.create_unicode_buffer(text)
     _send_msg_timeout(filter_h, WM_SETTEXT, 0, ctypes.addressof(buf),
                       timeout_ms=2000)
-    # Post EN_CHANGE to parent so Quicken re-filters
+    # Post EN_CHANGE to parent so Quicken re-filters.
+    # EN_CHANGE can cause Quicken to internally switch the active QWMDI —
+    # immediately re-activate our target MDI to counteract the focus steal.
     WM_COMMAND = 0x0111
     EN_CHANGE = 0x0300
     ctrl_id = user32.GetDlgCtrlID(filter_h)
     parent = user32.GetParent(filter_h)
     user32.PostMessageW(parent, WM_COMMAND, (EN_CHANGE << 16) | ctrl_id, filter_h)
+    _activate_mdi(mdi_h)   # queue re-activation before Quicken can steal focus
     time.sleep(0.4)
+    _activate_mdi(mdi_h)   # re-activate again after Quicken processes EN_CHANGE
+    time.sleep(0.2)
 
-    # Verify Quicken didn't silently switch accounts (a known side-effect
-    # of triggering EN_CHANGE on some filter controls).
-    # BringWindowToTop + SetFocus is the reliable mechanism in Quicken —
-    # WM_MDIACTIVATE (sent to MDIClient) does not work.
-    post_mdi = _find_active_mdi(root_hwnd)
-    if post_mdi and post_mdi != mdi_h:
-        user32.BringWindowToTop(mdi_h)
-        user32.SetFocus(mdi_h)
-        time.sleep(0.3)
+    # Verify using the bracket (not _find_active_mdi) — bracket is the
+    # most reliable indicator of which account Quicken considers active.
+    def _bracket_now() -> str:
+        user32.GetWindowTextW(root_hwnd, _sbuf_srf, 512)
+        _bm = _re_srf.search(r"\[(.+?)\]\s*$", _sbuf_srf.value)
+        return _bm.group(1).strip() if _bm else ""
 
-        # Re-check — if MDI *still* doesn't match, fail loudly so the
-        # caller knows the filter may have been applied to the wrong
-        # account rather than silently returning wrong data.
-        post_mdi2 = _find_active_mdi(root_hwnd)
-        if post_mdi2 and post_mdi2 != mdi_h:
+    _post_acct = _bracket_now()
+    if (_expected_acct and _post_acct
+            and not _acct_match(_post_acct, _expected_acct)):
+        # One more attempt — SetForegroundWindow helps Quicken commit the
+        # MDI activation we issued above.
+        user32.SetForegroundWindow(root_hwnd)
+        _activate_mdi(mdi_h)
+        time.sleep(0.5)
+        _post_acct2 = _bracket_now()
+        if not _acct_match(_post_acct2, _expected_acct):
             return {
                 "ok": False,
                 "error": "focus_shifted",
                 "detail": (
-                    "Applying the filter caused Quicken to switch "
-                    "to a different account register.  The filter "
-                    "text was applied but may be on the wrong "
+                    f"Applying the filter caused Quicken to switch "
+                    f"from '{_expected_acct}' to '{_post_acct}'. "
+                    "The filter text was NOT applied to the expected "
                     "account.  Clear the filter and re-navigate."
                 ),
                 "filter": text,
                 "count": "",
+                "account": _post_acct,
             }
 
     # Read updated count
@@ -4154,8 +4181,7 @@ def set_register_filter(bridge: Any, text: str) -> dict[str, Any]:
     # verify which account the filter was applied to.
     _acct_buf = ctypes.create_unicode_buffer(512)
     user32.GetWindowTextW(root_hwnd, _acct_buf, 512)
-    import re as _re  # noqa: PLC0415
-    _acct_m = _re.search(r"\[(.+?)\]\s*$", _acct_buf.value)
+    _acct_m = _re_srf.search(r"\[(.+?)\]\s*$", _acct_buf.value)
     _acct_name = _acct_m.group(1).strip() if _acct_m else ""
 
     return {"ok": True, "filter": text, "count": count_static,
