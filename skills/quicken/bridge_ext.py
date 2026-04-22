@@ -2842,8 +2842,9 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
 
             Dismisses modal dialogs (Securities Comparison Mismatch etc.)
             and waits for blank titles to resolve (investment accounts).
+            Also gives property/loan accounts a brief grace period: they
+            can transiently show "[Home]" while the register is loading.
             Returns the bracket name if it matches the target, else None.
-            Also populates the sidebar cache with any discovered accounts.
             """
             _dismiss_modal_dialogs(root_hwnd)
             user32.GetWindowTextW(root_hwnd, buf, 256)
@@ -2851,12 +2852,20 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
             if bracket and _acct_match(bracket, target_name):
                 return bracket
             if bracket:
-                # Title shows a non-target account — no need to wait.
-                # The click navigated somewhere else (or didn't navigate).
-                return None
-            # Blank title — investment account loading.  Poll up to 3s
-            # for the title to appear, then check if it's our target.
-            for _poll in range(6):  # up to ~3s
+                # Non-target bracket.  Property/loan accounts can briefly
+                # show "[Home]" while their register loads.  Give them one
+                # extra second to settle before giving up.
+                time.sleep(1.0)
+                _dismiss_modal_dialogs(root_hwnd)
+                user32.GetWindowTextW(root_hwnd, buf, 256)
+                bracket = _bracket_name(buf.value)
+                if bracket and _acct_match(bracket, target_name):
+                    return bracket
+                if bracket:
+                    return None  # stable non-target
+            # Blank title — investment/property account loading.  Poll up
+            # to 5s for the title to appear, then check if it's our target.
+            for _poll in range(10):  # up to ~5s
                 time.sleep(0.5)
                 _dismiss_modal_dialogs(root_hwnd)
                 user32.GetWindowTextW(root_hwnd, buf, 256)
@@ -2875,8 +2884,17 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
             nav_item = cached["nav_item"]
             LB_GETITEMRECT_FP = 0x0198
 
-            # Use LB_GETITEMRECT for current position (more reliable than
-            # cached screen coords which shift on scroll/resize).
+            # Scroll to the stored position first so the ListBox shows
+            # the correct account at the cached item index.  The sidebar
+            # ListBoxes are fixed-position containers whose *contents*
+            # change based on scroll position — clicking nav_item without
+            # scrolling to nav_scroll clicks the wrong account.
+            if "nav_scroll" in cached:
+                _scroll_to(cached["nav_scroll"])
+                time.sleep(0.15)  # wait for LB content to update
+            _dismiss_modal_dialogs(root_hwnd)
+
+            # Use LB_GETITEMRECT for precise current screen position.
             if user32.IsWindow(nav_lb):
                 ir_fp = wt.RECT()
                 ret_fp = _send_msg_timeout(
@@ -2889,7 +2907,6 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
                     hr_fp = wt.RECT()
                     user32.GetWindowRect(holder, ctypes.byref(hr_fp))
                     if hr_fp.top <= pt_fp.y <= hr_fp.bottom:
-                        _dismiss_modal_dialogs(root_hwnd)
                         _dblclick(pt_fp.x, pt_fp.y)
                         match = _check_match()
                         if match:
@@ -2897,10 +2914,8 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
                                 {"ok": True, "account": match,
                                  "method": "sidebar_cached_lb"})
 
-            # Fallback: scroll to cached position and click at stored coords
-            if "nav_scroll" in cached:
-                _scroll_to(cached["nav_scroll"])
-                _dismiss_modal_dialogs(root_hwnd)
+            # Fallback: click at stored nav_y (already scrolled to nav_scroll)
+            if "nav_y" in cached:
                 sx_ = cached.get("nav_sx", 0)
                 nav_y = cached["nav_y"]
                 hr = wt.RECT()
