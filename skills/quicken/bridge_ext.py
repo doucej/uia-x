@@ -4163,6 +4163,11 @@ def set_register_filter(bridge: Any, text: str) -> dict[str, Any]:
     # Dismiss any modal dialogs before interacting
     _dismiss_modal_dialogs(root_hwnd)
 
+    # Consume any pending navigate hint so we can use the exact QWMDI hwnd
+    # that navigate_to_account stored — more reliable than title-matching.
+    _nav_hint = _last_nav.copy()
+    _last_nav.clear()
+
     # Capture bracket NOW so we can verify account hasn't shifted after filter.
     import re as _re_srf  # noqa: PLC0415
     _sbuf_srf = ctypes.create_unicode_buffer(512)
@@ -4179,10 +4184,14 @@ def set_register_filter(bridge: Any, text: str) -> dict[str, Any]:
                           timeout_ms=1500)
         return buf.value
 
-    # Scope to the ACTIVE QWMDI to avoid silently switching accounts.
-    # Previously enumerated all root children — picking a TxList from
-    # an inactive tab would shift focus to that account.
-    mdi_h = _find_active_mdi(root_hwnd)
+    # Scope to the ACTIVE QWMDI — prefer the exact hwnd from navigate_to_account
+    # (stored in _last_nav) over title-matching, which can mis-identify the MDI
+    # when multiple tabs have similar names or titles haven't updated yet.
+    if _nav_hint.get("hwnd") and user32.IsWindow(_nav_hint["hwnd"]):
+        mdi_h: int | None = _nav_hint["hwnd"]
+        _activate_mdi(mdi_h)
+    else:
+        mdi_h = _find_active_mdi(root_hwnd)
     if mdi_h is None:
         raise UIAError("No active QWMDI found.", code="REGISTER_NOT_FOUND")
 
@@ -4227,22 +4236,47 @@ def set_register_filter(bridge: Any, text: str) -> dict[str, Any]:
             code="FILTER_EDIT_NOT_FOUND",
         )
 
-    # Write text via WM_SETTEXT and trigger change notification
-    buf = ctypes.create_unicode_buffer(text)
-    _send_msg_timeout(filter_h, WM_SETTEXT, 0, ctypes.addressof(buf),
-                      timeout_ms=2000)
-    # Post EN_CHANGE to parent so Quicken re-filters.
-    # EN_CHANGE can cause Quicken to internally switch the active QWMDI —
-    # immediately re-activate our target MDI to counteract the focus steal.
-    WM_COMMAND = 0x0111
-    EN_CHANGE = 0x0300
-    ctrl_id = user32.GetDlgCtrlID(filter_h)
-    parent = user32.GetParent(filter_h)
-    user32.PostMessageW(parent, WM_COMMAND, (EN_CHANGE << 16) | ctrl_id, filter_h)
-    _activate_mdi(mdi_h)   # queue re-activation before Quicken can steal focus
-    time.sleep(0.4)
-    _activate_mdi(mdi_h)   # re-activate again after Quicken processes EN_CHANGE
-    time.sleep(0.2)
+    # Activate the target QWMDI before writing so Quicken knows which account
+    # "owns" this filter edit.  This must happen before WM_SETTEXT so Quicken's
+    # EN_CHANGE handler runs in the context of the correct account.
+    _activate_mdi(mdi_h)
+    time.sleep(0.1)
+
+    # Write text and trigger Quicken's filter via WM_CHAR rather than a
+    # manually crafted WM_COMMAND(EN_CHANGE).
+    #
+    # Rationale: sending WM_COMMAND(EN_CHANGE) to filter_h's parent causes
+    # Quicken to switch the active MDI to whichever account has focus at that
+    # moment regardless of which QWMDI we activated.  WM_CHAR on the edit
+    # control fires EN_CHANGE *from within* the edit's own processing, so it
+    # is always scoped to the correct filter box without touching MDI focus.
+    #
+    # Strategy for non-empty text:
+    #   WM_SETTEXT(text[:-1])  — set prefix silently (no EN_CHANGE from edit)
+    #   WM_CHAR(text[-1])      — append last char; edit fires EN_CHANGE with
+    #                            full text → Quicken re-filters in-place
+    # Strategy for clear (text == ""):
+    #   EM_SETSEL(0, -1) + WM_CHAR(BS) → EN_CHANGE with "" → filter cleared
+    WM_CHAR = 0x0102
+    EM_SETSEL = 0x00B1
+    if text:
+        prefix = text[:-1]
+        last_ch = text[-1]
+        if prefix:
+            _buf_pre = ctypes.create_unicode_buffer(prefix)
+            _send_msg_timeout(filter_h, WM_SETTEXT, 0,
+                              ctypes.addressof(_buf_pre), timeout_ms=2000)
+        else:
+            _send_msg_timeout(filter_h, WM_SETTEXT, 0, 0, timeout_ms=2000)
+        _send_msg_timeout(filter_h, WM_CHAR, ord(last_ch), 1, timeout_ms=2000)
+    else:
+        # Clear: select all then Backspace fires EN_CHANGE with empty text
+        _send_msg_timeout(filter_h, EM_SETSEL, 0,
+                          ctypes.c_long(-1).value, timeout_ms=500)
+        _send_msg_timeout(filter_h, WM_CHAR, 0x08, 1, timeout_ms=2000)
+    # Re-activate in case Quicken internally shifted focus while filtering
+    _activate_mdi(mdi_h)
+    time.sleep(0.3)
 
     # Verify using the bracket (not _find_active_mdi) — bracket is the
     # most reliable indicator of which account Quicken considers active.
