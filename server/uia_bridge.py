@@ -106,8 +106,16 @@ class UIABridge(ABC):
         """Invoke (click/activate) the matched element."""
 
     @abstractmethod
-    def set_value(self, target: dict[str, Any], value: str) -> None:
-        """Set the value of the matched element."""
+    def set_value(self, target: dict[str, Any], value: str) -> dict[str, Any]:
+        """
+        Set the value of the matched element and return a readback result.
+
+        Returns
+        -------
+        dict
+            ``{"ok": True, "method": str, "written": str, "readback": str,
+               "validated": bool}``
+        """
 
     @abstractmethod
     def send_keys(self, keys: str, target: dict[str, Any] | None = None) -> None:
@@ -143,6 +151,7 @@ class UIABridge(ABC):
         y: int,
         double: bool = False,
         button: str = "left",
+        force_sendinput: bool = False,
     ) -> None:
         """
         Click at absolute screen coordinates.
@@ -155,7 +164,109 @@ class UIABridge(ABC):
             If True, send a double-click instead of a single click.
         button : str
             ``"left"`` (default), ``"right"``, or ``"middle"``.
+        force_sendinput : bool
+            When True, bypass any SetCursorPos path and use raw SendInput.
+            Currently a no-op on non-Windows backends; implemented in
+            WinUIABridge for callers that need guaranteed raw-input dispatch.
         """
+
+    # -----------------------------------------------------------------------
+    # Win32-specific extensions (not abstract – raise on non-Windows backends)
+    # -----------------------------------------------------------------------
+
+    def send_win32_message(
+        self,
+        hwnd: int,
+        message: int,
+        wparam: int = 0,
+        lparam: int = 0,
+        sync: bool = True,
+    ) -> int:
+        """
+        Send or post a Win32 message directly to a window handle.
+
+        Parameters
+        ----------
+        hwnd : int
+            Target window handle.
+        message : int
+            Windows message constant (e.g. ``0xF5`` for BM_CLICK).
+        wparam, lparam : int
+            Message parameters.
+        sync : bool
+            ``True`` → ``SendMessageW`` (blocks until processed).
+            ``False`` → ``PostMessageW`` (fire-and-forget).
+
+        Returns
+        -------
+        int
+            Return value from SendMessageW, or 1 on success for PostMessageW.
+        """
+        raise UIAError(
+            "send_win32_message is only available on the Windows backend.",
+            code="NOT_SUPPORTED",
+        )
+
+    def get_window_enabled_state(self, hwnd: int) -> dict[str, Any]:
+        """
+        Return whether *hwnd* is enabled and identify any blocking overlays.
+
+        Returns
+        -------
+        dict
+            ``{"hwnd": N, "enabled": bool, "blocking_windows": [...]}``
+        """
+        raise UIAError(
+            "get_window_enabled_state is only available on the Windows backend.",
+            code="NOT_SUPPORTED",
+        )
+
+    def dismiss_modal_overlay(self, target_hwnd: int) -> dict[str, Any]:
+        """
+        Close overlay windows that are blocking *target_hwnd* and re-enable it.
+
+        Returns
+        -------
+        dict
+            ``{"ok": true, "dismissed": [...], "re_enabled": bool}``
+        """
+        raise UIAError(
+            "dismiss_modal_overlay is only available on the Windows backend.",
+            code="NOT_SUPPORTED",
+        )
+
+    def capture_screenshot(
+        self,
+        hwnd: int | None = None,
+        region: dict[str, int] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Capture a screenshot of a window or screen region as a base64 PNG.
+
+        Parameters
+        ----------
+        hwnd
+            Window handle to capture.  Uses the attached window if ``None``
+            and no *region* is given.
+        region
+            Absolute screen rect ``{left, top, right, bottom}`` to capture.
+
+        Returns
+        -------
+        dict
+            ``{"ok": True, "image_b64": str, "width": int, "height": int,
+               "format": "PNG"}``
+
+        Raises
+        ------
+        UIAError
+            ``NOT_SUPPORTED`` on non-Windows backends.
+            ``DEPENDENCY_MISSING`` if Pillow is not installed.
+        """
+        raise UIAError(
+            "capture_screenshot is only available on the Windows backend.",
+            code="NOT_SUPPORTED",
+        )
 
 
 # ---------------------------------------------------------------------------

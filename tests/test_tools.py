@@ -585,3 +585,122 @@ class TestFindAllPagination:
         assert page1["total"] == full["total"]
         if full["total"] > 0:
             assert page1["elements"][0] == full["elements"][0]
+
+
+# ---------------------------------------------------------------------------
+# wait_for_element tests  (issue #14)
+# ---------------------------------------------------------------------------
+
+
+class TestWaitForElement:
+    """Tests for the wait_for_element server tool."""
+
+    def test_wait_present_element_found_immediately(self, bridge: MockUIABridge):
+        """When element already exists, returns immediately with found=True."""
+        from unittest.mock import patch
+
+        from server.server import wait_for_element
+
+        with patch("server.server._get_bridge", return_value=bridge), \
+             patch("server.server._check_auth", return_value=None):
+            result = wait_for_element(name="Save", present=True, timeout_ms=1000)
+        assert result["ok"] is True
+        assert result["found"] is True
+
+    def test_wait_absent_element_times_out(self, bridge: MockUIABridge):
+        """Element that doesn't exist causes timeout, returns ok=False."""
+        from unittest.mock import patch
+
+        from server.server import wait_for_element
+
+        with patch("server.server._get_bridge", return_value=bridge), \
+             patch("server.server._check_auth", return_value=None):
+            result = wait_for_element(
+                name="NonExistentElement", present=True, timeout_ms=300, poll_ms=100
+            )
+        assert result["ok"] is False
+        assert result["found"] is False
+        assert result["code"] == "TIMEOUT"
+
+    def test_wait_present_false_returns_ok_when_absent(self, bridge: MockUIABridge):
+        """present=False succeeds immediately when the element is NOT in tree."""
+        from unittest.mock import patch
+
+        from server.server import wait_for_element
+
+        with patch("server.server._get_bridge", return_value=bridge), \
+             patch("server.server._check_auth", return_value=None):
+            result = wait_for_element(
+                name="NoSuchElement", present=False, timeout_ms=1000
+            )
+        assert result["ok"] is True
+        assert result["found"] is False
+
+
+# ---------------------------------------------------------------------------
+# uia_send_message / check_window_state / dismiss_modal_overlay (issues #16/#17)
+# ---------------------------------------------------------------------------
+
+
+class TestWin32Tools:
+    """Server tools backed by mock bridge (returns NOT_SUPPORTED on non-Windows)."""
+
+    def test_send_message_mock_records_and_returns_ok(self, bridge: MockUIABridge):
+        """Mock bridge records the message and returns ok=True."""
+        from unittest.mock import patch
+
+        from server.server import uia_send_message
+
+        with patch("server.server._get_bridge", return_value=bridge), \
+             patch("server.server._check_auth", return_value=None):
+            result = uia_send_message(hwnd=0xBB01, message=0xF5)
+        assert result["ok"] is True
+        assert result["return_value"] == 1
+
+    def test_check_window_state_mock_returns_enabled(self, bridge: MockUIABridge):
+        """Mock bridge always reports enabled=True."""
+        from unittest.mock import patch
+
+        from server.server import check_window_state
+
+        with patch("server.server._get_bridge", return_value=bridge), \
+             patch("server.server._check_auth", return_value=None):
+            result = check_window_state(hwnd=0xBB01)
+        assert result["ok"] is True
+        assert result["enabled"] is True
+
+    def test_dismiss_modal_overlay_mock_no_op(self, bridge: MockUIABridge):
+        """Mock bridge dismiss is a no-op: no dismissed windows, not re-enabled."""
+        from unittest.mock import patch
+
+        from server.server import dismiss_modal_overlay_tool
+
+        with patch("server.server._get_bridge", return_value=bridge), \
+             patch("server.server._check_auth", return_value=None):
+            result = dismiss_modal_overlay_tool(hwnd=0xBB01)
+        assert result["ok"] is True
+        assert result["dismissed"] == []
+        assert result["re_enabled"] is False
+
+
+# ---------------------------------------------------------------------------
+# mouse_click with force_sendinput (issue #15)
+# ---------------------------------------------------------------------------
+
+
+class TestMouseClickForceSendInput:
+    """The force_sendinput parameter must be forwarded to the bridge."""
+
+    def test_uia_mouse_click_records_in_mock(self, bridge: MockUIABridge):
+        """Mock bridge records the click; force_sendinput flag doesn't crash."""
+        from unittest.mock import patch
+
+        from server.server import uia_mouse_click
+
+        with patch("server.server._get_bridge", return_value=bridge), \
+             patch("server.server._check_auth", return_value=None):
+            result = uia_mouse_click(x=100, y=200, force_sendinput=True)
+        assert result["ok"] is True
+        assert len(bridge.mouse_log) == 1
+        assert bridge.mouse_log[0]["x"] == 100
+        assert bridge.mouse_log[0]["y"] == 200

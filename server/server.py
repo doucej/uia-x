@@ -29,6 +29,9 @@ Key rotation
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import functools
 import os
 import sys
 import argparse
@@ -42,6 +45,66 @@ from server.process_manager import (
     get_process_manager,
     WindowInfo,
 )
+
+# ---------------------------------------------------------------------------
+# Bridge thread pool — keeps COM/pywinauto calls off the asyncio event loop.
+#
+# FastMCP calls sync tool functions *directly* in the event loop, which blocks
+# the server entirely while a slow UIA query runs.  We patch
+# FuncMetadata.call_fn_with_arg_validation to route sync tools through a
+# single-threaded ThreadPoolExecutor.  max_workers=1 satisfies COM's
+# Single-Threaded Apartment requirement: all pywinauto objects are created and
+# used inside the same thread.
+# ---------------------------------------------------------------------------
+
+def _init_bridge_thread() -> None:
+    """Initialise COM for the bridge worker thread (Windows only, no-op elsewhere)."""
+    try:
+        import comtypes  # noqa: PLC0415
+        comtypes.CoInitialize()
+    except Exception:
+        pass
+
+
+_bridge_executor: concurrent.futures.ThreadPoolExecutor | None = None
+
+
+def _get_bridge_executor() -> concurrent.futures.ThreadPoolExecutor:
+    global _bridge_executor
+    if _bridge_executor is None:
+        _bridge_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            initializer=_init_bridge_thread,
+            thread_name_prefix="uiax-bridge",
+        )
+    return _bridge_executor
+
+
+# Patch FastMCP so sync tool functions run in the bridge thread pool instead
+# of blocking the asyncio event loop.
+from mcp.server.fastmcp.utilities.func_metadata import FuncMetadata as _FuncMetadata  # noqa: E402
+
+
+async def _threaded_call_fn(
+    self,
+    fn,
+    fn_is_async: bool,
+    arguments_to_validate: dict,
+    arguments_to_pass_directly: dict | None,
+):
+    """Run sync MCP tools in the bridge thread pool (avoids event-loop blocking)."""
+    arguments_pre_parsed = self.pre_parse_json(arguments_to_validate)
+    arguments_parsed_model = self.arg_model.model_validate(arguments_pre_parsed)
+    arguments_parsed_dict = arguments_parsed_model.model_dump_one_level()
+    arguments_parsed_dict |= arguments_to_pass_directly or {}
+    if fn_is_async:
+        return await fn(**arguments_parsed_dict)
+    loop = asyncio.get_running_loop()
+    wrapped = functools.partial(fn, **arguments_parsed_dict)
+    return await loop.run_in_executor(_get_bridge_executor(), wrapped)
+
+
+_FuncMetadata.call_fn_with_arg_validation = _threaded_call_fn
 
 # ---------------------------------------------------------------------------
 # Server instantiation
@@ -115,7 +178,7 @@ def _check_auth(api_key: str = "") -> dict[str, Any] | None:
 
 
 def _window_to_dict(w: WindowInfo) -> dict[str, Any]:
-    return {
+    d: dict[str, Any] = {
         "hwnd": w.hwnd,
         "hwnd_hex": hex(w.hwnd),
         "title": w.title,
@@ -125,6 +188,23 @@ def _window_to_dict(w: WindowInfo) -> dict[str, Any]:
         "visible": w.visible,
         "rect": w.rect,
     }
+    if w.dpi_scale is not None:
+        d["dpi_scale"] = w.dpi_scale
+        rect = w.rect
+        if isinstance(rect, dict):
+            lw = rect.get("right", 0) - rect.get("left", 0)
+            lh = rect.get("bottom", 0) - rect.get("top", 0)
+        elif rect and hasattr(rect, "__len__") and len(rect) == 4:
+            lw = rect[2] - rect[0]
+            lh = rect[3] - rect[1]
+        else:
+            lw = lh = 0
+        d["logical_size"] = [lw, lh]
+        d["physical_size"] = [
+            round(lw * w.dpi_scale),
+            round(lh * w.dpi_scale),
+        ]
+    return d
 
 
 # ===================================================================
@@ -224,27 +304,6 @@ def select_window(
             hwnd=hwnd,
         )
         result: dict[str, Any] = {"ok": True, "window": _window_to_dict(win)}
-        # Best-effort context snapshot: scan for active mode toggles and focused element
-        try:
-            bridge = _get_bridge()
-            items = bridge.find_all({"has_actions": True, "named_only": True})
-            focused = next(
-                (it["name"] for it in items if it.get("focused")), None
-            )
-            active_toggles = [
-                {"name": it["name"], "states": it.get("states", [])}
-                for it in items
-                if any(s in it.get("states", []) for s in ("checked", "pressed", "selected"))
-            ]
-            context: dict[str, Any] = {}
-            if focused:
-                context["focused_element"] = focused
-            if active_toggles:
-                context["active_toggles"] = active_toggles
-            if context:
-                result["context"] = context
-        except Exception:  # noqa: BLE001
-            pass  # context is optional; never break the attach
         return result
     except UIAError as exc:
         return {"ok": False, "error": str(exc), "code": exc.code}
@@ -271,6 +330,7 @@ def select_window(
 def uia_inspect(
     name: str = "",
     target: dict[str, Any] = {},  # noqa: B006
+    depth: int = 3,
     api_key: str = "",
 ) -> dict[str, Any]:
     """
@@ -288,16 +348,20 @@ def uia_inspect(
                     ``"automation_id"``, ``"control_type"``, ``"class_name"``,
                     ``"path"``, ``"legacy_name"``, ``"legacy_role"``, ``"hwnd"``
         ``value`` – value for the chosen strategy
-        ``depth`` – how many levels of children to expand (default 3)
+        ``depth`` – how many levels of children to expand (overridden by top-level depth param)
         ``index`` – zero-based index for multiple matches (default 0)
 
         Pass an empty dict ``{}`` to return the root window.
+    depth : int
+        How many levels of children to expand (default 3). Overrides target["depth"].
     """
     auth_err = _check_auth(api_key)
     if auth_err:
         return auth_err
     if name and not target:
         target = {"by": "name", "value": name}
+    # Inject depth into target dict (top-level param takes precedence)
+    target = {**target, "depth": depth} if target else {"depth": depth}
     try:
         bridge = _get_bridge()
         element = bridge.inspect(target)
@@ -398,6 +462,9 @@ def uia_find_all(
             "has_actions": has_actions,
             "named_only": named_only,
             "root": target or None,
+            # Pass a stop-after hint so the Win32 fast path can early-exit via
+            # EnumChildWindows returning False.  limit=0 means "no cap".
+            "limit": (limit + offset) if limit > 0 else 0,
         })
         # Server-side name search
         if name_contains:
@@ -428,9 +495,11 @@ def uia_find_all(
 @mcp.tool(
     name="uia_invoke",
     description=(
-        "Click or activate a UI element by name. "
+        "Click or activate a UI element by name or HWND. "
         "Use name='Button Name' with the exact name from uia_find_all. "
+        "Use hwnd='0x1234' (the hex hwnd from uia_find_all include_hwnd=True) for the fastest path. "
         "Example: uia_invoke(name='7') clicks the '7' button. "
+        "Example: uia_invoke(hwnd='0x40164') clicks by window handle (fastest, no scan). "
         "Example: uia_invoke(name='=') presses equals and returns the result when read_after=true. "
         "Set read_after=true to read the focused element's text immediately after invoking "
         "(useful for getting calculator results, updated labels, etc.). "
@@ -445,7 +514,9 @@ def uia_find_all(
 def uia_invoke(
     name: str = "",
     target: dict[str, Any] = {},  # noqa: B006
+    hwnd: str = "",
     read_after: bool = False,
+    timeout_ms: int = 0,
     api_key: str = "",
 ) -> dict[str, Any]:
     """
@@ -459,22 +530,61 @@ def uia_invoke(
         Use names from uia_find_all output.
     target : dict
         Full selector dict (used when name is not set).
+    hwnd : str
+        Hex HWND string (e.g. '0x401f2') from uia_find_all include_hwnd=True.
+        Fastest path — no element scan required. Takes precedence over name.
     read_after : bool
         When True, read the focused element's text after invoking and include
         it in the response as ``after_text`` / ``after_source``.  Useful after
         pressing = or Enter to capture the calculator result in one round-trip.
+    timeout_ms : int
+        When > 0, poll for a window title/state change for up to this many
+        milliseconds after invoking.  Useful for slow-loading views (e.g.
+        Quicken BILLS & INCOME takes 15-25 s to fully load).  Returns
+        ``settled=true`` when a change is detected, ``settled=false`` on timeout.
     """
     auth_err = _check_auth(api_key)
     if auth_err:
         return auth_err
+    if hwnd and not target:
+        target = {"hwnd": hwnd}
     if name and not target:
         target = {"by": "name", "value": name}
     if not target:
         return {"ok": False, "error": "Provide name='...' or target={...}", "code": "INVALID_ARGS"}
     try:
         bridge = _get_bridge()
+
+        # Capture pre-invoke state for change detection when timeout_ms > 0
+        pre_title = ""
+        if timeout_ms > 0:
+            try:
+                state = bridge.check_state()
+                pre_title = state.get("title", "") if isinstance(state, dict) else ""
+            except Exception:  # noqa: BLE001
+                pass
+
         bridge.invoke(target)
         result: dict[str, Any] = {"ok": True}
+
+        if timeout_ms > 0:
+            import time as _time
+            deadline = _time.monotonic() + timeout_ms / 1000.0
+            settled = False
+            while _time.monotonic() < deadline:
+                _time.sleep(0.25)
+                try:
+                    state = bridge.check_state()
+                    cur_title = state.get("title", "") if isinstance(state, dict) else ""
+                    if cur_title != pre_title:
+                        settled = True
+                        result["after_title"] = cur_title
+                        break
+                except Exception:  # noqa: BLE001
+                    break
+            result["settled"] = settled
+            result["elapsed_ms"] = round((_time.monotonic() - (deadline - timeout_ms / 1000.0)) * 1000)
+
         if read_after:
             try:
                 after_text, after_source = bridge.get_text(None)
@@ -522,7 +632,10 @@ def uia_set_value(
         return auth_err
     try:
         bridge = _get_bridge()
-        bridge.set_value(target, value)
+        result = bridge.set_value(target, value)
+        # bridge returns a dict on success; fall back for non-Windows bridges
+        if isinstance(result, dict):
+            return result
         return {"ok": True}
     except UIAError as exc:
         return {"ok": False, "error": str(exc), "code": exc.code}
@@ -642,7 +755,10 @@ def uia_legacy_invoke(
         "Click at absolute screen coordinates. "
         "Use double=true for double-clicks.  Coordinates come from the 'rect' "
         "field returned by uia_inspect.  "
-        "button: 'left' (default), 'right', or 'middle'."
+        "button: 'left' (default), 'right', or 'middle'.  "
+        "force_sendinput: always dispatch via raw SendInput (no pywinauto "
+        "SetCursorPos path).  Use when the target window filters out synthetic "
+        "mouse events that set the cursor position first."
     ),
 )
 def uia_mouse_click(
@@ -650,6 +766,7 @@ def uia_mouse_click(
     y: int,
     double: bool = False,
     button: str = "left",
+    force_sendinput: bool = False,
     api_key: str = "",
 ) -> dict[str, Any]:
     """
@@ -663,13 +780,15 @@ def uia_mouse_click(
         True for double-click.
     button : str
         'left', 'right', or 'middle'.
+    force_sendinput : bool
+        Forward to the bridge's ``force_sendinput`` parameter (see bridge docs).
     """
     auth_err = _check_auth(api_key)
     if auth_err:
         return auth_err
     try:
         bridge = _get_bridge()
-        bridge.mouse_click(x, y, double=double, button=button)
+        bridge.mouse_click(x, y, double=double, button=button, force_sendinput=force_sendinput)
         return {"ok": True}
     except UIAError as exc:
         return {"ok": False, "error": str(exc), "code": exc.code}
@@ -916,6 +1035,290 @@ def uia_get_text(
         return {"ok": False, "error": str(exc), "code": exc.code}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+
+# ===================================================================
+# Tool: wait_for_element  (#14)
+# ===================================================================
+
+
+@mcp.tool(
+    name="wait_for_element",
+    description=(
+        "Poll the UI tree until a named element appears (or disappears). "
+        "Returns as soon as the condition is met, or after timeout_ms with ok=false. "
+        "Use present=true (default) to wait for an element to appear, "
+        "present=false to wait for it to vanish (e.g. dismiss confirmation dialogs). "
+        "Example: wait_for_element(name='Save') waits up to 5 s for a Save button. "
+        "Example: wait_for_element(name='Please wait…', present=false) waits for a "
+        "loading spinner to disappear."
+    ),
+)
+def wait_for_element(
+    name: str,
+    present: bool = True,
+    timeout_ms: int = 5000,
+    poll_ms: int = 250,
+    api_key: str = "",
+) -> dict[str, Any]:
+    """
+    Poll until an element appears or disappears in the UI tree.
+
+    Parameters
+    ----------
+    name : str
+        Exact name of the element to wait for.
+    present : bool
+        ``True`` (default) — wait until the element is present.
+        ``False`` — wait until the element is gone.
+    timeout_ms : int
+        Maximum wait time in milliseconds (default 5000).
+    poll_ms : int
+        Polling interval in milliseconds (default 250).
+    """
+    import time  # noqa: PLC0415
+
+    auth_err = _check_auth(api_key)
+    if auth_err:
+        return auth_err
+    try:
+        bridge = _get_bridge()
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        interval = poll_ms / 1000.0
+        while True:
+            items = bridge.find_all({"has_actions": False, "named_only": True})
+            found = any(i.get("name") == name for i in items)
+            if found == present:
+                return {
+                    "ok": True,
+                    "found": found,
+                    "name": name,
+                    "elapsed_ms": round((time.monotonic() - (deadline - timeout_ms / 1000.0)) * 1000),
+                }
+            if time.monotonic() >= deadline:
+                return {
+                    "ok": False,
+                    "found": found,
+                    "name": name,
+                    "error": f"Timed out after {timeout_ms} ms waiting for element "
+                    f"{'to appear' if present else 'to disappear'}",
+                    "code": "TIMEOUT",
+                }
+            time.sleep(interval)
+    except UIAError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+
+# ===================================================================
+# Tool: uia_send_message  (#16)
+# ===================================================================
+
+
+@mcp.tool(
+    name="uia_send_message",
+    description=(
+        "Send a raw Win32 message to a window handle. "
+        "Use for controls that only respond to WM_LBUTTONDOWN/UP, BM_CLICK, "
+        "or similar low-level messages (e.g. Quicken menu items that ignore "
+        "InvokePattern).  "
+        "Common message constants: BM_CLICK=0xF5, WM_CLOSE=0x0010, "
+        "WM_COMMAND=0x0111, WM_LBUTTONDOWN=0x0201, WM_LBUTTONUP=0x0202.  "
+        "sync=true (default) uses SendMessageW; sync=false uses PostMessageW. "
+        "Only available on Windows; returns ok=false with code=NOT_SUPPORTED "
+        "on other platforms."
+    ),
+)
+def uia_send_message(
+    hwnd: int,
+    message: int,
+    wparam: int = 0,
+    lparam: int = 0,
+    sync: bool = True,
+    api_key: str = "",
+) -> dict[str, Any]:
+    """
+    Send or post a Win32 message to a window handle.
+
+    Parameters
+    ----------
+    hwnd : int
+        Target window handle (e.g. from uia_inspect's ``hwnd`` field).
+    message : int
+        Windows message constant.
+    wparam, lparam : int
+        Message parameters (default 0).
+    sync : bool
+        True → SendMessageW (blocking).  False → PostMessageW (async).
+    """
+    auth_err = _check_auth(api_key)
+    if auth_err:
+        return auth_err
+    try:
+        bridge = _get_bridge()
+        ret = bridge.send_win32_message(hwnd, message, wparam, lparam, sync=sync)
+        return {"ok": True, "return_value": ret}
+    except UIAError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+
+# ===================================================================
+# Tool: check_window_state  (#17)
+# ===================================================================
+
+
+@mcp.tool(
+    name="check_window_state",
+    description=(
+        "Check whether the target window is currently enabled (not blocked by a "
+        "modal overlay or dialog).  "
+        "Returns enabled=true when the window is interactive.  "
+        "When enabled=false, the response includes a blocking_windows list "
+        "identifying the same-process windows that may be responsible "
+        "(e.g. Quicken's QWinLightbox or an unsaved-changes dialog).  "
+        "Use this before invoking menu items to detect modal states and avoid "
+        "silent failures.  "
+        "Only available on Windows."
+    ),
+)
+def check_window_state(
+    hwnd: int,
+    api_key: str = "",
+) -> dict[str, Any]:
+    """
+    Check whether *hwnd* is enabled and list any blocking overlays.
+
+    Parameters
+    ----------
+    hwnd : int
+        The handle of the window to check (from process_list or select_window).
+    """
+    auth_err = _check_auth(api_key)
+    if auth_err:
+        return auth_err
+    try:
+        bridge = _get_bridge()
+        result = bridge.get_window_enabled_state(hwnd)
+        return {"ok": True, **result}
+    except UIAError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+
+# ===================================================================
+# Tool: dismiss_modal_overlay  (#17)
+# ===================================================================
+
+
+@mcp.tool(
+    name="dismiss_modal_overlay",
+    description=(
+        "Close any modal overlay windows blocking the target window and "
+        "re-enable it if it was left disabled.  "
+        "Handles the pattern where a wizard or background dialog calls "
+        "EnableWindow(parent, 0) and then fails to re-enable it after closing. "
+        "Sends WM_CLOSE to each blocking same-process window, then calls "
+        "EnableWindow(target, 1) if the window is still disabled.  "
+        "Returns a list of dismissed windows and whether the target was "
+        "explicitly re-enabled.  "
+        "Only available on Windows."
+    ),
+)
+def dismiss_modal_overlay_tool(
+    hwnd: int,
+    api_key: str = "",
+) -> dict[str, Any]:
+    """
+    Dismiss modal overlays blocking *hwnd* and re-enable it.
+
+    Parameters
+    ----------
+    hwnd : int
+        The handle of the blocked parent window.
+    """
+    auth_err = _check_auth(api_key)
+    if auth_err:
+        return auth_err
+    try:
+        bridge = _get_bridge()
+        result = bridge.dismiss_modal_overlay(hwnd)
+        return {"ok": True, **result}
+    except UIAError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+
+# ===================================================================
+# Tool: capture_screenshot
+# ===================================================================
+
+
+@mcp.tool(
+    name="capture_screenshot",
+    description=(
+        "Capture a screenshot of a window or screen region and return it as "
+        "a base64-encoded PNG.  "
+        "When hwnd is provided, uses PrintWindow to capture the window even if "
+        "partially occluded.  "
+        "When region {left,top,right,bottom} is provided, captures that screen "
+        "rectangle via BitBlt.  "
+        "Omit both to capture the currently-attached window.  "
+        "Use this to inspect owner-drawn controls (e.g. Quicken transaction "
+        "register rows) that have no UIA element tree.  "
+        "Only available on Windows; requires Pillow (pip install pillow).  "
+        "Returns: {ok, image_b64, width, height, format='PNG'}."
+    ),
+)
+def capture_screenshot(
+    hwnd: int | None = None,
+    region: dict[str, int] | None = None,
+    api_key: str = "",
+) -> dict[str, Any]:
+    """
+    Capture a window or screen region as a base64 PNG.
+
+    Parameters
+    ----------
+    hwnd : int, optional
+        Window handle to capture.  Defaults to the attached window.
+    region : dict, optional
+        ``{"left": int, "top": int, "right": int, "bottom": int}``
+        Screen coordinates to capture.  Overrides *hwnd* when provided.
+    """
+    auth_err = _check_auth(api_key)
+    if auth_err:
+        return auth_err
+    try:
+        bridge = _get_bridge()
+        return bridge.capture_screenshot(hwnd=hwnd, region=region)
+    except UIAError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+
+# ---------------------------------------------------------------------------
+# Skill plugin loading
+# ---------------------------------------------------------------------------
+
+def _load_skill_plugins() -> None:
+    """Discover and load skill plugins from the ``skills/`` package."""
+    try:
+        from skills import load_skills  # noqa: PLC0415
+        loaded = load_skills(mcp, get_bridge=_get_bridge, check_auth=_check_auth)
+        if loaded:
+            names = [s.name for s in loaded]
+            print(f"[uiax] loaded skills: {', '.join(names)}", file=__import__('sys').stderr)
+    except Exception:
+        import traceback  # noqa: PLC0415
+        traceback.print_exc()
+
+_load_skill_plugins()
 
 
 # ---------------------------------------------------------------------------
