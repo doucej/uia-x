@@ -201,16 +201,16 @@ def register(
             "and clicking visible items.  Uses a scroll-sweep approach that is "
             "reliable for all account types including investments.  "
             "Returns {ok, accounts:[{name,section}], scanned, total, done, cached}. "
-            "The first call runs a full scan (up to max_seconds).  Subsequent "
-            "calls return cached results instantly — set force_rescan=true to "
-            "discard the cache and re-scan.  "
+            "The first call runs a full scan (up to max_seconds; default 720s). "
+            "Subsequent calls return cached results instantly — set force_rescan=true "
+            "to discard the cache and re-scan.  "
             "Windows-only.  [Quicken skill]"
         ),
     )
     def list_sidebar_accounts_tool(
         api_key: str = "",
         resume: bool = False,
-        max_seconds: float = 360.0,
+        max_seconds: float = 720.0,
         force_rescan: bool = False,
     ) -> dict[str, Any]:
         auth_err = check_auth(api_key)

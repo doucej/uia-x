@@ -1437,7 +1437,7 @@ def _sidebar_dblclick(root_hwnd: int, screen_x: int, screen_y: int,
     return buf.value
 
 
-def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict[str, Any]]:
+def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 600.0) -> list[dict[str, Any]]:
     """Discover sidebar accounts by scrolling and clicking ListBox items.
 
     Uses per-item targeting via LB_GETITEMRECT to click only actual ListBox
@@ -2287,7 +2287,7 @@ def _sweep_scan_sidebar(root_hwnd: int, max_seconds: float = 300.0) -> list[dict
 
 
 def list_sidebar_accounts(bridge: Any, resume: bool = False,
-                           max_seconds: float = 300.0,
+                           max_seconds: float = 600.0,
                            force_rescan: bool = False) -> dict[str, Any]:
     """Discover sidebar accounts by scrolling through and clicking visible items.
 
@@ -2297,7 +2297,7 @@ def list_sidebar_accounts(bridge: Any, resume: bool = False,
     message-based clicks on hidden ListBoxes.
 
     When a previous scan has populated the cache, returns cached results
-    immediately unless ``force_rescan`` is set.  This avoids the 300-second
+    immediately unless ``force_rescan`` is set.  This avoids the 600-second
     full scan on every call.
 
     Parameters
@@ -2308,7 +2308,7 @@ def list_sidebar_accounts(bridge: Any, resume: bool = False,
         Accepted for API compatibility but ignored — the sweep scan always
         starts fresh and completes in a single call.
     max_seconds
-        Seconds budget for the entire scan (default 300).
+        Seconds budget for the entire scan (default 600).
     force_rescan
         If True, discard the cache and run a fresh scan.
 
