@@ -4971,17 +4971,13 @@ def _wait_for_split_container(
 ) -> tuple[int, str]:
     """Wait for Quicken's split editor to become visible after clicking Split.
 
-    Tries two strategies:
-    1. **New popup window** — a new immediate child of *root_hwnd* appears
-       with ≥ 3 visible QREdit descendants.
-    2. **Inline expansion** — the count of QREdit children inside *qwmdi_hwnd*
-       grows by at least 3 compared to *qredits_before*.
+    The split editor is a top-level QWinDlg modal window with title "Split Transaction".
+    It is NOT a child of QFRAME, so we search for it among top-level windows.
 
-    Returns ``(container_hwnd, kind)`` where *kind* is ``"popup"`` or
-    ``"inline"``, or ``(0, "timeout")`` on timeout.
+    Returns ``(container_hwnd, kind)`` where *kind* is ``"qwindlg"``
+    on success, or ``(0, "timeout")`` on timeout.
     """
     import ctypes  # noqa: PLC0415
-    import ctypes.wintypes  # noqa: PLC0415
     import time  # noqa: PLC0415
     import sys  # noqa: PLC0415
 
@@ -4993,28 +4989,28 @@ def _wait_for_split_container(
         time.sleep(0.15)
         poll_count += 1
 
-        # Strategy 1: new popup child of root
-        curr = _snapshot_immediate_children(root_hwnd)
-        new = curr - children_before
-        for h in new:
-            if not user32.IsWindowVisible(h):
-                continue
-            qredits = _enum_visible_children_by_class(h, "qredit")
-            if len(qredits) >= 3:
-                print(f"[SPLIT_WAIT] Found popup with {len(qredits)} QREdits after {poll_count} polls", file=sys.stderr)
-                return h, "popup"
-
-        # Strategy 2: inline — more QREdits appeared inside the QWMDI
-        curr_qredits = _enum_visible_children_by_class(qwmdi_hwnd, "qredit")
-        if len(curr_qredits) >= qredits_before + 3:
-            print(f"[SPLIT_WAIT] Found inline with {len(curr_qredits)} QREdits (threshold: {qredits_before + 3}) after {poll_count} polls", file=sys.stderr)
-            return qwmdi_hwnd, "inline"
+        # Search for top-level QWinDlg window with "Split Transaction" in title
+        hwnd = 0
+        while True:
+            hwnd = user32.FindWindowExW(0, hwnd, "QWinDlg", None)
+            if not hwnd:
+                break
+            
+            # Check title
+            txt_buf = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(hwnd, txt_buf, 256)
+            title = txt_buf.value
+            
+            if "split" in title.lower():
+                elapsed = time.monotonic() - t0
+                print(f"[SPLIT_WAIT] Found QWinDlg after {elapsed:.2f}s ({poll_count} polls): {title!r}", file=sys.stderr)
+                return hwnd, "qwindlg"
         
         # Print progress periodically
         if poll_count % 10 == 0:
-            print(f"[SPLIT_WAIT] Poll {poll_count}: new_children={len(new)}, qredits={len(curr_qredits)}/{qredits_before + 3}", file=sys.stderr)
+            print(f"[SPLIT_WAIT] Poll {poll_count}: searching for QWinDlg...", file=sys.stderr)
 
-    print(f"[SPLIT_WAIT] TIMEOUT after {poll_count} polls, new_children={len(curr - children_before)}, qredits={len(curr_qredits)}/{qredits_before + 3}", file=sys.stderr)
+    print(f"[SPLIT_WAIT] TIMEOUT after {timeout_s:.1f}s ({poll_count} polls) - QWinDlg not found", file=sys.stderr)
     return 0, "timeout"
 
 
@@ -5043,6 +5039,79 @@ def _debug_split_state(root_hwnd: int, mdi_h: int) -> None:
     cb = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)(find_windows)
     ctypes.windll.user32.EnumChildWindows(root_hwnd, cb, 0)
 
+
+
+def _parse_split_qwindlg(
+    container_hwnd: int,
+) -> list[dict[str, Any]]:
+    """Parse split rows from a QWinDlg split dialog.
+
+    The QWinDlg contains a QWListViewer with a ListBox.
+    Within the ListBox are Edit controls that hold the split row values.
+    
+    Each visible Edit control represents one field in a split row.
+    Fields are grouped into rows by y-position (controls within 20 px = same row),
+    then sorted left-to-right to get category, memo, amount order.
+
+    Returns a list of dicts: ``{"index", "hwnd_category", "hwnd_memo",
+    "hwnd_amount", "category", "memo", "amount"}``.
+    """
+    import ctypes  # noqa: PLC0415
+
+    user32 = ctypes.windll.user32
+    
+    # Find all visible Edit controls in the split dialog
+    edits: list[tuple[int, int, int]] = []  # (hwnd, left, top)
+    
+    def enum_edits(h: int, _: int) -> bool:
+        cls_buf = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(h, cls_buf, 64)
+        if cls_buf.value == "Edit" and user32.IsWindowVisible(h):
+            r_int = (ctypes.c_long * 4)()
+            user32.GetWindowRect(h, ctypes.byref(r_int))
+            edits.append((h, r_int[0], r_int[1]))  # (hwnd, left, top)
+        return True
+    
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    user32.EnumChildWindows(container_hwnd, WNDENUMPROC(enum_edits), 0)
+    
+    if not edits:
+        return []
+    
+    # Sort by y then x
+    edits.sort(key=lambda e: (e[2], e[1]))
+    
+    # Group into y-bands (±20 px = same row)
+    rows: list[list[tuple[int, int, int]]] = []
+    for edit_data in edits:
+        placed = False
+        for row in rows:
+            if abs(edit_data[2] - row[0][2]) <= 20:
+                row.append(edit_data)
+                placed = True
+                break
+        if not placed:
+            rows.append([edit_data])
+    
+    result: list[dict[str, Any]] = []
+    for i, row in enumerate(rows):
+        # Sort left-to-right within row
+        row.sort(key=lambda e: e[1])
+        hwnds = [h for h, _, _ in row]
+        values = [_read_hwnd_text(h) for h in hwnds]
+        
+        entry: dict[str, Any] = {
+            "index": i,
+            "hwnd_category": hwnds[0] if len(hwnds) > 0 else 0,
+            "hwnd_memo":     hwnds[1] if len(hwnds) > 1 else 0,
+            "hwnd_amount":   hwnds[2] if len(hwnds) > 2 else 0,
+            "category": values[0] if len(values) > 0 else "",
+            "memo":     values[1] if len(values) > 1 else "",
+            "amount":   values[2] if len(values) > 2 else "",
+        }
+        result.append(entry)
+    
+    return result
 
 
 def _parse_split_qredits(
@@ -5265,11 +5334,16 @@ def read_transaction_splits(
             "code": "SPLIT_DIALOG_TIMEOUT",
         }
 
-    # Read split rows
-    splits = _parse_split_qredits(
-        container,
-        exclude_hwnds=qredits_before_hwnds if kind == "inline" else None,
-    )
+    # Read split rows based on dialog type
+    if kind == "qwindlg":
+        # Split dialog is a QWinDlg modal with Edit controls
+        splits = _parse_split_qwindlg(container)
+    else:
+        # Fallback to QREdit-based parsing (legacy/inline mode)
+        splits = _parse_split_qredits(
+            container,
+            exclude_hwnds=qredits_before_hwnds if kind == "inline" else None,
+        )
 
     # Store state for edit_split_line / close_split_dialog
     global _split_state  # noqa: PLW0603
