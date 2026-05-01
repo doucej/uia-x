@@ -2432,6 +2432,7 @@ def list_sidebar_accounts(bridge: Any, resume: bool = False,
 
     results = _sweep_scan_sidebar(root, max_seconds=max_seconds)
     _sidebar_cache = list(results)
+    _save_sidebar_cache()
 
     return {
         "ok": True,
@@ -2448,6 +2449,46 @@ _sidebar_cache: list[dict[str, Any]] = []
 
 # Resumable scan state for list_sidebar_accounts
 _scan_state: dict[str, Any] = {}
+
+
+# ---------------------------------------------------------------------------
+# Sidebar cache disk persistence
+# ---------------------------------------------------------------------------
+import json as _json  # noqa: PLC0415, E402 — late import to avoid top-level order issues
+import os as _os  # noqa: PLC0415, E402
+
+_SIDEBAR_CACHE_FILE: str = _os.path.join(
+    _os.path.expandvars("%APPDATA%"), "uiax", "sidebar_cache.json"
+)
+
+
+def _save_sidebar_cache() -> None:
+    """Persist _sidebar_cache to disk so it survives server restarts."""
+    try:
+        dir_ = _os.path.dirname(_SIDEBAR_CACHE_FILE)
+        _os.makedirs(dir_, exist_ok=True)
+        with open(_SIDEBAR_CACHE_FILE, "w", encoding="utf-8") as _f:
+            _json.dump(_sidebar_cache, _f, indent=2)
+    except Exception:  # noqa: BLE001
+        pass  # Disk persistence is best-effort
+
+
+def _load_sidebar_cache() -> None:
+    """Load the on-disk sidebar cache into _sidebar_cache at startup."""
+    global _sidebar_cache  # noqa: PLW0603
+    if not _os.path.exists(_SIDEBAR_CACHE_FILE):
+        return
+    try:
+        with open(_SIDEBAR_CACHE_FILE, encoding="utf-8") as _f:
+            data = _json.load(_f)
+        if isinstance(data, list) and data:
+            _sidebar_cache = data
+    except Exception:  # noqa: BLE001
+        pass  # Corrupted or unreadable cache — start fresh
+
+
+# Load persisted cache immediately on module import
+_load_sidebar_cache()
 
 # Last successful navigate_to_account result: hwnd + name, used by
 # read_register_state to re-activate the target MDI before reading.
@@ -2477,12 +2518,14 @@ def _sidebar_cache_add(name: str, scroll: int, y: int, sx: int,
         if entry["name"].lower() == name.lower():
             entry.update(nav_scroll=scroll, nav_y=y, nav_sx=sx,
                          nav_lb=lb, nav_item=item)
+            _save_sidebar_cache()
             return
     _sidebar_cache.append({
         "name": name, "section": "",
         "nav_scroll": scroll, "nav_y": y, "nav_sx": sx,
         "nav_lb": lb, "nav_item": item,
     })
+    _save_sidebar_cache()
 
 
 def _sidebar_lookup(account_name: str) -> dict[str, Any] | None:
@@ -2551,6 +2594,10 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
         raise TargetNotFoundError(
             "Quicken window is no longer valid. Use select_window to reattach."
         )
+
+    # Clear stale nav hint so downstream tools don't pick up a previous
+    # account.  _lock_in will populate _last_nav when navigation succeeds.
+    _last_nav.clear()
 
     # Dismiss any modal dialogs that may be blocking interaction
     _dismiss_modal_dialogs(root_hwnd)
@@ -3022,6 +3069,18 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
                         return _verify_and_stabilize(
                             {"ok": True, "account": match,
                              "method": "sidebar_cached"})
+                    # If the sidebar hid after this click, an investment
+                    # account opened.  Retrying other y_off values is
+                    # pointless — the sidebar is no longer there to click.
+                    # Restore the sidebar once and drop to the slow scan.
+                    holder_now = _find_sidebar_holder(root_hwnd)
+                    sidebar_hidden = (
+                        not holder_now
+                        or not user32.IsWindowVisible(holder_now)
+                    )
+                    if sidebar_hidden:
+                        _restore_sidebar_btn()
+                        break  # fall through to slow scan
 
         # --- Slow path: scroll + wheel-scroll sidebar scan ---
         _expand_sidebar_sections(holder)
@@ -3336,8 +3395,10 @@ def read_register_state(bridge: Any) -> dict[str, Any]:
 
     # Consume any pending navigate hint BEFORE the slow _find_active_mdi
     # retry loop so we capture the bracket name while it's still fresh.
+    # NOTE: do NOT clear _last_nav here — set_register_filter (called right
+    # after read_register_state in a typical flow) also needs the nav hint.
+    # _last_nav is cleared only by navigate_to_account when starting a new nav.
     _nav_info = _last_nav.copy()
-    _last_nav.clear()
 
     # Read bracket NOW (right after navigate_to_account returned) so we
     # get the "just navigated" state before any async Quicken switch.
@@ -4284,12 +4345,16 @@ def set_register_filter(bridge: Any, text: str) -> dict[str, Any]:
     _nav_hint = _last_nav.copy()
     _last_nav.clear()
 
-    # Capture bracket NOW so we can verify account hasn't shifted after filter.
+    # Determine expected account for post-filter verification.
+    # Prefer _nav_hint["name"] (set by navigate_to_account just before this
+    # call) — it is always current and avoids the race between navigate_to_account
+    # returning and the QFRAME title bracket updating.  Fall back to bracket.
     import re as _re_srf  # noqa: PLC0415
     _sbuf_srf = ctypes.create_unicode_buffer(512)
     user32.GetWindowTextW(root_hwnd, _sbuf_srf, 512)
     _bm_srf = _re_srf.search(r"\[(.+?)\]\s*$", _sbuf_srf.value)
-    _expected_acct = _bm_srf.group(1).strip() if _bm_srf else ""
+    _bracket_acct = _bm_srf.group(1).strip() if _bm_srf else ""
+    _expected_acct = _nav_hint.get("name") or _bracket_acct
 
     def _read_text(h: int) -> str:
         tlen = _send_msg_timeout(h, WM_GETTEXTLENGTH, 0, 0, timeout_ms=1500)
@@ -4356,10 +4421,14 @@ def set_register_filter(bridge: Any, text: str) -> dict[str, Any]:
     global _filter_edit_cache  # noqa: PLW0603
     _filter_edit_cache[mdi_h] = filter_h
 
-    # Activate the target QWMDI before writing so Quicken knows which account
-    # "owns" this filter edit.  This must happen before WM_SETTEXT so Quicken's
-    # EN_CHANGE handler runs in the context of the correct account.
+    # Activate the target QWMDI and give keyboard focus to the filter Edit
+    # directly.  SetFocus(filter_h) is critical: Quicken's EN_CHANGE handler
+    # uses the keyboard focus owner to decide *which account* gets filtered.
+    # Just calling _activate_mdi (BringWindowToTop+SetFocus on the QWMDI)
+    # is insufficient — if another account's Edit last had focus, Quicken
+    # will filter that account instead.
     _activate_mdi(mdi_h)
+    user32.SetFocus(filter_h)
     time.sleep(0.1)
 
     # Write text and trigger Quicken's filter via WM_CHAR rather than a
@@ -4394,7 +4463,7 @@ def set_register_filter(bridge: Any, text: str) -> dict[str, Any]:
         _send_msg_timeout(filter_h, EM_SETSEL, 0,
                           ctypes.c_long(-1).value, timeout_ms=500)
         _send_msg_timeout(filter_h, WM_CHAR, 0x08, 1, timeout_ms=2000)
-    # Re-activate in case Quicken internally shifted focus while filtering
+    # Re-activate MDI in case Quicken internally shifted focus while filtering
     _activate_mdi(mdi_h)
     time.sleep(0.3)
 
