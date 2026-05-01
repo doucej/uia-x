@@ -569,7 +569,8 @@ def list_accounts(bridge: Any) -> list[dict[str, Any]]:
         return [{"name": e["name"], "source": "sidebar"} for e in _sidebar_cache]
     sidebar = list_sidebar_accounts(bridge)
     if sidebar:
-        return [{"name": e["name"], "source": "sidebar"} for e in sidebar]
+        return [{"name": e["name"], "source": "sidebar"}
+                for e in sidebar.get("accounts", [])]
 
     raise UIAError(
         "No accounts found. Try navigating to a Spending or All Transactions view.",
@@ -2369,6 +2370,10 @@ _scan_state: dict[str, Any] = {}
 # Cleared after first use so it doesn't affect unrelated reads.
 _last_nav: dict[str, Any] = {}  # {"hwnd": int, "name": str}
 
+# Cache the filter Edit handle per MDI so read_register_state can read back
+# the exact same control that set_register_filter wrote to.
+_filter_edit_cache: dict[int, int] = {}  # mdi_h → filter Edit HWND
+
 
 def _activate_mdi(mdi_h: int) -> None:
     """Activate a QWMDI child window.
@@ -2864,8 +2869,9 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
                 if bracket:
                     return None  # stable non-target
             # Blank title — investment/property account loading.  Poll up
-            # to 5s for the title to appear, then check if it's our target.
-            for _poll in range(10):  # up to ~5s
+            # to 25s for the title to appear (investment accounts on slow
+            # VMs take 17-20s), then check if it's our target.
+            for _poll in range(50):  # up to ~25s
                 time.sleep(0.5)
                 _dismiss_modal_dialogs(root_hwnd)
                 user32.GetWindowTextW(root_hwnd, buf, 256)
@@ -3075,6 +3081,17 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
                         if not user32.IsWindowVisible(holder):
                             if not _restore_nav_sidebar():
                                 return None
+                            # _restore_nav_sidebar may have already landed
+                            # on the target via bracket match — return now
+                            # to avoid over-clicking to the next account.
+                            user32.GetWindowTextW(root_hwnd, buf, 256)
+                            _post_restore = _bracket_name(buf.value)
+                            if (_post_restore
+                                    and _acct_match(_post_restore, target_name)):
+                                return _verify_and_stabilize(
+                                    {"ok": True,
+                                     "account": _post_restore,
+                                     "method": "sidebar_scan"})
                             # Re-enumerate with fresh handles
                             vis_lbs = _enum_lbs_nav()
                             user32.GetWindowRect(
@@ -3472,7 +3489,9 @@ def read_register_state(bridge: Any) -> dict[str, Any]:
     ):
         current_account = _nav_bracket_override
 
-    # Reconcile active? "C" button and "Reset" button both visible in header
+    # Reconcile active? "C" button and "Reset" button both visible in header.
+    # Filter bar also shows "C" (Clear) and "Reset" — disambiguate using
+    # reconcile-specific Static labels that only appear during reconcile.
     c_btn_visible = any(
         h for h, c, t in mdi_children
         if c == "qc_button" and t == "C" and user32.IsWindowVisible(h)
@@ -3481,20 +3500,33 @@ def read_register_state(bridge: Any) -> dict[str, Any]:
         h for h, c, t in mdi_children
         if c == "qc_button" and t == "Reset" and user32.IsWindowVisible(h)
     )
-    reconcile_active = c_btn_visible and reset_visible
+    has_reconcile_labels = any(
+        c == "static" and user32.IsWindowVisible(h)
+        and any(kw in t.lower() for kw in (
+            "statement ending", "cleared balance", "difference"
+        ))
+        for h, c, t in mdi_children
+    )
+    reconcile_active = c_btn_visible and reset_visible and has_reconcile_labels
 
-    # Filter text (Edit control in reconcile header, y < TxList.top)
-    txlist_rect = ctypes.wintypes.RECT()
-    user32.GetWindowRect(txlist_h, ctypes.byref(txlist_rect))
+    # Filter text — use handle cached by set_register_filter when available
+    # (avoids reading the wrong Edit when multiple controls are above TxList).
     filter_text = ""
-    for h, c, t in mdi_children:
-        if c != "edit" or not user32.IsWindowVisible(h):
-            continue
-        r = ctypes.wintypes.RECT()
-        user32.GetWindowRect(h, ctypes.byref(r))
-        if r.bottom <= txlist_rect.top:
-            filter_text = _read_text(h)
-            break
+    _cached_filter_h = _filter_edit_cache.get(mdi_h)
+    if (_cached_filter_h and user32.IsWindow(_cached_filter_h)
+            and user32.IsWindowVisible(_cached_filter_h)):
+        filter_text = _read_text(_cached_filter_h)
+    else:
+        txlist_rect = ctypes.wintypes.RECT()
+        user32.GetWindowRect(txlist_h, ctypes.byref(txlist_rect))
+        for h, c, t in mdi_children:
+            if c != "edit" or not user32.IsWindowVisible(h):
+                continue
+            r = ctypes.wintypes.RECT()
+            user32.GetWindowRect(h, ctypes.byref(r))
+            if r.bottom <= txlist_rect.top:
+                filter_text = _read_text(h)
+                break
 
     return {
         "ok": True,
@@ -4235,6 +4267,10 @@ def set_register_filter(bridge: Any, text: str) -> dict[str, Any]:
             "No filter Edit found above TxList.",
             code="FILTER_EDIT_NOT_FOUND",
         )
+
+    # Cache so read_register_state can read back the same control.
+    global _filter_edit_cache  # noqa: PLW0603
+    _filter_edit_cache[mdi_h] = filter_h
 
     # Activate the target QWMDI before writing so Quicken knows which account
     # "owns" this filter edit.  This must happen before WM_SETTEXT so Quicken's
