@@ -4983,6 +4983,7 @@ def _wait_for_split_container(
     import ctypes  # noqa: PLC0415
     import ctypes.wintypes  # noqa: PLC0415
     import time  # noqa: PLC0415
+    import sys  # noqa: PLC0415
 
     user32 = ctypes.windll.user32
     t0 = time.monotonic()
@@ -5000,18 +5001,20 @@ def _wait_for_split_container(
                 continue
             qredits = _enum_visible_children_by_class(h, "qredit")
             if len(qredits) >= 3:
+                print(f"[SPLIT_WAIT] Found popup with {len(qredits)} QREdits after {poll_count} polls", file=sys.stderr)
                 return h, "popup"
 
         # Strategy 2: inline — more QREdits appeared inside the QWMDI
         curr_qredits = _enum_visible_children_by_class(qwmdi_hwnd, "qredit")
         if len(curr_qredits) >= qredits_before + 3:
+            print(f"[SPLIT_WAIT] Found inline with {len(curr_qredits)} QREdits (threshold: {qredits_before + 3}) after {poll_count} polls", file=sys.stderr)
             return qwmdi_hwnd, "inline"
         
-        # Debug output every 10 polls or on last poll
-        if poll_count % 10 == 0 or time.monotonic() - t0 > timeout_s - 0.2:
-            print(f"[SPLIT_WAIT] poll {poll_count}: new_children={len(new)}, "
-                  f"qredits={len(curr_qredits)} (need >={qredits_before + 3})")
+        # Print progress periodically
+        if poll_count % 10 == 0:
+            print(f"[SPLIT_WAIT] Poll {poll_count}: new_children={len(new)}, qredits={len(curr_qredits)}/{qredits_before + 3}", file=sys.stderr)
 
+    print(f"[SPLIT_WAIT] TIMEOUT after {poll_count} polls, new_children={len(curr - children_before)}, qredits={len(curr_qredits)}/{qredits_before + 3}", file=sys.stderr)
     return 0, "timeout"
 
 
@@ -5039,6 +5042,7 @@ def _debug_split_state(root_hwnd: int, mdi_h: int) -> None:
     
     cb = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)(find_windows)
     ctypes.windll.user32.EnumChildWindows(root_hwnd, cb, 0)
+
 
 
 def _parse_split_qredits(
@@ -5197,6 +5201,8 @@ def read_transaction_splits(
         Quicken used).
     """
     import ctypes  # noqa: PLC0415
+    import ctypes.wintypes  # noqa: PLC0415
+    import sys  # noqa: PLC0415
     import time  # noqa: PLC0415
 
     from server.process_manager import get_process_manager  # noqa: PLC0415
@@ -5226,14 +5232,11 @@ def read_transaction_splits(
     qredits_before_hwnds = set(_enum_visible_children_by_class(mdi_h, "qredit"))
     qredits_before_count = len(qredits_before_hwnds)
 
-    # Find and click the Split button (direct BM_CLICK — no focus change)
+    # Find the Split button
     split_btn = _find_button_in_hwnd(root_hwnd, "split", "splits")
     if split_btn is None:
-        # Button not visible yet — click the row to enter edit mode first
-        txlist_h = _find_txlist_hwnd(root_hwnd)
-        if txlist_h:
-            _click_hwnd_center(txlist_h)
-            time.sleep(0.4)
+        # Button not visible yet — wait longer for toolbar to appear
+        time.sleep(0.5)
         split_btn = _find_button_in_hwnd(root_hwnd, "split", "splits")
 
     if split_btn is None:
@@ -5244,8 +5247,11 @@ def read_transaction_splits(
             "code": "SPLIT_BUTTON_NOT_FOUND",
         }
 
-    # Click Split — try direct mouse click first (BM_CLICK may not work on Quicken's QC_button)
-    _click_hwnd_center(split_btn)
+    # Click the Split button via BM_CLICK (Windows message)
+    # Note: Live testing shows split dialog may not open for all transactions.
+    # This may be transaction-type specific or require specific Quicken state.
+    BM_CLICK = 0x00F5
+    ctypes.windll.user32.SendMessageW(split_btn, BM_CLICK, 0, 0)
     time.sleep(0.8)
 
     # Wait for the split editor to appear
