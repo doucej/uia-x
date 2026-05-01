@@ -257,3 +257,113 @@ def register(
             return {"ok": False, "error": str(exc), "code": exc.code}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+    @mcp.tool(
+        name="select_register_row",
+        description=(
+            "Select a specific transaction row in the visible register by "
+            "0-based row_index (0 = most recent transaction).  Clicks the "
+            "row directly via its screen rectangle — no keyboard required.  "
+            "Call this before read_transaction_splits to choose which "
+            "transaction to inspect.  Windows-only.  [Quicken skill]"
+        ),
+    )
+    def select_register_row_tool(
+        row_index: int = 0,
+        api_key: str = "",
+    ) -> dict[str, Any]:
+        auth_err = check_auth(api_key)
+        if auth_err:
+            return auth_err
+        try:
+            bridge = get_bridge()
+            return bridge_ext.select_register_row(bridge, row_index=row_index)
+        except UIAError as exc:
+            return {"ok": False, "error": str(exc), "code": exc.code}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+    @mcp.tool(
+        name="read_transaction_splits",
+        description=(
+            "Open the split editor for a transaction and read all split lines.  "
+            "If row_index is given (0 = most recent), that row is selected first; "
+            "otherwise uses the currently-selected row.  "
+            "Returns a list of splits: [{index, category, memo, amount}].  "
+            "The split editor is left OPEN after this call — use "
+            "edit_split_line to change values, then close_split_dialog to save "
+            "or cancel.  "
+            "Windows-only.  [Quicken skill]"
+        ),
+    )
+    def read_transaction_splits_tool(
+        row_index: int | None = None,
+        api_key: str = "",
+    ) -> dict[str, Any]:
+        auth_err = check_auth(api_key)
+        if auth_err:
+            return auth_err
+        try:
+            bridge = get_bridge()
+            return bridge_ext.read_transaction_splits(bridge, row_index=row_index)
+        except UIAError as exc:
+            return {"ok": False, "error": str(exc), "code": exc.code}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+    @mcp.tool(
+        name="edit_split_line",
+        description=(
+            "Edit one split line in the currently-open split editor.  "
+            "Uses WM_SETTEXT + EN_CHANGE injection — no focus change, no "
+            "keyboard input.  A readback verifies each write.  "
+            "read_transaction_splits must be called first to open the editor.  "
+            "index: 0-based split row.  Pass only the fields you want to change; "
+            "omit (or pass null) to leave unchanged.  "
+            "Windows-only.  [Quicken skill]"
+        ),
+    )
+    def edit_split_line_tool(
+        index: int,
+        category: str | None = None,
+        memo: str | None = None,
+        amount: str | None = None,
+        api_key: str = "",
+    ) -> dict[str, Any]:
+        auth_err = check_auth(api_key)
+        if auth_err:
+            return auth_err
+        try:
+            bridge = get_bridge()
+            return bridge_ext.edit_split_line(
+                bridge, index=index, category=category, memo=memo, amount=amount,
+            )
+        except UIAError as exc:
+            return {"ok": False, "error": str(exc), "code": exc.code}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+    @mcp.tool(
+        name="close_split_dialog",
+        description=(
+            "Close the currently-open split editor.  "
+            "save=true (default) commits changes (clicks OK/Done/Enter button).  "
+            "save=false discards changes (clicks Cancel).  "
+            "Uses BM_CLICK on the button HWND — no focus required.  "
+            "Windows-only.  [Quicken skill]"
+        ),
+    )
+    def close_split_dialog_tool(
+        save: bool = True,
+        api_key: str = "",
+    ) -> dict[str, Any]:
+        auth_err = check_auth(api_key)
+        if auth_err:
+            return auth_err
+        try:
+            bridge = get_bridge()
+            return bridge_ext.close_split_dialog(bridge, save=save)
+        except UIAError as exc:
+            return {"ok": False, "error": str(exc), "code": exc.code}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}

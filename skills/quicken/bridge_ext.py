@@ -4795,6 +4795,618 @@ def open_reconcile(
     }
 
 
+# ── Transaction split editing ─────────────────────────────────────
+
+
+def _read_hwnd_text(hwnd: int) -> str:
+    """Read text from any HWND via WM_GETTEXT — no focus required."""
+    import ctypes  # noqa: PLC0415
+    tlen = _send_msg_timeout(hwnd, 0x000E, 0, 0, timeout_ms=1000)  # WM_GETTEXTLENGTH
+    if not tlen or tlen <= 0:
+        return ""
+    buf = ctypes.create_unicode_buffer(tlen + 2)
+    _send_msg_timeout(hwnd, 0x000D, len(buf), ctypes.addressof(buf), timeout_ms=1500)  # WM_GETTEXT
+    return buf.value
+
+
+def _write_qredit_background(
+    hwnd: int, text: str, parent_hwnd: int | None = None, *, verify: bool = True,
+) -> bool:
+    """Write *text* to a QREdit control without stealing focus.
+
+    Primary path: ``WM_SETTEXT`` on the control followed by a synthetic
+    ``WM_COMMAND(EN_CHANGE)`` notification to its parent so that Quicken
+    updates its internal state.
+
+    Returns ``True`` if a readback confirms the value was accepted, or
+    *verify* is ``False``.  Returns ``False`` when the value was silently
+    dropped (indicating a keyboard-fallback may be needed).
+    """
+    import ctypes  # noqa: PLC0415
+    import time  # noqa: PLC0415
+
+    user32 = ctypes.windll.user32
+    WM_SETTEXT = 0x000C
+    WM_COMMAND = 0x0111
+    EN_CHANGE = 0x0300
+
+    buf = ctypes.create_unicode_buffer(text)
+    _send_msg_timeout(hwnd, WM_SETTEXT, 0, ctypes.addressof(buf), timeout_ms=2000)
+
+    if parent_hwnd:
+        ctrl_id = user32.GetDlgCtrlID(hwnd)
+        wp = (EN_CHANGE << 16) | (ctrl_id & 0xFFFF)
+        _send_msg_timeout(parent_hwnd, WM_COMMAND, wp, hwnd, timeout_ms=2000)
+        time.sleep(0.05)
+
+    if verify:
+        readback = _read_hwnd_text(hwnd)
+        return readback.strip() == text.strip()
+    return True
+
+
+def _enum_visible_children_by_class(parent_hwnd: int, class_lower: str) -> list[int]:
+    """Enumerate all visible direct and nested children with *class_lower*."""
+    import ctypes  # noqa: PLC0415
+    import ctypes.wintypes  # noqa: PLC0415
+
+    user32 = ctypes.windll.user32
+    results: list[int] = []
+    WNDENUMPROC = ctypes.WINFUNCTYPE(
+        ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
+    )
+
+    def _cb(h: int, _: int) -> bool:
+        cls_buf = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(h, cls_buf, 64)
+        if cls_buf.value.lower() == class_lower and user32.IsWindowVisible(h):
+            results.append(h)
+        return True
+
+    user32.EnumChildWindows(parent_hwnd, WNDENUMPROC(_cb), 0)
+    return results
+
+
+def _snapshot_immediate_children(parent_hwnd: int) -> set[int]:
+    """Snapshot all current *immediate* child HWNDs (depth-1 only)."""
+    import ctypes  # noqa: PLC0415
+    import ctypes.wintypes  # noqa: PLC0415
+
+    user32 = ctypes.windll.user32
+    found: set[int] = set()
+    h = user32.GetWindow(parent_hwnd, 5)  # GW_CHILD
+    while h:
+        found.add(h)
+        h = user32.GetWindow(h, 2)  # GW_HWNDNEXT
+    return found
+
+
+def _find_button_in_hwnd(parent_hwnd: int, *texts: str) -> int | None:
+    """Find a visible button child whose text matches one of *texts* (case-insensitive)."""
+    import ctypes  # noqa: PLC0415
+    import ctypes.wintypes  # noqa: PLC0415
+
+    user32 = ctypes.windll.user32
+    target_lower = {t.lower() for t in texts}
+    result: list[int] = []
+    WNDENUMPROC = ctypes.WINFUNCTYPE(
+        ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
+    )
+
+    def _cb(h: int, _: int) -> bool:
+        if not user32.IsWindowVisible(h):
+            return True
+        cls_buf = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(h, cls_buf, 64)
+        cls = cls_buf.value.lower()
+        if cls not in ("qc_button", "button"):
+            return True
+        # Strip accelerator (&) and normalize; check for any target as substring
+        raw = _read_hwnd_text(h).replace("&", "").strip().lower()
+        if raw in target_lower or any(t in raw for t in target_lower):
+            result.append(h)
+            return False  # stop after first match
+        return True
+
+    user32.EnumChildWindows(parent_hwnd, WNDENUMPROC(_cb), 0)
+    return result[0] if result else None
+
+
+def _click_hwnd_center(hwnd: int) -> None:
+    """Left-click the center of *hwnd* via mouse_event (uses screen coords)."""
+    import ctypes  # noqa: PLC0415
+    import ctypes.wintypes  # noqa: PLC0415
+    import time  # noqa: PLC0415
+
+    user32 = ctypes.windll.user32
+    r = ctypes.wintypes.RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(r))
+    x = (r.left + r.right) // 2
+    y = (r.top + r.bottom) // 2
+    user32.SetCursorPos(x, y)
+    time.sleep(0.05)
+    user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
+    user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
+    time.sleep(0.2)
+
+
+def _click_txlist_row(txlist_hwnd: int, item_index: int) -> bool:
+    """Click the centre of TxList item *item_index* to select it and enter edit mode.
+
+    ``item_index`` is the raw ListBox index (0-based); callers should add 1
+    to skip the blank new-transaction row that sits at item 0.
+    Returns ``False`` if the item rect is empty/invalid.
+    """
+    import ctypes  # noqa: PLC0415
+    import ctypes.wintypes  # noqa: PLC0415
+    import time  # noqa: PLC0415
+
+    user32 = ctypes.windll.user32
+    LB_GETITEMRECT = 0x0198
+
+    r = ctypes.wintypes.RECT()
+    res = _send_msg_timeout(
+        txlist_hwnd, LB_GETITEMRECT, item_index, ctypes.addressof(r), timeout_ms=1000
+    )
+    if res is None or res < 0:
+        return False
+
+    pt = ctypes.wintypes.POINT((r.left + r.right) // 2, (r.top + r.bottom) // 2)
+    user32.ClientToScreen(txlist_hwnd, ctypes.byref(pt))
+    user32.SetCursorPos(pt.x, pt.y)
+    time.sleep(0.05)
+    user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
+    user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
+    time.sleep(0.35)
+    return True
+
+
+def _wait_for_split_container(
+    root_hwnd: int,
+    qwmdi_hwnd: int,
+    children_before: set[int],
+    qredits_before: int,
+    *,
+    timeout_s: float = 6.0,
+) -> tuple[int, str]:
+    """Wait for Quicken's split editor to become visible after clicking Split.
+
+    Tries two strategies:
+    1. **New popup window** — a new immediate child of *root_hwnd* appears
+       with ≥ 3 visible QREdit descendants.
+    2. **Inline expansion** — the count of QREdit children inside *qwmdi_hwnd*
+       grows by at least 3 compared to *qredits_before*.
+
+    Returns ``(container_hwnd, kind)`` where *kind* is ``"popup"`` or
+    ``"inline"``, or ``(0, "timeout")`` on timeout.
+    """
+    import ctypes  # noqa: PLC0415
+    import ctypes.wintypes  # noqa: PLC0415
+    import time  # noqa: PLC0415
+
+    user32 = ctypes.windll.user32
+    t0 = time.monotonic()
+
+    while time.monotonic() - t0 < timeout_s:
+        time.sleep(0.15)
+
+        # Strategy 1: new popup child of root
+        curr = _snapshot_immediate_children(root_hwnd)
+        new = curr - children_before
+        for h in new:
+            if not user32.IsWindowVisible(h):
+                continue
+            qredits = _enum_visible_children_by_class(h, "qredit")
+            if len(qredits) >= 3:
+                return h, "popup"
+
+        # Strategy 2: inline — more QREdits appeared inside the QWMDI
+        curr_qredits = _enum_visible_children_by_class(qwmdi_hwnd, "qredit")
+        if len(curr_qredits) >= qredits_before + 3:
+            return qwmdi_hwnd, "inline"
+
+    return 0, "timeout"
+
+
+def _parse_split_qredits(
+    container_hwnd: int,
+    exclude_hwnds: set[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Enumerate QREdit controls in *container_hwnd* and group them into split rows.
+
+    Fields are grouped by y-band (controls within 20 px of each other =
+    same row) and sorted left-to-right within each row.  The first three
+    x-ordered fields are mapped to category, memo, and amount.
+
+    *exclude_hwnds* can be used to skip QREdits that were already present
+    before the split dialog opened (relevant for inline mode).
+
+    Returns a list of dicts: ``{"index", "hwnd_category", "hwnd_memo",
+    "hwnd_amount", "category", "memo", "amount"}``.
+    """
+    import ctypes  # noqa: PLC0415
+    import ctypes.wintypes  # noqa: PLC0415
+
+    user32 = ctypes.windll.user32
+    qredits = _enum_visible_children_by_class(container_hwnd, "qredit")
+
+    if exclude_hwnds:
+        qredits = [h for h in qredits if h not in exclude_hwnds]
+
+    if not qredits:
+        return []
+
+    # Get (hwnd, x, y) for each — screen coords
+    fields: list[tuple[int, int, int]] = []
+    for h in qredits:
+        r = ctypes.wintypes.RECT()
+        user32.GetWindowRect(h, ctypes.byref(r))
+        fields.append((h, r.left, r.top))
+
+    fields.sort(key=lambda f: (f[2], f[1]))  # y then x
+
+    # Group into y-bands (±20 px = same row)
+    rows: list[list[tuple[int, int, int]]] = []
+    for f in fields:
+        placed = False
+        for row in rows:
+            if abs(f[2] - row[0][2]) <= 20:
+                row.append(f)
+                placed = True
+                break
+        if not placed:
+            rows.append([f])
+
+    result: list[dict[str, Any]] = []
+    for i, row in enumerate(rows):
+        row.sort(key=lambda f: f[1])  # x order within row
+        hwnds = [h for h, _, _ in row]
+        values = [_read_hwnd_text(h) for h in hwnds]
+
+        entry: dict[str, Any] = {
+            "index": i,
+            "hwnd_category": hwnds[0] if len(hwnds) > 0 else 0,
+            "hwnd_memo":     hwnds[1] if len(hwnds) > 1 else 0,
+            "hwnd_amount":   hwnds[2] if len(hwnds) > 2 else 0,
+            "category": values[0] if len(values) > 0 else "",
+            "memo":     values[1] if len(values) > 1 else "",
+            "amount":   values[2] if len(values) > 2 else "",
+        }
+        result.append(entry)
+    return result
+
+
+# Module-level state for the currently-open split dialog
+_split_state: dict[str, Any] = {}
+# {"container": int, "kind": str, "rows": list[dict], "root": int, "qwmdi": int}
+
+
+def select_register_row(
+    bridge: Any,
+    row_index: int = 0,
+) -> dict[str, Any]:
+    """Select a specific transaction row in the visible register.
+
+    Uses ``LB_GETITEMRECT`` + a direct mouse click on the row's screen
+    rectangle — no keyboard input, no focus hijacking.
+
+    The blank new-transaction row is always at ListBox item 0; *row_index*
+    0 maps to the **first real transaction** (ListBox item 1).
+
+    Parameters
+    ----------
+    row_index : int
+        0-based index into the visible transaction list, where 0 is the
+        first (most recent) real transaction.
+
+    Returns
+    -------
+    dict
+        ``{"ok": True, "row_index": int, "lb_index": int}``
+    """
+    import ctypes  # noqa: PLC0415
+    import time  # noqa: PLC0415
+
+    from server.process_manager import get_process_manager  # noqa: PLC0415
+
+    pm = get_process_manager()
+    if not pm.attached:
+        raise TargetNotFoundError("Use select_window to attach first.")
+
+    root_hwnd = pm.attached.hwnd
+    _dismiss_modal_dialogs(root_hwnd)
+
+    txlist_h = _find_txlist_hwnd(root_hwnd)
+    if txlist_h is None:
+        return {
+            "ok": False,
+            "error": "No transaction register visible.",
+            "code": "REGISTER_NOT_FOUND",
+        }
+
+    # Real transactions start at LB item 1 (item 0 = blank new-entry row)
+    lb_index = row_index + 1
+    if not _click_txlist_row(txlist_h, lb_index):
+        return {
+            "ok": False,
+            "error": f"Row index {row_index} out of range (lb_index={lb_index}).",
+            "code": "ROW_NOT_FOUND",
+        }
+
+    time.sleep(0.3)
+    return {"ok": True, "row_index": row_index, "lb_index": lb_index}
+
+
+def read_transaction_splits(
+    bridge: Any,
+    row_index: int | None = None,
+) -> dict[str, Any]:
+    """Open the split editor for a transaction and read its split lines.
+
+    If *row_index* is given the row is selected first (0 = first real
+    transaction).  Otherwise the currently-selected row is used.
+
+    The split editor is left **open** after this call so that
+    :func:`edit_split_line` can write to it.  Call
+    :func:`close_split_dialog` to save or cancel.
+
+    Parameters
+    ----------
+    row_index : int | None
+        0-based row index.  ``None`` uses the row that is already selected.
+
+    Returns
+    -------
+    dict
+        ``{"ok": True, "splits": [...], "count": int, "kind": str}``
+        where each split is ``{"index", "category", "memo", "amount"}``.
+        *kind* is ``"popup"`` or ``"inline"`` (the split editor style
+        Quicken used).
+    """
+    import ctypes  # noqa: PLC0415
+    import time  # noqa: PLC0415
+
+    from server.process_manager import get_process_manager  # noqa: PLC0415
+
+    pm = get_process_manager()
+    if not pm.attached:
+        raise TargetNotFoundError("Use select_window to attach first.")
+
+    root_hwnd = pm.attached.hwnd
+    _dismiss_modal_dialogs(root_hwnd)
+
+    if row_index is not None:
+        sel = select_register_row(bridge, row_index)
+        if not sel.get("ok"):
+            return sel
+        time.sleep(0.3)
+
+    mdi_h = _find_active_mdi(root_hwnd)
+    if mdi_h is None:
+        return {
+            "ok": False, "error": "No active register found.",
+            "code": "REGISTER_NOT_FOUND",
+        }
+
+    # Snapshot state *before* clicking Split so we can detect what changed
+    children_before = _snapshot_immediate_children(root_hwnd)
+    qredits_before_hwnds = set(_enum_visible_children_by_class(mdi_h, "qredit"))
+    qredits_before_count = len(qredits_before_hwnds)
+
+    # Find and click the Split button (direct BM_CLICK — no focus change)
+    split_btn = _find_button_in_hwnd(root_hwnd, "split", "splits")
+    if split_btn is None:
+        # Button not visible yet — click the row to enter edit mode first
+        txlist_h = _find_txlist_hwnd(root_hwnd)
+        if txlist_h:
+            _click_hwnd_center(txlist_h)
+            time.sleep(0.4)
+        split_btn = _find_button_in_hwnd(root_hwnd, "split", "splits")
+
+    if split_btn is None:
+        return {
+            "ok": False,
+            "error": "Split button not found. Navigate to an account register "
+                     "and select a transaction first.",
+            "code": "SPLIT_BUTTON_NOT_FOUND",
+        }
+
+    # Click Split — try direct mouse click first (BM_CLICK may not work on Quicken's QC_button)
+    _click_hwnd_center(split_btn)
+    time.sleep(0.8)
+
+    # Wait for the split editor to appear
+    container, kind = _wait_for_split_container(
+        root_hwnd, mdi_h, children_before, qredits_before_count, timeout_s=6.0
+    )
+    if container == 0:
+        return {
+            "ok": False,
+            "error": "Split editor did not open within 6 s after clicking Split.",
+            "code": "SPLIT_DIALOG_TIMEOUT",
+        }
+
+    # Read split rows
+    splits = _parse_split_qredits(
+        container,
+        exclude_hwnds=qredits_before_hwnds if kind == "inline" else None,
+    )
+
+    # Store state for edit_split_line / close_split_dialog
+    global _split_state  # noqa: PLW0603
+    _split_state = {
+        "container": container,
+        "kind": kind,
+        "rows": splits,
+        "root": root_hwnd,
+        "qwmdi": mdi_h,
+        "exclude": qredits_before_hwnds,
+    }
+
+    # Return splits without internal hwnd details
+    public_splits = [
+        {"index": s["index"], "category": s["category"],
+         "memo": s["memo"], "amount": s["amount"]}
+        for s in splits
+    ]
+    return {
+        "ok": True,
+        "splits": public_splits,
+        "count": len(public_splits),
+        "kind": kind,
+    }
+
+
+def edit_split_line(
+    bridge: Any,
+    index: int,
+    category: str | None = None,
+    memo: str | None = None,
+    amount: str | None = None,
+) -> dict[str, Any]:
+    """Edit one split line in the currently-open split editor.
+
+    Uses ``WM_SETTEXT`` + ``WM_COMMAND(EN_CHANGE)`` injection — no focus
+    change, no keyboard input.  A readback verifies each write.
+
+    :func:`read_transaction_splits` must be called first to open the
+    split editor and populate internal state.
+
+    Parameters
+    ----------
+    index : int
+        0-based split row index (from the ``splits`` list returned by
+        :func:`read_transaction_splits`).
+    category, memo, amount : str or None
+        Fields to update.  ``None`` leaves the field unchanged.
+
+    Returns
+    -------
+    dict
+        ``{"ok": True, "index": int, "written": {...}, "verified": {...}}``
+    """
+    import time  # noqa: PLC0415
+
+    if not _split_state:
+        return {
+            "ok": False,
+            "error": "No split editor is open. Call read_transaction_splits first.",
+            "code": "SPLIT_NOT_OPEN",
+        }
+
+    container = _split_state["container"]
+    rows = _split_state["rows"]
+
+    # Re-read rows to get fresh HWNDs (in case the dialog re-rendered)
+    fresh = _parse_split_qredits(
+        container,
+        exclude_hwnds=_split_state.get("exclude") if _split_state.get("kind") == "inline" else None,
+    )
+    if fresh:
+        _split_state["rows"] = fresh
+        rows = fresh
+
+    if index < 0 or index >= len(rows):
+        return {
+            "ok": False,
+            "error": f"Split index {index} out of range (have {len(rows)} rows).",
+            "code": "INDEX_OUT_OF_RANGE",
+        }
+
+    row = rows[index]
+    written: dict[str, str] = {}
+    verified: dict[str, bool] = {}
+
+    def _do_write(hwnd: int, field: str, value: str) -> None:
+        if not hwnd:
+            return
+        ok = _write_qredit_background(hwnd, value, parent_hwnd=container, verify=True)
+        written[field] = value
+        verified[field] = ok
+        time.sleep(0.05)
+
+    if category is not None:
+        _do_write(row["hwnd_category"], "category", category)
+    if memo is not None:
+        _do_write(row["hwnd_memo"], "memo", memo)
+    if amount is not None:
+        _do_write(row["hwnd_amount"], "amount", amount)
+
+    # Refresh stored rows with latest read-back values
+    updated_row = _parse_split_qredits(
+        container,
+        exclude_hwnds=_split_state.get("exclude") if _split_state.get("kind") == "inline" else None,
+    )
+    if updated_row and index < len(updated_row):
+        _split_state["rows"] = updated_row
+
+    return {"ok": True, "index": index, "written": written, "verified": verified}
+
+
+def close_split_dialog(
+    bridge: Any,
+    save: bool = True,
+) -> dict[str, Any]:
+    """Close the currently-open split editor.
+
+    Parameters
+    ----------
+    save : bool
+        ``True`` (default) clicks OK / Enter to commit changes.
+        ``False`` clicks Cancel to discard.
+
+    Returns
+    -------
+    dict
+        ``{"ok": True, "saved": bool}``
+    """
+    import time  # noqa: PLC0415
+
+    global _split_state  # noqa: PLW0603
+
+    if not _split_state:
+        return {
+            "ok": False,
+            "error": "No split editor is open.",
+            "code": "SPLIT_NOT_OPEN",
+        }
+
+    container = _split_state["container"]
+
+    if save:
+        btn = _find_button_in_hwnd(container, "ok", "done", "save", "enter")
+        if btn is None:
+            # Fallback: look in root for inline editors
+            root = _split_state.get("root", 0)
+            if root:
+                btn = _find_button_in_hwnd(root, "ok", "done", "save", "enter")
+    else:
+        btn = _find_button_in_hwnd(container, "cancel")
+        if btn is None:
+            root = _split_state.get("root", 0)
+            if root:
+                btn = _find_button_in_hwnd(root, "cancel")
+
+    if btn:
+        BM_CLICK = 0x00F5
+        _send_msg_timeout(btn, BM_CLICK, 0, 0, timeout_ms=2000)
+        time.sleep(0.4)
+    else:
+        # Last resort: Escape to cancel, Enter to save (keyboard-only fallback)
+        import ctypes  # noqa: PLC0415
+        root = _split_state.get("root", 0)
+        qwmdi = _split_state.get("qwmdi", 0)
+        target = qwmdi or root
+        if target:
+            vk = 0x0D if save else 0x1B  # VK_RETURN or VK_ESCAPE
+            _post_msg(target, 0x0100, vk, 0)
+            _post_msg(target, 0x0101, vk, 0)
+            time.sleep(0.4)
+
+    _split_state.clear()
+    return {"ok": True, "saved": save}
+
+
 # ── Server-side screen text extraction (Windows OCR) ──────────────
 
 
