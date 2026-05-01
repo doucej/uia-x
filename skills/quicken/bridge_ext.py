@@ -4986,9 +4986,11 @@ def _wait_for_split_container(
 
     user32 = ctypes.windll.user32
     t0 = time.monotonic()
+    poll_count = 0
 
     while time.monotonic() - t0 < timeout_s:
         time.sleep(0.15)
+        poll_count += 1
 
         # Strategy 1: new popup child of root
         curr = _snapshot_immediate_children(root_hwnd)
@@ -5004,8 +5006,39 @@ def _wait_for_split_container(
         curr_qredits = _enum_visible_children_by_class(qwmdi_hwnd, "qredit")
         if len(curr_qredits) >= qredits_before + 3:
             return qwmdi_hwnd, "inline"
+        
+        # Debug output every 10 polls or on last poll
+        if poll_count % 10 == 0 or time.monotonic() - t0 > timeout_s - 0.2:
+            print(f"[SPLIT_WAIT] poll {poll_count}: new_children={len(new)}, "
+                  f"qredits={len(curr_qredits)} (need >={qredits_before + 3})")
 
     return 0, "timeout"
+
+
+def _debug_split_state(root_hwnd: int, mdi_h: int) -> None:
+    """Debug helper: print current split dialog state."""
+    import ctypes  # noqa: PLC0415
+    
+    # Count new children
+    children_now = _snapshot_immediate_children(root_hwnd)
+    qredits_now = _enum_visible_children_by_class(mdi_h, "qredit")
+    
+    print(f"[SPLIT_DEBUG] root children: {len(children_now)}")
+    print(f"[SPLIT_DEBUG] mdi qredits: {len(qredits_now)}")
+    
+    # Look for dialog-like windows
+    def find_windows(hwnd, param):
+        if ctypes.windll.user32.IsWindowVisible(hwnd):
+            cls = ctypes.create_unicode_buffer(64)
+            ctypes.windll.user32.GetClassNameW(hwnd, cls, 64)
+            if any(k in cls.value.lower() for k in ['dialog', 'split', 'edit']):
+                buf = ctypes.create_unicode_buffer(256)
+                ctypes.windll.user32.GetWindowTextW(hwnd, buf, 256)
+                print(f"[SPLIT_DEBUG] found {cls.value}: {buf.value!r}")
+        return True
+    
+    cb = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)(find_windows)
+    ctypes.windll.user32.EnumChildWindows(root_hwnd, cb, 0)
 
 
 def _parse_split_qredits(
