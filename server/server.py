@@ -157,6 +157,94 @@ def _get_bridge():
 
 
 # ---------------------------------------------------------------------------
+# UIPI compatibility check (Windows only)
+# ---------------------------------------------------------------------------
+
+
+def _get_integrity_level(pid: int) -> int | None:
+    """Return the mandatory integrity level RID for the given process.
+
+    Returns the integer RID (e.g. 0x2000 = Medium, 0x3000 = High, 0x4000 = System)
+    or None if the check fails (non-Windows or access denied).
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes  # noqa: PLC0415
+        import ctypes.wintypes as wt  # noqa: PLC0415
+        import struct  # noqa: PLC0415
+
+        kernel32 = ctypes.windll.kernel32
+        advapi32 = ctypes.windll.advapi32
+
+        h_proc = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED
+        if not h_proc:
+            return None
+        tok = wt.HANDLE()
+        if not advapi32.OpenProcessToken(h_proc, 0x20008, ctypes.byref(tok)):
+            kernel32.CloseHandle(h_proc)
+            return None
+        buf = ctypes.create_string_buffer(64)
+        size = wt.DWORD()
+        advapi32.GetTokenInformation(tok, 25, buf, len(buf), ctypes.byref(size))
+        # TOKEN_MANDATORY_LABEL: first 8 bytes = SID pointer (64-bit)
+        sid_ptr = struct.unpack_from("<Q", buf.raw, 0)[0]
+        if not sid_ptr:
+            kernel32.CloseHandle(tok)
+            kernel32.CloseHandle(h_proc)
+            return None
+        sub_auth_count = struct.unpack_from(
+            "<B", (ctypes.c_char * 1).from_address(sid_ptr + 1).raw, 0
+        )[0]
+        sub_auth_offset = 8 + (sub_auth_count - 1) * 4
+        sa = struct.unpack_from(
+            "<I", (ctypes.c_char * 4).from_address(sid_ptr + sub_auth_offset).raw, 0
+        )[0]
+        kernel32.CloseHandle(tok)
+        kernel32.CloseHandle(h_proc)
+        return sa
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _check_uipi(target_pid: int) -> dict[str, Any] | None:
+    """Return a UIPI warning dict if the target runs at higher integrity, else None.
+
+    UIPI (User Interface Privilege Isolation) blocks ALL PostMessage/SendMessage
+    calls from a lower-integrity process to a higher-integrity window — including
+    WM_COMMAND, BM_CLICK, CB_SETCURSEL — making input automation impossible.
+    Mouse/keyboard injection (SendInput, mouse_event) is also blocked.
+    """
+    import os  # noqa: PLC0415
+    if sys.platform != "win32":
+        return None
+    our_pid = os.getpid()
+    our_il = _get_integrity_level(our_pid)
+    target_il = _get_integrity_level(target_pid)
+    if our_il is None or target_il is None:
+        return None
+    if target_il > our_il:
+        # Map RID to human-readable label
+        labels = {0x1000: "Low", 0x2000: "Medium", 0x3000: "High", 0x4000: "System"}
+        our_label = labels.get(our_il, hex(our_il))
+        target_label = labels.get(target_il, hex(target_il))
+        return {
+            "uipi_blocked": True,
+            "our_integrity": our_label,
+            "target_integrity": target_label,
+            "message": (
+                f"Target process runs at {target_label} integrity; "
+                f"this server runs at {our_label} integrity. "
+                "UIPI will block all window messages and input injection. "
+                "Fix: (A) restart the target app without 'Run as administrator', "
+                "or (B) restart the MCP server elevated "
+                "(open an admin terminal and run: python -m uiax.server)."
+            ),
+        }
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Authentication helper
 # ---------------------------------------------------------------------------
 
@@ -304,6 +392,9 @@ def select_window(
             hwnd=hwnd,
         )
         result: dict[str, Any] = {"ok": True, "window": _window_to_dict(win)}
+        uipi = _check_uipi(win.pid)
+        if uipi:
+            result["warning"] = uipi
         return result
     except UIAError as exc:
         return {"ok": False, "error": str(exc), "code": exc.code}

@@ -23,6 +23,71 @@ def _is_valid_hwnd(hwnd: int) -> bool:
     import ctypes  # noqa: PLC0415
     return bool(ctypes.windll.user32.IsWindow(hwnd))
 
+
+def _get_process_integrity(pid: int) -> int | None:
+    """Return the mandatory integrity level RID for a process (Windows only).
+
+    Typical values: 0x2000=Medium, 0x3000=High (admin), 0x4000=System.
+    Returns None on failure.
+    """
+    import struct  # noqa: PLC0415
+    import ctypes  # noqa: PLC0415
+    import ctypes.wintypes as wt  # noqa: PLC0415
+
+    try:
+        kernel32 = ctypes.windll.kernel32
+        advapi32 = ctypes.windll.advapi32
+        h_proc = kernel32.OpenProcess(0x1000, False, pid)
+        if not h_proc:
+            return None
+        tok = wt.HANDLE()
+        if not advapi32.OpenProcessToken(h_proc, 0x20008, ctypes.byref(tok)):
+            kernel32.CloseHandle(h_proc)
+            return None
+        buf = ctypes.create_string_buffer(64)
+        size = wt.DWORD()
+        advapi32.GetTokenInformation(tok, 25, buf, len(buf), ctypes.byref(size))
+        sid_ptr = struct.unpack_from("<Q", buf.raw, 0)[0]
+        if not sid_ptr:
+            kernel32.CloseHandle(tok)
+            kernel32.CloseHandle(h_proc)
+            return None
+        sub_auth_count = struct.unpack_from(
+            "<B", (ctypes.c_char * 1).from_address(sid_ptr + 1).raw, 0
+        )[0]
+        sub_auth_offset = 8 + (sub_auth_count - 1) * 4
+        sa = struct.unpack_from(
+            "<I", (ctypes.c_char * 4).from_address(sid_ptr + sub_auth_offset).raw, 0
+        )[0]
+        kernel32.CloseHandle(tok)
+        kernel32.CloseHandle(h_proc)
+        return sa
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _uipi_is_blocked(target_hwnd: int) -> bool:
+    """Return True if UIPI will block message delivery to *target_hwnd*.
+
+    UIPI (User Interface Privilege Isolation) blocks all PostMessage/SendMessage
+    calls from lower-integrity to higher-integrity processes — including input
+    injection and window control messages needed for automation.
+    """
+    import os  # noqa: PLC0415
+    import ctypes  # noqa: PLC0415
+    import ctypes.wintypes as wt  # noqa: PLC0415
+
+    try:
+        pid = wt.DWORD()
+        ctypes.windll.user32.GetWindowThreadProcessId(target_hwnd, ctypes.byref(pid))
+        target_il = _get_process_integrity(pid.value)
+        our_il = _get_process_integrity(os.getpid())
+        if target_il is not None and our_il is not None:
+            return target_il > our_il
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
 def _acct_match(candidate: str, query: str) -> bool:
     """Fuzzy account name matching: exact, substring, or all-words-present.
 
@@ -2344,6 +2409,25 @@ def list_sidebar_accounts(bridge: Any, resume: bool = False,
             "total": len(accts),
             "done": True,
             "cached": True,
+        }
+
+    # Check for UIPI: if the target runs elevated and we do not, all window
+    # messages (PostMessage, SendMessage, mouse/keyboard injection) are blocked.
+    # The scan will silently fail and return 0 accounts.
+    if _uipi_is_blocked(root):
+        return {
+            "ok": False,
+            "error": (
+                "UIPI_BLOCKED: Quicken is running elevated (High integrity) but "
+                "the MCP server is not (Medium integrity).  UIPI blocks all window "
+                "messages and input injection — the sidebar scan cannot function.  "
+                "Fix: (A) restart Quicken without 'Run as administrator' — its "
+                "manifest allows asInvoker so it works fine non-elevated, "
+                "or (B) restart the MCP server elevated by running: "
+                "powershell -File start_server_admin.ps1 (in the uiax directory)."
+            ),
+            "code": "UIPI_BLOCKED",
+            "accounts": [],
         }
 
     results = _sweep_scan_sidebar(root, max_seconds=max_seconds)

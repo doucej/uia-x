@@ -159,7 +159,10 @@ class RealProcessManager(ProcessManager):
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
             pid_val = pid.value
 
-            # Get process name
+            # Get process name — try PROCESS_QUERY_INFORMATION first, then
+            # fall back to PROCESS_QUERY_LIMITED_INFORMATION + QueryFullProcessImageNameW.
+            # Some processes deny VM_READ or QUERY_INFORMATION (e.g. Quicken on
+            # certain Windows builds), leaving proc_name empty with the primary path.
             proc_name = ""
             handle = kernel32.OpenProcess(0x0410, False, pid_val)  # PROCESS_QUERY_INFORMATION | PROCESS_VM_READ
             if handle:
@@ -167,6 +170,22 @@ class RealProcessManager(ProcessManager):
                 psapi.GetModuleBaseNameW(handle, None, name_buf, 260)
                 proc_name = name_buf.value
                 kernel32.CloseHandle(handle)
+            if not proc_name:
+                # Fallback: QueryFullProcessImageNameW only needs PROCESS_QUERY_LIMITED_INFORMATION
+                handle2 = kernel32.OpenProcess(0x1000, False, pid_val)
+                if handle2:
+                    try:
+                        path_buf = ctypes.create_unicode_buffer(1024)
+                        path_len = ctypes.wintypes.DWORD(1024)
+                        if kernel32.QueryFullProcessImageNameW(handle2, 0, path_buf, ctypes.byref(path_len)):
+                            full_path = path_buf.value
+                            if full_path:
+                                import os as _os  # noqa: PLC0415
+                                proc_name = _os.path.basename(full_path)
+                    except Exception:
+                        pass
+                    finally:
+                        kernel32.CloseHandle(handle2)
 
             rect_struct = ctypes.wintypes.RECT()
             user32.GetWindowRect(hwnd, ctypes.byref(rect_struct))
