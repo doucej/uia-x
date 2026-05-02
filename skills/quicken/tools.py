@@ -23,9 +23,9 @@ def register(
     """Register all Quicken-specific MCP tools with *mcp*."""
     if sys.platform == "win32":
         from skills.quicken import windows_impl as _impl  # noqa: PLC0415
+    elif sys.platform == "darwin":
+        from skills.quicken import macos_impl as _impl  # noqa: PLC0415
     else:
-        # macOS / Linux: tools not yet implemented; skill loader skips this
-        # platform at the QuickenSkill level, so we should never reach here.
         raise NotImplementedError(f"Quicken skill not supported on {sys.platform}")
 
     @mcp.tool(

@@ -80,9 +80,9 @@ class QuickenSkill:
         get_bridge: Callable[[], Any],
         check_auth: Callable[[str], dict[str, Any] | None],
     ) -> None:
-        if sys.platform != "win32":
+        if sys.platform not in ("win32", "darwin"):
             warnings.warn(
-                f"Quicken skill skipped: Windows-only implementation not supported on {sys.platform}",
+                f"Quicken skill skipped: not supported on {sys.platform}",
                 stacklevel=2,
             )
             return
