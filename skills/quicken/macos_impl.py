@@ -29,6 +29,8 @@ Investment register (e.g. Fidelity PAS):
 from __future__ import annotations
 
 import ctypes
+import json
+import os
 import re
 import subprocess
 import time
@@ -42,15 +44,29 @@ from server.uia_bridge import UIAError, TargetNotFoundError
 
 _AX: ctypes.CDLL | None = None
 _CF: ctypes.CDLL | None = None
+_CG: ctypes.CDLL | None = None
 
 kCFStringEncodingUTF8: int = 0x08000100
 kAXErrorSuccess: int = 0
+kCFNumberDoubleType: int = 13
+kAXValueCGRectType: int = 3
+kCGKeyCode_Tab: int = 48
+kCGKeyCode_Return: int = 36
+kCGKeyCode_Escape: int = 53
+kCGEventFlagMaskCommand: int = 0x100000
 c_void_p = ctypes.c_void_p
+
+
+class _CGPoint(ctypes.Structure):
+    """CGPoint struct for CGEventCreateMouseEvent."""
+    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+_OCR_SCRIPT = os.path.join(os.path.dirname(__file__), "ocr_region.swift")
 
 
 def _load_frameworks() -> None:
     """Load macOS frameworks needed for AX access (idempotent)."""
-    global _AX, _CF
+    global _AX, _CF, _CG
     if _AX is not None:
         return
 
@@ -59,6 +75,9 @@ def _load_frameworks() -> None:
     )
     _AX = ctypes.cdll.LoadLibrary(
         "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+    )
+    _CG = ctypes.cdll.LoadLibrary(
+        "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
     )
 
     # CoreFoundation types
@@ -77,10 +96,14 @@ def _load_frameworks() -> None:
     _CF.CFArrayGetValueAtIndex.restype = c_void_p
     _CF.CFArrayCreate.argtypes = [c_void_p, ctypes.POINTER(c_void_p), ctypes.c_long, c_void_p]
     _CF.CFArrayCreate.restype = c_void_p
+    _CF.CFNumberCreate.restype = c_void_p
+    _CF.CFNumberCreate.argtypes = [c_void_p, ctypes.c_int, c_void_p]
 
     # AXUIElement
     _AX.AXUIElementCreateApplication.argtypes = [ctypes.c_int32]
     _AX.AXUIElementCreateApplication.restype = c_void_p
+    _AX.AXUIElementCreateSystemWide.restype = c_void_p
+    _AX.AXUIElementCreateSystemWide.argtypes = []
     _AX.AXUIElementCopyAttributeValue.argtypes = [c_void_p, c_void_p, ctypes.POINTER(c_void_p)]
     _AX.AXUIElementCopyAttributeValue.restype = ctypes.c_int
     _AX.AXUIElementSetAttributeValue.argtypes = [c_void_p, c_void_p, c_void_p]
@@ -88,6 +111,22 @@ def _load_frameworks() -> None:
     _AX.AXUIElementPerformAction.argtypes = [c_void_p, c_void_p]
     _AX.AXUIElementPerformAction.restype = ctypes.c_int
     _AX.AXIsProcessTrusted.restype = ctypes.c_bool
+    _AX.AXValueGetValue.restype = ctypes.c_bool
+    _AX.AXValueGetValue.argtypes = [c_void_p, ctypes.c_int, c_void_p]
+
+    # CoreGraphics CGEvent
+    _CG.CGEventCreateKeyboardEvent.restype = c_void_p
+    _CG.CGEventCreateKeyboardEvent.argtypes = [c_void_p, ctypes.c_uint16, ctypes.c_bool]
+    _CG.CGEventPost.restype = None
+    _CG.CGEventPost.argtypes = [ctypes.c_uint32, c_void_p]
+    _CG.CGEventSetFlags.restype = None
+    _CG.CGEventSetFlags.argtypes = [c_void_p, ctypes.c_uint64]
+    _CG.CGEventKeyboardSetUnicodeString.restype = None
+    _CG.CGEventKeyboardSetUnicodeString.argtypes = [
+        c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_uint16)
+    ]
+    _CG.CGEventCreateMouseEvent.restype = c_void_p
+    _CG.CGEventCreateMouseEvent.argtypes = [c_void_p, ctypes.c_uint32, _CGPoint, ctypes.c_uint32]
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +201,157 @@ def _ax_set_value(el: c_void_p, text: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# New low-level helpers: frame, numeric attributes, key events, OCR
+# ---------------------------------------------------------------------------
+
+def _ax_get_frame(el: c_void_p) -> tuple[float, float, float, float] | None:
+    """Return AXFrame as (x, y, w, h), or None if not available."""
+    val = _ax_attr(el, "AXFrame")
+    if val is None:
+        return None
+    r = (ctypes.c_double * 4)()
+    ok = _AX.AXValueGetValue(val, kAXValueCGRectType, r)
+    _CF.CFRelease(val)
+    return (r[0], r[1], r[2], r[3]) if ok else None
+
+
+def _ax_set_num(el: c_void_p, attr: str, val_f: float) -> int:
+    """Set a numeric AX attribute using CFNumber (double). Returns error code."""
+    v = ctypes.c_double(val_f)
+    cfnum = _CF.CFNumberCreate(None, kCFNumberDoubleType, ctypes.byref(v))
+    k = _cfstr(attr)
+    err = _AX.AXUIElementSetAttributeValue(el, k, cfnum)
+    _CF.CFRelease(k)
+    _CF.CFRelease(cfnum)
+    return err
+
+
+def _ax_press_action(el: c_void_p) -> int:
+    """Perform AXPress action on an element. Returns error code."""
+    k = _cfstr("AXPress")
+    err = _AX.AXUIElementPerformAction(el, k)
+    _CF.CFRelease(k)
+    return err
+
+
+def _mouse_click(x: float, y: float) -> None:
+    """Send a synthetic left-click at screen position (x, y) via CGEvent."""
+    _load_frameworks()
+    pt = _CGPoint(x, y)
+    kDown = ctypes.c_uint32(1)  # kCGEventLeftMouseDown
+    kUp = ctypes.c_uint32(2)    # kCGEventLeftMouseUp
+    kLeft = ctypes.c_uint32(0)  # kCGMouseButtonLeft
+    for event_type in (kDown, kUp):
+        ev = _CG.CGEventCreateMouseEvent(None, event_type, pt, kLeft)
+        _CG.CGEventPost(ctypes.c_uint32(0), ev)
+        _CF.CFRelease(ev)
+        time.sleep(0.05)
+
+
+def _activate_quicken() -> None:
+    """Bring Quicken to the foreground. Required before menu/button interactions."""
+    try:
+        subprocess.run(
+            ["osascript", "-e", 'tell application "Quicken" to activate'],
+            timeout=3,
+            capture_output=True,
+        )
+    except subprocess.TimeoutExpired:
+        pass  # Quicken may be unresponsive; continue anyway
+    time.sleep(0.2)
+
+
+def _send_key(keycode: int, modifiers: int = 0) -> None:
+    """Send a synthetic key event (down + up) via CoreGraphics."""
+    _load_frameworks()
+    for down in (True, False):
+        ev = _CG.CGEventCreateKeyboardEvent(None, keycode, down)
+        if modifiers:
+            _CG.CGEventSetFlags(ev, modifiers)
+        _CG.CGEventPost(0, ev)
+        _CF.CFRelease(ev)
+        if down:
+            time.sleep(0.02)
+
+
+def _type_text(text: str) -> None:
+    """Type Unicode text via CGEvent keyboard string injection."""
+    _load_frameworks()
+    for ch in text:
+        encoded = ch.encode("utf-16-le")
+        buf = (ctypes.c_uint16 * 1)(int.from_bytes(encoded, "little"))
+        for down in (True, False):
+            ev = _CG.CGEventCreateKeyboardEvent(None, 0, down)
+            _CG.CGEventKeyboardSetUnicodeString(ev, 1, buf)
+            _CG.CGEventPost(0, ev)
+            _CF.CFRelease(ev)
+            if down:
+                time.sleep(0.01)
+
+
+def _scroll_table_to_row(scroll_bar: c_void_p, total_rows: int, idx: int) -> None:
+    """Scroll the register table so that row idx becomes visible."""
+    if total_rows > 0:
+        _ax_set_num(scroll_bar, "AXValue", idx / total_rows)
+        time.sleep(0.35)
+
+
+def _ocr_region(x: int, y: int, w: int, h: int) -> list[str]:
+    """
+    OCR a screen region using Vision framework via the ocr_region.swift script.
+    Returns a list of recognized text strings (one per text observation, top-to-bottom).
+    Returns empty list on any error.
+    """
+    if not os.path.exists(_OCR_SCRIPT):
+        return []
+    try:
+        result = subprocess.run(
+            ["swift", _OCR_SCRIPT, str(x), str(y), str(w), str(h)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            return []
+        data = json.loads(result.stdout.strip())
+        return data.get("lines", [])
+    except Exception:
+        return []
+
+
+def _parse_split_lines(ocr_lines: list[str]) -> list[dict[str, Any]]:
+    """
+    Parse raw OCR text lines from an expanded split row into structured dicts.
+    Each split line typically contains: Category  [Tag]  Memo  Amount
+    The amount is usually the last token matching a currency pattern.
+    """
+    splits = []
+    for line in ocr_lines:
+        line = line.strip()
+        if not line:
+            continue
+        # Try to extract amount from end of line
+        parts = line.rsplit(None, 1)
+        amount = ""
+        rest = line
+        if len(parts) == 2:
+            candidate = parts[1].lstrip("-").replace(",", "").replace("$", "")
+            if re.match(r"^\d+(\.\d{2})?$", candidate):
+                amount = parts[1]
+                rest = parts[0].strip()
+        splits.append(
+            {
+                "index": len(splits),
+                "category": rest,
+                "tag": "",
+                "memo": "",
+                "amount": amount,
+            }
+        )
+    return splits
+
+
+# ---------------------------------------------------------------------------
 # Quicken process / window navigation
 # ---------------------------------------------------------------------------
 
@@ -199,12 +389,11 @@ def _get_outer_children(root: c_void_p) -> list[c_void_p]:
       [0] = sidebar SplitGroup
       [1..n] = main content elements (layout varies by account type)
 
-    Uses AXWindows (not AXChildren) to get the actual window element.
+    Uses AXMainWindow to avoid picking up tooltip (AXHelpTag) or dialog windows.
     """
-    wins = _ax_children(root, "AXWindows")
-    if not wins:
-        raise UIAError("Quicken has no windows", code="NO_WINDOW")
-    window = wins[0]
+    window = _ax_attr(root, "AXMainWindow")
+    if window is None:
+        raise UIAError("Quicken main window not found", code="NO_WINDOW")
     win_children = _ax_children(window)
     if not win_children:
         raise UIAError("Window has no children", code="EMPTY_WINDOW")
@@ -641,7 +830,7 @@ def set_register_filter(bridge: Any, text: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Not yet implemented on macOS
+# Reconcile and split management
 # ---------------------------------------------------------------------------
 
 def open_reconcile(
@@ -655,33 +844,312 @@ def open_reconcile(
     interest_date: str = "",
     timeout_ms: int = 5000,
 ) -> dict[str, Any]:
-    """Open reconcile dialog. (macOS: not yet implemented.)"""
-    return {
-        "ok": False,
-        "error": "Reconcile workflow not yet implemented for macOS",
-        "code": "NOT_IMPLEMENTED",
-    }
+    """
+    Open the reconcile dialog for account_name and advance to the transaction list.
+
+    Navigates to account_name, opens Accounts > Reconcile Account…, fills the
+    ending balance in Step 1, and presses Next.  If an in-progress reconciliation
+    is detected (Step 2 already showing), it returns immediately with step=2 and
+    resumed=True.
+
+    macOS note: statement_date, service_charge, service_date, interest_earned, and
+    interest_date are not supported in the Quicken for Mac reconcile UI — they are
+    accepted for API compatibility but silently ignored.
+    """
+    try:
+        nav = navigate_to_account(bridge, account_name)
+        if not nav.get("ok"):
+            return nav
+
+        _activate_quicken()
+        root = _get_root()
+
+        # Open Accounts menu (index 6) → Reconcile Account…
+        mb = _ax_attr(root, "AXMenuBar")
+        if mb is None:
+            return {"ok": False, "error": "Menu bar not found", "code": "NO_MENUBAR"}
+        mb_kids = _ax_children(mb)
+        if len(mb_kids) < 7:
+            return {"ok": False, "error": "Accounts menu not found", "code": "NO_MENU"}
+        accts_menu = mb_kids[6]
+        _ax_press_action(accts_menu)
+        time.sleep(0.35)
+        menu_children = _ax_children(accts_menu)
+        if not menu_children:
+            return {"ok": False, "error": "Accounts menu did not open", "code": "MENU_OPEN_FAILED"}
+        items = _ax_children(menu_children[0])
+        rec_item = next(
+            (
+                it for it in items
+                if "Reconcile" in (_ax_str(it, "AXTitle") or "")
+                and "History" not in (_ax_str(it, "AXTitle") or "")
+            ),
+            None,
+        )
+        if rec_item is None:
+            return {
+                "ok": False,
+                "error": "Reconcile Account menu item not found",
+                "code": "MENU_ITEM_NOT_FOUND",
+            }
+        _ax_press_action(rec_item)
+
+        # Wait for the reconcile dialog window
+        deadline = time.time() + timeout_ms / 1000.0
+        rec_win = None
+        while time.time() < deadline:
+            wins = _ax_children(root, "AXWindows")
+            for w in wins:
+                if (_ax_str(w, "AXTitle") or "").startswith("Reconcile:"):
+                    rec_win = w
+                    break
+            if rec_win:
+                break
+            time.sleep(0.2)
+
+        if rec_win is None:
+            return {
+                "ok": False,
+                "error": "Reconcile dialog did not appear within timeout",
+                "code": "TIMEOUT",
+            }
+
+        win_title = _ax_str(rec_win, "AXTitle") or f"Reconcile: {account_name}"
+        kids = _ax_children(rec_win)
+        group = kids[0]
+        gkids = _ax_children(group)
+
+        has_next = any(_ax_str(g, "AXTitle") == "Next" for g in gkids)
+        has_finish = any(_ax_str(g, "AXTitle") == "Finish" for g in gkids)
+
+        if has_finish and not has_next:
+            # Already on Step 2 — in-progress reconciliation was resumed
+            return {
+                "ok": True,
+                "window": win_title,
+                "step": 2,
+                "resumed": True,
+                "note": (
+                    "Resumed in-progress reconciliation; "
+                    "ending_balance not re-entered on macOS"
+                ),
+            }
+
+        # Step 1: fill ending balance field
+        eb_field = next(
+            (g for g in gkids if _ax_str(g, "AXDescription") == "Statement Ending Balance"),
+            gkids[11] if len(gkids) > 11 else None,
+        )
+        if eb_field is not None:
+            _ax_set_value(eb_field, ending_balance)
+
+        # Click Next
+        next_btn = next((g for g in gkids if _ax_str(g, "AXTitle") == "Next"), None)
+        if next_btn is None:
+            return {
+                "ok": False,
+                "error": "Next button not found in reconcile Step 1",
+                "code": "UI_CHANGED",
+            }
+        _ax_press_action(next_btn)
+        time.sleep(0.8)
+
+        return {"ok": True, "window": win_title, "step": 2, "resumed": False}
+
+    except (UIAError, TargetNotFoundError) as e:
+        return {"ok": False, "error": str(e), "code": getattr(e, "code", "ERROR")}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "code": "RECONCILE_ERROR"}
 
 
 def read_screen_text(bridge: Any, *, region: str = "") -> dict[str, Any]:
-    """Capture text via macOS OCR. (Not yet implemented.)"""
-    return {
-        "ok": False,
-        "lines": [],
-        "text": "",
-        "error": "Screen OCR not yet implemented for macOS",
-        "code": "NOT_IMPLEMENTED",
-    }
+    """
+    Capture visible text from the screen (or a sub-region) via macOS Vision OCR.
+
+    region format: "x,y,w,h" in screen points (optional; defaults to full screen).
+    """
+    try:
+        import subprocess as _sp
+        # Parse optional region
+        x, y, w, h = 0, 0, 0, 0
+        if region:
+            parts = [p.strip() for p in region.split(",")]
+            if len(parts) == 4:
+                x, y, w, h = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+
+        if w <= 0 or h <= 0:
+            # Full primary display bounds
+            _load_frameworks()
+            _CG.CGMainDisplayID.restype = ctypes.c_uint32
+            _CG.CGDisplayPixelsWide.restype = ctypes.c_ulong
+            _CG.CGDisplayPixelsHigh.restype = ctypes.c_ulong
+            _CG.CGMainDisplayID.argtypes = []
+            _CG.CGDisplayPixelsWide.argtypes = [ctypes.c_uint32]
+            _CG.CGDisplayPixelsHigh.argtypes = [ctypes.c_uint32]
+            did = _CG.CGMainDisplayID()
+            w = int(_CG.CGDisplayPixelsWide(did))
+            h = int(_CG.CGDisplayPixelsHigh(did))
+
+        lines = _ocr_region(x, y, w, h)
+        return {"ok": True, "lines": lines, "text": "\n".join(lines)}
+
+    except (UIAError, TargetNotFoundError) as e:
+        return {"ok": False, "lines": [], "text": "", "error": str(e), "code": getattr(e, "code", "ERROR")}
+    except Exception as e:
+        return {"ok": False, "lines": [], "text": "", "error": str(e), "code": "OCR_ERROR"}
 
 
 def read_transaction_splits(bridge: Any, row_index: int | None = None) -> dict[str, Any]:
-    """Read split dialog details. (Not yet implemented.)"""
-    return {
-        "ok": False,
-        "splits": [],
-        "error": "Split dialog reading not yet implemented for macOS",
-        "code": "NOT_IMPLEMENTED",
-    }
+    """
+    Read split line details for the currently selected (or specified) transaction.
+
+    For a split transaction (cell[4] role = AXImage), the function:
+      1. Scrolls the row into view.
+      2. Clicks the split-expand button (cell[5]) to open the inline split editor.
+      3. Screenshots the expanded sub-row area.
+      4. Runs Vision OCR (via ocr_region.swift) to extract split lines.
+
+    Returns:
+      {
+        "ok": True,
+        "kind": "split" | "single",
+        "count": int,
+        "splits": [{"index", "category", "tag", "memo", "amount"}, ...],
+        "header": {"date", "payee", "amount"},
+      }
+
+    Note: split sub-lines are not exposed in the AX tree; OCR is the only
+    available read path on macOS.
+    """
+    try:
+        _load_frameworks()
+        root = _get_root()
+        outer = _get_outer_children(root)
+        main = outer[1:]
+
+        table = _find_transaction_table(main)
+        if table is None:
+            return {"ok": False, "error": "Transaction table not found", "code": "NO_TABLE"}
+
+        rows = _ax_children(table)
+        if not rows:
+            return {"ok": False, "error": "No rows in table", "code": "NO_ROWS"}
+
+        # Resolve target row
+        if row_index is None:
+            k = _cfstr("AXSelectedRows")
+            v = c_void_p(0)
+            err = _AX.AXUIElementCopyAttributeValue(table, k, ctypes.byref(v))
+            _CF.CFRelease(k)
+            if err != kAXErrorSuccess or not v:
+                return {"ok": False, "error": "No row selected", "code": "NO_SELECTION"}
+            sel_count = _CF.CFArrayGetCount(v)
+            if sel_count == 0:
+                return {"ok": False, "error": "No row selected", "code": "NO_SELECTION"}
+            target_row = c_void_p(_CF.CFArrayGetValueAtIndex(v, 0))
+            _CF.CFRelease(v)
+            # Find its index in the rows list
+            target_idx = next(
+                (i for i, r in enumerate(rows) if r.value == target_row.value), None
+            )
+        else:
+            if row_index < 0 or row_index >= len(rows):
+                return {
+                    "ok": False,
+                    "error": f"Row index {row_index} out of range ({len(rows)} rows)",
+                    "code": "INVALID_INDEX",
+                }
+            target_row = rows[row_index]
+            target_idx = row_index
+
+        cells = _ax_children(target_row)
+        if not cells:
+            return {"ok": False, "error": "Row has no cells", "code": "EMPTY_ROW"}
+
+        # Check for split indicator: cell[4] is AXImage for split rows
+        is_split = len(cells) >= 5 and (_ax_str(cells[4], "AXRole") or "") == "AXImage"
+        vals = [_ax_str(c, "AXValue") or "" for c in cells]
+        header = {
+            "date": vals[1] if len(vals) > 1 else "",
+            "payee": vals[3] if len(vals) > 3 else "",
+            "amount": vals[6] if len(vals) > 6 else "",
+        }
+
+        if not is_split:
+            return {"ok": True, "kind": "single", "count": 0, "splits": [], "header": header}
+
+        # Scroll row into view
+        scroll_area = next(
+            (el for el in main if (_ax_str(el, "AXRole") or "") == "AXScrollArea"), None
+        )
+        if scroll_area and target_idx is not None:
+            sb = next(
+                (k for k in _ax_children(scroll_area) if (_ax_str(k, "AXRole") or "") == "AXScrollBar"),
+                None,
+            )
+            if sb:
+                _scroll_table_to_row(sb, len(rows), target_idx)
+
+        # Expand the split view by clicking cell[5] (split open button)
+        # AXPress is not supported on these cells; CGEvent mouse click is required.
+        if len(cells) >= 6:
+            _activate_quicken()
+            frame5 = _ax_get_frame(cells[5])
+            if frame5:
+                cx = frame5[0] + frame5[2] / 2.0
+                cy = frame5[1] + frame5[3] / 2.0
+                _mouse_click(cx, cy)
+            else:
+                # Fallback: click center of the row
+                row_frame = _ax_get_frame(target_row)
+                if row_frame:
+                    _mouse_click(row_frame[0] + row_frame[2] / 2.0,
+                                 row_frame[1] + row_frame[3] / 2.0)
+            time.sleep(0.7)
+            # Refresh cell references after expansion
+            cells = _ax_children(target_row)
+
+        # Get the expanded row frame for OCR
+        frame = _ax_get_frame(target_row)
+        if frame is None:
+            return {
+                "ok": True,
+                "kind": "split",
+                "count": 0,
+                "splits": [],
+                "header": header,
+                "note": "Could not get row frame for OCR",
+            }
+
+        x, y, w, h = frame
+        # Skip the 34px header row, OCR the split content below
+        split_y = int(y) + 34
+        split_h = int(h) - 34
+        if split_h <= 4:
+            return {
+                "ok": True,
+                "kind": "split",
+                "count": 0,
+                "splits": [],
+                "header": header,
+                "note": "Split row not expanded or too small for OCR",
+            }
+
+        ocr_lines = _ocr_region(int(x), split_y, int(w), split_h)
+        splits = _parse_split_lines(ocr_lines)
+
+        return {
+            "ok": True,
+            "kind": "split",
+            "count": len(splits),
+            "splits": splits,
+            "header": header,
+        }
+
+    except (UIAError, TargetNotFoundError) as e:
+        return {"ok": False, "error": str(e), "code": getattr(e, "code", "ERROR")}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "code": "SPLIT_READ_ERROR"}
 
 
 def edit_split_line(
@@ -692,18 +1160,88 @@ def edit_split_line(
     amount: str | None = None,
     tag: str | None = None,
 ) -> dict[str, Any]:
-    """Edit a split line. (Not yet implemented.)"""
-    return {
-        "ok": False,
-        "error": "Split editing not yet implemented for macOS",
-        "code": "NOT_IMPLEMENTED",
-    }
+    """
+    Edit a split line by keyboard Tab navigation within the inline split editor.
+
+    Quicken's inline split editor does not expose split sub-elements in the AX tree.
+    This function navigates by sending Tab keystrokes to reach the correct field and
+    typing the new value.
+
+    Column order inside each split line: Category → Tag → Memo → Amount
+    Pressing Cmd+E first ensures the row is in edit mode.
+
+    Note: AXFocusedUIElement does not track focus within Quicken's custom split editor,
+    so field targeting is based on a fixed tab count.  Use close_split_dialog(save=True)
+    afterwards to commit changes.
+    """
+    try:
+        _activate_quicken()
+
+        # Enter edit mode (Cmd+E)
+        _send_key(14, kCGEventFlagMaskCommand)  # E key
+        time.sleep(0.5)
+
+        # Tab navigation: 3 header fields (date, check#, payee) then per-split fields
+        HEADER_TABS = 3
+        FIELDS_PER_SPLIT = 4  # category, tag, memo, amount
+        base_tab = HEADER_TABS + index * FIELDS_PER_SPLIT
+
+        for _ in range(base_tab):
+            _send_key(kCGKeyCode_Tab)
+            time.sleep(0.08)
+
+        # Write fields in column order
+        field_values = [
+            ("category", category),
+            ("tag", tag),
+            ("memo", memo),
+            ("amount", amount),
+        ]
+        wrote: list[str] = []
+        for field_name, value in field_values:
+            if value is not None:
+                # Select all existing text, then type new value
+                _send_key(0x00, kCGEventFlagMaskCommand)  # Cmd+A (select all)
+                time.sleep(0.05)
+                _type_text(value)
+                time.sleep(0.05)
+                wrote.append(field_name)
+            _send_key(kCGKeyCode_Tab)
+            time.sleep(0.08)
+
+        return {
+            "ok": True,
+            "index": index,
+            "fields_written": wrote,
+            "note": (
+                "Split line edited via keyboard Tab navigation; "
+                "call close_split_dialog(save=True) to commit."
+            ),
+        }
+
+    except (UIAError, TargetNotFoundError) as e:
+        return {"ok": False, "error": str(e), "code": getattr(e, "code", "ERROR")}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "code": "EDIT_ERROR"}
 
 
 def close_split_dialog(bridge: Any, save: bool = True) -> dict[str, Any]:
-    """Close split dialog. (Not yet implemented.)"""
-    return {
-        "ok": False,
-        "error": "Split dialog close not yet implemented for macOS",
-        "code": "NOT_IMPLEMENTED",
-    }
+    """
+    Commit or discard split/transaction edits in the inline editor.
+
+    save=True  → press Return to save changes.
+    save=False → press Escape to discard.
+    """
+    try:
+        _activate_quicken()
+        if save:
+            _send_key(kCGKeyCode_Return)
+        else:
+            _send_key(kCGKeyCode_Escape)
+        time.sleep(0.3)
+        return {"ok": True, "saved": save}
+
+    except (UIAError, TargetNotFoundError) as e:
+        return {"ok": False, "error": str(e), "code": getattr(e, "code", "ERROR")}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "code": "CLOSE_ERROR"}
