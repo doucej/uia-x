@@ -1267,3 +1267,16 @@ def close_split_dialog(bridge: Any, save: bool = True) -> dict[str, Any]:
         return {"ok": False, "error": str(e), "code": getattr(e, "code", "ERROR")}
     except Exception as e:
         return {"ok": False, "error": str(e), "code": "CLOSE_ERROR"}
+
+
+# Module-level initialization: Validate frameworks can be loaded
+# This catches framework loading errors early when the module is imported,
+# rather than waiting for the first tool call.
+try:
+    _load_frameworks()
+except Exception as e:
+    raise RuntimeError(
+        f"Failed to initialize macOS Quicken skill: {e}. "
+        "Ensure you are running on macOS with proper accessibility permissions. "
+        "Check: System Settings > Privacy & Security > Accessibility"
+    ) from e
