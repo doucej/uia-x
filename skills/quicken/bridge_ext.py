@@ -118,7 +118,12 @@ def _acct_match(candidate: str, query: str) -> bool:
     return False
 
 
-def _dismiss_modal_dialogs(root_hwnd: int, *, max_rounds: int = 3) -> bool:
+def _dismiss_modal_dialogs(
+    root_hwnd: int,
+    *,
+    max_rounds: int = 3,
+    preserve_titles: set[str] | None = None,
+) -> bool:
     """Find and dismiss any modal dialogs owned by the Quicken window.
 
     Looks for top-level ``QWinDlg``, ``QWinPopup``, or ``#32770`` windows
@@ -207,11 +212,20 @@ def _dismiss_modal_dialogs(root_hwnd: int, *, max_rounds: int = 3) -> bool:
             if not user32.IsWindowVisible(h):
                 return True
             owner = user32.GetWindow(h, 4)  # GW_OWNER
-            if owner != root_hwnd:
+            # Accept dialogs owned by root_hwnd OR by root's own owner (e.g. New Tag
+            # dialogs are owned by QFRAME, not by the split dialog container).
+            owner_of_root = user32.GetWindow(root_hwnd, 4)
+            if owner not in (root_hwnd, owner_of_root):
                 return True
             cls = ctypes.create_unicode_buffer(64)
             user32.GetClassNameW(h, cls, 64)
             if cls.value in _DIALOG_CLASSES:
+                # Skip dialogs whose title is in the preserve list
+                if preserve_titles:
+                    ttl = ctypes.create_unicode_buffer(256)
+                    user32.GetWindowTextW(h, ttl, 256)
+                    if ttl.value.strip().lower() in preserve_titles:
+                        return True
                 dialogs.append(h)
             return True
 
@@ -4901,9 +4915,13 @@ def _find_button_in_hwnd(parent_hwnd: int, *texts: str) -> int | None:
         cls = cls_buf.value.lower()
         if cls not in ("qc_button", "button"):
             return True
-        # Strip accelerator (&) and normalize; check for any target as substring
+        # Strip accelerator (&) and normalize.
+        # Match strategy: exact match, OR first-word match (handles "Split transaction",
+        # "&OK", etc.) — NOT arbitrary substring (avoids false matches like
+        # "Save to the Memorized Payee List" matching keyword "save").
         raw = _read_hwnd_text(h).replace("&", "").strip().lower()
-        if raw in target_lower or any(t in raw for t in target_lower):
+        raw_first = raw.split()[0] if raw else raw
+        if raw in target_lower or raw_first in target_lower:
             result.append(h)
             return False  # stop after first match
         return True
@@ -5046,71 +5064,151 @@ def _parse_split_qwindlg(
 ) -> list[dict[str, Any]]:
     """Parse split rows from a QWinDlg split dialog.
 
-    The QWinDlg contains a QWListViewer with a ListBox.
-    Within the ListBox are Edit controls that hold the split row values.
-    
-    Each visible Edit control represents one field in a split row.
-    Fields are grouped into rows by y-position (controls within 20 px = same row),
-    then sorted left-to-right to get category, memo, amount order.
+    The QWinDlg contains a QWListViewer with a ListBox (owner-drawn).
+    Only the focused column of the focused row has a non-zero-size Edit control.
+    We click each column and read whichever Edit becomes non-zero-sized.
+
+    Strategy:
+      1. Find the ListBox inside the dialog.
+      2. Enumerate all Edit child controls.
+      3. Use LB_GETITEMRECT for each row's y-position in client coords.
+      4. For each row: click cat/amt/memo columns; after each click, find
+         the Edit with non-zero width (= the active one) and read its text.
+         Stop at the first row where both category and amount are empty.
 
     Returns a list of dicts: ``{"index", "hwnd_category", "hwnd_memo",
     "hwnd_amount", "category", "memo", "amount"}``.
     """
     import ctypes  # noqa: PLC0415
+    import ctypes.wintypes  # noqa: PLC0415
+    import time  # noqa: PLC0415
 
     user32 = ctypes.windll.user32
-    
-    # Find all visible Edit controls in the split dialog
-    edits: list[tuple[int, int, int]] = []  # (hwnd, left, top)
-    
-    def enum_edits(h: int, _: int) -> bool:
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+    # ── Locate ListBox and all Edit controls ──────────────────────────
+    lb_hwnd = 0
+    all_edits: list[int] = []
+
+    def _find_cb(h: int, _: int) -> bool:
+        nonlocal lb_hwnd
         cls_buf = ctypes.create_unicode_buffer(64)
         user32.GetClassNameW(h, cls_buf, 64)
-        if cls_buf.value == "Edit" and user32.IsWindowVisible(h):
-            r_int = (ctypes.c_long * 4)()
-            user32.GetWindowRect(h, ctypes.byref(r_int))
-            edits.append((h, r_int[0], r_int[1]))  # (hwnd, left, top)
+        cls = cls_buf.value
+        if cls == "ListBox" and not lb_hwnd:
+            lb_hwnd = h
+        elif cls == "Edit":
+            all_edits.append(h)
         return True
-    
-    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
-    user32.EnumChildWindows(container_hwnd, WNDENUMPROC(enum_edits), 0)
-    
-    if not edits:
+
+    user32.EnumChildWindows(container_hwnd, WNDENUMPROC(_find_cb), 0)
+
+    if not lb_hwnd or not all_edits:
         return []
-    
-    # Sort by y then x
-    edits.sort(key=lambda e: (e[2], e[1]))
-    
-    # Group into y-bands (±20 px = same row)
-    rows: list[list[tuple[int, int, int]]] = []
-    for edit_data in edits:
-        placed = False
-        for row in rows:
-            if abs(edit_data[2] - row[0][2]) <= 20:
-                row.append(edit_data)
-                placed = True
-                break
-        if not placed:
-            rows.append([edit_data])
-    
+
+    item_count = _send_msg_timeout(lb_hwnd, 0x018B, 0, 0)  # LB_GETCOUNT
+    if item_count is None or item_count <= 0:
+        return []
+
+    lb_rc = ctypes.wintypes.RECT()
+    user32.GetWindowRect(lb_hwnd, ctypes.byref(lb_rc))
+    lb_w = max(1, lb_rc.right - lb_rc.left)
+
+    # Column x-positions in ListBox client coords (empirically verified via scan)
+    # Quicken split dialog has 4 columns: Category | Tag | Memo | Amount
+    # Edits appear at: 9% (cat), 33% (tag), 57% (memo), 80% (amt)
+    cat_x  = max(1, int(lb_w * 0.15))   # category column ~15% from left
+    tag_x  = max(1, int(lb_w * 0.43))   # tag column ~43% from left
+    memo_x = max(1, int(lb_w * 0.70))   # memo column ~70% (was 0.45 → hit Tag!)
+    amt_x  = max(1, int(lb_w * 0.88))   # amount column ~88% from left
+
+    WM_LBUTTONDOWN = 0x0201
+    WM_LBUTTONUP   = 0x0202
+    LB_GETITEMRECT = 0x0198
+
+    def _click_lb_at(client_x: int, client_y: int) -> None:
+        lp = (client_y << 16) | (client_x & 0xFFFF)
+        user32.PostMessageW(lb_hwnd, WM_LBUTTONDOWN, 1, lp)
+        time.sleep(0.05)
+        user32.PostMessageW(lb_hwnd, WM_LBUTTONUP, 0, lp)
+        time.sleep(0.25)  # wait for Quicken to update IsWindowVisible on the Edits
+
+    def _snap_vis() -> dict:
+        """Snapshot current IsWindowVisible state for all edits."""
+        return {h: bool(user32.IsWindowVisible(h)) for h in all_edits}
+
+    def _get_newly_visible_edit(before: dict) -> int:
+        """Return Edit that just became visible (state changed False→True).
+
+        Falls back to any visible Edit if no state change is detected (e.g.
+        first click when all were invisible, or same column clicked twice).
+        """
+        for h in all_edits:
+            if not before.get(h) and user32.IsWindowVisible(h):
+                return h
+        # Fallback: any currently visible Edit
+        for h in all_edits:
+            if user32.IsWindowVisible(h):
+                return h
+        return 0
+
+    def _read_edit(hwnd: int) -> str:
+        if not hwnd:
+            return ""
+        buf = ctypes.create_unicode_buffer(512)
+        _fn = user32.SendMessageW
+        _fn.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_wchar_p]
+        _fn.restype = ctypes.c_ssize_t
+        _fn(hwnd, 0x000D, 511, buf)  # WM_GETTEXT
+        return buf.value
+
     result: list[dict[str, Any]] = []
-    for i, row in enumerate(rows):
-        # Sort left-to-right within row
-        row.sort(key=lambda e: e[1])
-        hwnds = [h for h, _, _ in row]
-        values = [_read_hwnd_text(h) for h in hwnds]
-        
-        entry: dict[str, Any] = {
-            "index": i,
-            "hwnd_category": hwnds[0] if len(hwnds) > 0 else 0,
-            "hwnd_memo":     hwnds[1] if len(hwnds) > 1 else 0,
-            "hwnd_amount":   hwnds[2] if len(hwnds) > 2 else 0,
-            "category": values[0] if len(values) > 0 else "",
-            "memo":     values[1] if len(values) > 1 else "",
-            "amount":   values[2] if len(values) > 2 else "",
-        }
-        result.append(entry)
-    
+    for i in range(item_count):
+        row_rc = ctypes.wintypes.RECT()
+        res = _send_msg_timeout(lb_hwnd, LB_GETITEMRECT, i, ctypes.addressof(row_rc))
+        if res is None or res < 0:
+            break
+        row_mid_y = (row_rc.top + row_rc.bottom) // 2
+
+        # Click each column; detect which Edit JUST BECAME visible (not just "any visible")
+        # This avoids the z-order bug where a previously-written Edit stays WS_VISIBLE
+        # and appears first even after clicking a different column.
+        # Column order: cat → tag → memo → amt (ends on amt = numeric, no QuickFill issues)
+        snap = _snap_vis()
+        _click_lb_at(cat_x, row_mid_y)
+        hwnd_cat = _get_newly_visible_edit(snap)
+        category = _read_edit(hwnd_cat)
+
+        snap = _snap_vis()
+        _click_lb_at(tag_x, row_mid_y)
+        hwnd_tag = _get_newly_visible_edit(snap)
+        tag = _read_edit(hwnd_tag)
+
+        snap = _snap_vis()
+        _click_lb_at(memo_x, row_mid_y)
+        hwnd_memo = _get_newly_visible_edit(snap)
+        memo = _read_edit(hwnd_memo)
+
+        snap = _snap_vis()
+        _click_lb_at(amt_x, row_mid_y)
+        hwnd_amt = _get_newly_visible_edit(snap)
+        amount = _read_edit(hwnd_amt)
+
+        if not category and not amount:
+            break  # end of real splits (empty placeholder rows)
+
+        result.append({
+            "index": len(result),
+            "hwnd_category": hwnd_cat,
+            "hwnd_tag": hwnd_tag,
+            "hwnd_memo": hwnd_memo,
+            "hwnd_amount": hwnd_amt,
+            "category": category,
+            "tag": tag,
+            "memo": memo,
+            "amount": amount,
+        })
+
     return result
 
 
@@ -5274,6 +5372,8 @@ def read_transaction_splits(
     import sys  # noqa: PLC0415
     import time  # noqa: PLC0415
 
+    global _split_state  # noqa: PLW0603
+
     from server.process_manager import get_process_manager  # noqa: PLC0415
 
     pm = get_process_manager()
@@ -5281,9 +5381,77 @@ def read_transaction_splits(
         raise TargetNotFoundError("Use select_window to attach first.")
 
     root_hwnd = pm.attached.hwnd
-    _dismiss_modal_dialogs(root_hwnd)
+    # Don't dismiss the split dialog itself — only other blocking modals
+    _dismiss_modal_dialogs(root_hwnd, preserve_titles={"split transaction"})
 
+    # If a split dialog is already open (and row_index not specified to force re-select), use it
+    if row_index is None:
+        _u32 = ctypes.windll.user32
+        _prev = 0
+        _existing_dlg = 0
+        while True:
+            _h = _u32.FindWindowExW(0, _prev, "QWinDlg", None)
+            if not _h:
+                break
+            _ttl = ctypes.create_unicode_buffer(256)
+            _u32.GetWindowTextW(_h, _ttl, 256)
+            if "split" in _ttl.value.lower():
+                _existing_dlg = _h
+                break
+            _prev = _h
+        if _existing_dlg:
+            splits = _parse_split_qwindlg(_existing_dlg)
+            _split_state = {
+                "container": _existing_dlg,
+                "kind": "qwindlg",
+                "rows": splits,
+                "root": root_hwnd,
+                "qwmdi": _find_active_mdi(root_hwnd) or 0,
+                "exclude": set(),
+            }
+            public_splits = [
+                {"index": s["index"], "category": s["category"],
+                 "memo": s["memo"], "amount": s["amount"]}
+                for s in splits
+            ]
+            return {"ok": True, "splits": public_splits, "count": len(public_splits), "kind": "qwindlg"}
     if row_index is not None:
+        # Close any existing "Split Transaction" dialogs so we open a fresh one
+        # for the specified row — avoids reading stale data from a leaked dialog.
+        _u32 = ctypes.windll.user32
+        _closed_any = False
+        _deadline = time.time() + 3.0
+        while time.time() < _deadline:
+            _prev2 = 0
+            _found_dlg = 0
+            while True:
+                _h2 = _u32.FindWindowExW(0, _prev2, "QWinDlg", None)
+                if not _h2:
+                    break
+                _ttl2 = ctypes.create_unicode_buffer(256)
+                _u32.GetWindowTextW(_h2, _ttl2, 256)
+                if "split" in _ttl2.value.lower():
+                    _found_dlg = _h2
+                    break
+                _prev2 = _h2
+            if not _found_dlg:
+                break
+            # Cancel the open dialog
+            _cancel_btn = _find_button_in_hwnd(_found_dlg, "cancel")
+            if _cancel_btn:
+                WM_LBUTTONDOWN = 0x0201
+                WM_LBUTTONUP   = 0x0202
+                _u32.PostMessageW(_cancel_btn, WM_LBUTTONDOWN, 1, (1 << 16) | 1)
+                time.sleep(0.05)
+                _u32.PostMessageW(_cancel_btn, WM_LBUTTONUP, 0, (1 << 16) | 1)
+            else:
+                _u32.PostMessageW(_found_dlg, 0x0010, 0, 0)  # WM_CLOSE fallback
+            time.sleep(0.5)
+            _closed_any = True
+        _split_state.clear()
+        if _closed_any:
+            time.sleep(0.3)  # let Quicken stabilise
+
         sel = select_register_row(bridge, row_index)
         if not sel.get("ok"):
             return sel
@@ -5316,11 +5484,14 @@ def read_transaction_splits(
             "code": "SPLIT_BUTTON_NOT_FOUND",
         }
 
-    # Click the Split button via BM_CLICK (Windows message)
-    # Note: Live testing shows split dialog may not open for all transactions.
-    # This may be transaction-type specific or require specific Quicken state.
-    BM_CLICK = 0x00F5
-    ctypes.windll.user32.SendMessageW(split_btn, BM_CLICK, 0, 0)
+    # Click the Split button using WM_LBUTTONDOWN/UP (QC_button handles these,
+    # not BM_CLICK; physical mouse_event unreliable if button is off-screen)
+    WM_LBUTTONDOWN = 0x0201
+    WM_LBUTTONUP = 0x0202
+    lpar = (1 << 16) | 1  # local coords x=1,y=1 inside button
+    ctypes.windll.user32.PostMessageW(split_btn, WM_LBUTTONDOWN, 1, lpar)
+    time.sleep(0.05)
+    ctypes.windll.user32.PostMessageW(split_btn, WM_LBUTTONUP, 0, lpar)
     time.sleep(0.8)
 
     # Wait for the split editor to appear
@@ -5346,7 +5517,6 @@ def read_transaction_splits(
         )
 
     # Store state for edit_split_line / close_split_dialog
-    global _split_state  # noqa: PLW0603
     _split_state = {
         "container": container,
         "kind": kind,
@@ -5359,7 +5529,7 @@ def read_transaction_splits(
     # Return splits without internal hwnd details
     public_splits = [
         {"index": s["index"], "category": s["category"],
-         "memo": s["memo"], "amount": s["amount"]}
+         "tag": s.get("tag", ""), "memo": s["memo"], "amount": s["amount"]}
         for s in splits
     ]
     return {
@@ -5376,11 +5546,17 @@ def edit_split_line(
     category: str | None = None,
     memo: str | None = None,
     amount: str | None = None,
+    tag: str | None = None,
 ) -> dict[str, Any]:
     """Edit one split line in the currently-open split editor.
 
     Uses ``WM_SETTEXT`` + ``WM_COMMAND(EN_CHANGE)`` injection — no focus
     change, no keyboard input.  A readback verifies each write.
+
+    For QWinDlg dialogs, the correct sequence is:
+      1. Click the column in the ListBox to expose that Edit control.
+      2. Send ``WM_SETTEXT`` to the now-active Edit.
+      3. Send ``WM_COMMAND(EN_CHANGE)`` to the Edit's parent.
 
     :func:`read_transaction_splits` must be called first to open the
     split editor and populate internal state.
@@ -5390,7 +5566,7 @@ def edit_split_line(
     index : int
         0-based split row index (from the ``splits`` list returned by
         :func:`read_transaction_splits`).
-    category, memo, amount : str or None
+    category, memo, amount, tag : str or None
         Fields to update.  ``None`` leaves the field unchanged.
 
     Returns
@@ -5398,6 +5574,8 @@ def edit_split_line(
     dict
         ``{"ok": True, "index": int, "written": {...}, "verified": {...}}``
     """
+    import ctypes  # noqa: PLC0415
+    import ctypes.wintypes  # noqa: PLC0415
     import time  # noqa: PLC0415
 
     if not _split_state:
@@ -5408,16 +5586,19 @@ def edit_split_line(
         }
 
     container = _split_state["container"]
-    rows = _split_state["rows"]
+    kind = _split_state.get("kind", "qwindlg")
 
-    # Re-read rows to get fresh HWNDs (in case the dialog re-rendered)
-    fresh = _parse_split_qredits(
-        container,
-        exclude_hwnds=_split_state.get("exclude") if _split_state.get("kind") == "inline" else None,
-    )
-    if fresh:
-        _split_state["rows"] = fresh
-        rows = fresh
+    # Re-parse to get fresh HWNDs and current row positions
+    if kind == "qwindlg":
+        rows = _parse_split_qwindlg(container)
+    else:
+        rows = _parse_split_qredits(
+            container,
+            exclude_hwnds=_split_state.get("exclude") if kind == "inline" else None,
+        )
+
+    if rows:
+        _split_state["rows"] = rows
 
     if index < 0 or index >= len(rows):
         return {
@@ -5430,28 +5611,141 @@ def edit_split_line(
     written: dict[str, str] = {}
     verified: dict[str, bool] = {}
 
-    def _do_write(hwnd: int, field: str, value: str) -> None:
-        if not hwnd:
-            return
-        ok = _write_qredit_background(hwnd, value, parent_hwnd=container, verify=True)
-        written[field] = value
-        verified[field] = ok
-        time.sleep(0.05)
+    if kind == "qwindlg":
+        # For QWinDlg: must click the column to expose the Edit before writing
+        user32 = ctypes.windll.user32
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
 
-    if category is not None:
-        _do_write(row["hwnd_category"], "category", category)
-    if memo is not None:
-        _do_write(row["hwnd_memo"], "memo", memo)
-    if amount is not None:
-        _do_write(row["hwnd_amount"], "amount", amount)
+        # Find the ListBox
+        lb_hwnd = 0
+        def _find_lb(h: int, _: int) -> bool:
+            nonlocal lb_hwnd
+            cls_buf = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(h, cls_buf, 64)
+            if cls_buf.value == "ListBox" and not lb_hwnd:
+                lb_hwnd = h
+            return True
+        user32.EnumChildWindows(container, WNDENUMPROC(_find_lb), 0)
 
-    # Refresh stored rows with latest read-back values
-    updated_row = _parse_split_qredits(
-        container,
-        exclude_hwnds=_split_state.get("exclude") if _split_state.get("kind") == "inline" else None,
-    )
-    if updated_row and index < len(updated_row):
-        _split_state["rows"] = updated_row
+        lb_rc = ctypes.wintypes.RECT()
+        if lb_hwnd:
+            user32.GetWindowRect(lb_hwnd, ctypes.byref(lb_rc))
+        lb_w = max(1, lb_rc.right - lb_rc.left)
+
+        cat_x  = max(1, int(lb_w * 0.15))
+        tag_x  = max(1, int(lb_w * 0.43))
+        memo_x = max(1, int(lb_w * 0.70))
+        amt_x  = max(1, int(lb_w * 0.88))
+
+        LB_GETITEMRECT = 0x0198
+        WM_LBUTTONDOWN = 0x0201
+        WM_LBUTTONUP   = 0x0202
+
+        row_rc = ctypes.wintypes.RECT()
+        res = _send_msg_timeout(lb_hwnd, LB_GETITEMRECT, index, ctypes.addressof(row_rc))
+        if res is None or res < 0:
+            return {"ok": False, "error": "Could not get row rect", "code": "ROW_RECT_FAIL"}
+        row_mid_y = (row_rc.top + row_rc.bottom) // 2
+
+        def _click_col(col_x: int) -> None:
+            lp = (row_mid_y << 16) | (col_x & 0xFFFF)
+            user32.PostMessageW(lb_hwnd, WM_LBUTTONDOWN, 1, lp)
+            time.sleep(0.05)
+            user32.PostMessageW(lb_hwnd, WM_LBUTTONUP, 0, lp)
+            time.sleep(0.15)
+
+        def _do_write_qwindlg(hwnd: int, field: str, value: str, col_x: int) -> None:
+            """Write *value* to *hwnd* using WM_CHAR injection.
+
+            Clicks the target column to expose the Edit, clears it via
+            EM_SETSEL + WM_CHAR(Delete), then injects each character via
+            WM_CHAR.  After typing, clicks the amount column to trigger the
+            column-transition commit handler (numeric field → no autocomplete,
+            no "New Tag" dialog).  Any residual modal dialogs are dismissed.
+            """
+            if not hwnd or not lb_hwnd:
+                return
+            _click_col(col_x)  # expose the Edit
+            time.sleep(0.15)
+
+            WM_GETTEXT   = 0x000D
+            WM_CHAR      = 0x0102
+            WM_KEYDOWN   = 0x0100
+            WM_KEYUP     = 0x0101
+            EM_SETSEL    = 0x00B1
+            VK_DELETE    = 0x2E
+
+            # Select-all then Delete to clear any existing text
+            user32.PostMessageW(hwnd, EM_SETSEL, 0, -1)
+            time.sleep(0.04)
+            user32.PostMessageW(hwnd, WM_KEYDOWN, VK_DELETE, 0)
+            time.sleep(0.02)
+            user32.PostMessageW(hwnd, WM_KEYUP, VK_DELETE, 0)
+            time.sleep(0.04)
+
+            for ch in value:
+                user32.PostMessageW(hwnd, WM_CHAR, ord(ch), 0)
+                time.sleep(0.01)
+            time.sleep(0.1)
+
+            # Commit by clicking the amount column — numeric field means no
+            # autocomplete / "New Tag" dialog will appear.
+            _click_col(amt_x)
+            time.sleep(0.25)
+            # Dismiss any modal dialogs that snuck in (safety net)
+            _dismiss_modal_dialogs(container, preserve_titles={"split transaction"})
+
+            # Verify via readback (click back to this column first to re-expose)
+            _click_col(col_x)
+            time.sleep(0.15)
+            rbuf = ctypes.create_unicode_buffer(512)
+            fn2 = user32.SendMessageW
+            fn2.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                            ctypes.c_size_t, ctypes.c_wchar_p]
+            fn2.restype  = ctypes.c_ssize_t
+            fn2(hwnd, WM_GETTEXT, 511, rbuf)
+            ok = rbuf.value.strip() == value.strip()
+            written[field] = value
+            verified[field] = ok
+
+        if category is not None:
+            _do_write_qwindlg(row["hwnd_category"], "category", category, cat_x)
+        if tag is not None:
+            _do_write_qwindlg(row.get("hwnd_tag", 0), "tag", tag, tag_x)
+        if memo is not None:
+            _do_write_qwindlg(row["hwnd_memo"], "memo", memo, memo_x)
+        if amount is not None:
+            _do_write_qwindlg(row["hwnd_amount"], "amount", amount, amt_x)
+
+        if written:
+            time.sleep(0.2)
+    else:
+        # Legacy inline / QREdit path
+        def _do_write(hwnd: int, field: str, value: str) -> None:
+            if not hwnd:
+                return
+            ok = _write_qredit_background(hwnd, value, parent_hwnd=container, verify=True)
+            written[field] = value
+            verified[field] = ok
+            time.sleep(0.05)
+
+        if category is not None:
+            _do_write(row["hwnd_category"], "category", category)
+        if memo is not None:
+            _do_write(row["hwnd_memo"], "memo", memo)
+        if amount is not None:
+            _do_write(row["hwnd_amount"], "amount", amount)
+
+    # For qwindlg, the commit step above triggers a column transition that saves
+    # the last-written Edit value into Quicken's model.  Also refresh stored rows
+    # for the legacy inline/QREdit path.
+    if kind != "qwindlg":
+        updated_rows = _parse_split_qredits(
+            container,
+            exclude_hwnds=_split_state.get("exclude") if kind == "inline" else None,
+        )
+        if updated_rows:
+            _split_state["rows"] = updated_rows
 
     return {"ok": True, "index": index, "written": written, "verified": verified}
 
@@ -5487,12 +5781,12 @@ def close_split_dialog(
     container = _split_state["container"]
 
     if save:
-        btn = _find_button_in_hwnd(container, "ok", "done", "save", "enter")
+        btn = _find_button_in_hwnd(container, "ok", "done", "enter")
         if btn is None:
             # Fallback: look in root for inline editors
             root = _split_state.get("root", 0)
             if root:
-                btn = _find_button_in_hwnd(root, "ok", "done", "save", "enter")
+                btn = _find_button_in_hwnd(root, "ok", "done", "enter")
     else:
         btn = _find_button_in_hwnd(container, "cancel")
         if btn is None:
@@ -5501,9 +5795,61 @@ def close_split_dialog(
                 btn = _find_button_in_hwnd(root, "cancel")
 
     if btn:
-        BM_CLICK = 0x00F5
-        _send_msg_timeout(btn, BM_CLICK, 0, 0, timeout_ms=2000)
-        time.sleep(0.4)
+        import ctypes  # noqa: PLC0415
+        import ctypes.wintypes  # noqa: PLC0415
+        u32 = ctypes.windll.user32
+
+        # Dismiss any modal dialogs blocking the split dialog (e.g. "New Tag",
+        # category autocomplete dropdowns) before trying to click OK/Cancel.
+        _dismiss_modal_dialogs(container, preserve_titles={"split transaction"})
+        time.sleep(0.1)
+
+        # Get button screen coordinates for physical click
+        btn_rc = ctypes.wintypes.RECT()
+        u32.GetWindowRect(btn, ctypes.byref(btn_rc))
+        btn_x = (btn_rc.left + btn_rc.right) // 2
+        btn_y = (btn_rc.top + btn_rc.bottom) // 2
+
+        if save:
+            # Physical mouse click on OK button — do NOT call SetForegroundWindow
+            # before the click, as doing so sends WM_ACTIVATE to Quicken which
+            # may cause it to re-populate Edit controls from its internal model
+            # (discarding WM_CHAR text we just wrote).
+            u32.SetCursorPos(btn_x, btn_y)
+            time.sleep(0.08)
+            MOUSEEVENTF_LEFTDOWN = 0x0002
+            MOUSEEVENTF_LEFTUP   = 0x0004
+            u32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+            time.sleep(0.08)
+            u32.mouse_event(MOUSEEVENTF_LEFTUP,   0, 0, 0, 0)
+        else:
+            # Escape key to cancel
+            class _KI(ctypes.Structure):
+                _fields_ = [("wVk", ctypes.c_ushort), ("wScan", ctypes.c_ushort),
+                             ("dwFlags", ctypes.c_uint), ("time", ctypes.c_uint),
+                             ("dwExtraInfo", ctypes.c_void_p)]
+
+            class _INP(ctypes.Structure):
+                _fields_ = [("type", ctypes.c_uint), ("ki", _KI),
+                             ("_pad", ctypes.c_byte * 8)]
+
+            ki_dn = _INP(); ki_dn.type = 1; ki_dn.ki.wVk = 0x1B  # VK_ESCAPE
+            ki_up = _INP(); ki_up.type = 1; ki_up.ki.wVk = 0x1B; ki_up.ki.dwFlags = 0x0002
+            u32.SendInput(2, (_INP * 2)(ki_dn, ki_up), ctypes.sizeof(_INP))
+
+        # Wait for the dialog to close (up to 3 s)
+        _deadline = time.time() + 3.0
+        while time.time() < _deadline:
+            time.sleep(0.1)
+            if not u32.IsWindow(container):
+                break
+        # If still open, try WM_COMMAND as fallback (no focus change)
+        if u32.IsWindow(container):
+            WM_COMMAND = 0x0111
+            BN_CLICKED = 0
+            cid = u32.GetDlgCtrlID(btn)
+            u32.PostMessageW(container, WM_COMMAND, (BN_CLICKED << 16) | cid, btn)
+            time.sleep(0.6)
     else:
         # Last resort: Escape to cancel, Enter to save (keyboard-only fallback)
         import ctypes  # noqa: PLC0415
@@ -5516,8 +5862,10 @@ def close_split_dialog(
             _post_msg(target, 0x0101, vk, 0)
             time.sleep(0.4)
 
+    import ctypes as _ctypes_check  # noqa: PLC0415
+    _dialog_closed = not _ctypes_check.windll.user32.IsWindow(container)
     _split_state.clear()
-    return {"ok": True, "saved": save}
+    return {"ok": True, "saved": save, "dialog_closed": _dialog_closed}
 
 
 # ── Server-side screen text extraction (Windows OCR) ──────────────

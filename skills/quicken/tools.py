@@ -328,6 +328,7 @@ def register(
         category: str | None = None,
         memo: str | None = None,
         amount: str | None = None,
+        tag: str | None = None,
         api_key: str = "",
     ) -> dict[str, Any]:
         auth_err = check_auth(api_key)
@@ -336,7 +337,7 @@ def register(
         try:
             bridge = get_bridge()
             return bridge_ext.edit_split_line(
-                bridge, index=index, category=category, memo=memo, amount=amount,
+                bridge, index=index, category=category, memo=memo, amount=amount, tag=tag,
             )
         except UIAError as exc:
             return {"ok": False, "error": str(exc), "code": exc.code}
