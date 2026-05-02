@@ -1,6 +1,6 @@
 # Quicken Classic Premier — Skill Reference
 
-> **File**: Jdouc's Quicken Data  
+> **File**: [Your Quicken Data File]  
 > **Version**: Quicken Classic Premier  
 > **Automation stack**: PowerShell .NET UIA + Python ctypes (PrintWindow for screenshots)
 
@@ -38,7 +38,7 @@ hwnd = ctypes.windll.user32.FindWindowW('QFRAME', None)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  Title Bar: "Quicken Classic Premier - Jdouc's Quicken Data - [X]" │
+│  Title Bar: "Quicken Classic Premier - [Your Quicken Data File] - [X]" │
 ├─────────────────────────────────────────────────────────────────────┤
 │  Menu: File | Edit | View | Tools | Mobile & Web | Reports | Help  │
 ├─────────────────────────────────────────────────────────────────────┤
