@@ -887,11 +887,9 @@ class TestBridgeFactory:
 
     def test_get_bridge_auto_detects_macos(self):
         """get_bridge('real') auto-detects macOS on darwin."""
-        with (
-            patch("server.uia_bridge._is_linux", return_value=False),
-            patch("server.uia_bridge._is_macos", return_value=True),
-            patch("uiax.backends.macos.bridge.require_axapi"),
-        ):
+        with patch("server.uia_bridge._is_linux", return_value=False), \
+             patch("server.uia_bridge._is_macos", return_value=True), \
+             patch("uiax.backends.macos.bridge.require_axapi"):
             from server.uia_bridge import get_bridge
 
             bridge = get_bridge("real")
