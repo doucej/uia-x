@@ -8,10 +8,11 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+import sys
+
 from mcp.server.fastmcp import FastMCP
 
 from server.uia_bridge import UIAError
-from skills.quicken import bridge_ext
 
 
 def register(
@@ -20,6 +21,12 @@ def register(
     check_auth: Callable[[str], dict[str, Any] | None],
 ) -> None:
     """Register all Quicken-specific MCP tools with *mcp*."""
+    if sys.platform == "win32":
+        from skills.quicken import windows_impl as _impl  # noqa: PLC0415
+    else:
+        # macOS / Linux: tools not yet implemented; skill loader skips this
+        # platform at the QuickenSkill level, so we should never reach here.
+        raise NotImplementedError(f"Quicken skill not supported on {sys.platform}")
 
     @mcp.tool(
         name="list_accounts",
@@ -39,7 +46,7 @@ def register(
             return auth_err
         try:
             bridge = get_bridge()
-            accounts = bridge_ext.list_accounts(bridge)
+            accounts = _impl.list_accounts(bridge)
             return {"ok": True, "count": len(accounts), "accounts": accounts}
         except UIAError as exc:
             return {"ok": False, "error": str(exc), "code": exc.code}
@@ -65,7 +72,7 @@ def register(
             return auth_err
         try:
             bridge = get_bridge()
-            return bridge_ext.navigate_to_account(bridge, account_name)
+            return _impl.navigate_to_account(bridge, account_name)
         except UIAError as exc:
             return {"ok": False, "error": str(exc), "code": exc.code}
         except Exception as exc:  # noqa: BLE001
@@ -88,7 +95,7 @@ def register(
             return auth_err
         try:
             bridge = get_bridge()
-            return bridge_ext.read_register_state(bridge)
+            return _impl.read_register_state(bridge)
         except UIAError as exc:
             return {"ok": False, "error": str(exc), "code": exc.code}
         except Exception as exc:  # noqa: BLE001
@@ -116,7 +123,7 @@ def register(
             return auth_err
         try:
             bridge = get_bridge()
-            return bridge_ext.read_register_rows(bridge, max_rows=max_rows)
+            return _impl.read_register_rows(bridge, max_rows=max_rows)
         except UIAError as exc:
             return {"ok": False, "error": str(exc), "code": exc.code}
         except Exception as exc:  # noqa: BLE001
@@ -141,7 +148,7 @@ def register(
             return auth_err
         try:
             bridge = get_bridge()
-            return bridge_ext.set_register_filter(bridge, text)
+            return _impl.set_register_filter(bridge, text)
         except UIAError as exc:
             return {"ok": False, "error": str(exc), "code": exc.code}
         except Exception as exc:  # noqa: BLE001
@@ -178,7 +185,7 @@ def register(
             return auth_err
         try:
             bridge = get_bridge()
-            return bridge_ext.open_reconcile(
+            return _impl.open_reconcile(
                 bridge,
                 account_name=account_name,
                 statement_date=statement_date,
@@ -218,7 +225,7 @@ def register(
             return auth_err
         try:
             bridge = get_bridge()
-            result = bridge_ext.list_sidebar_accounts(
+            result = _impl.list_sidebar_accounts(
                 bridge, resume=resume, max_seconds=max_seconds,
                 force_rescan=force_rescan,
             )
@@ -252,7 +259,7 @@ def register(
             return auth_err
         try:
             bridge = get_bridge()
-            return bridge_ext.read_screen_text(bridge, region=region)
+            return _impl.read_screen_text(bridge, region=region)
         except UIAError as exc:
             return {"ok": False, "error": str(exc), "code": exc.code}
         except Exception as exc:  # noqa: BLE001
@@ -277,7 +284,7 @@ def register(
             return auth_err
         try:
             bridge = get_bridge()
-            return bridge_ext.select_register_row(bridge, row_index=row_index)
+            return _impl.select_register_row(bridge, row_index=row_index)
         except UIAError as exc:
             return {"ok": False, "error": str(exc), "code": exc.code}
         except Exception as exc:  # noqa: BLE001
@@ -305,7 +312,7 @@ def register(
             return auth_err
         try:
             bridge = get_bridge()
-            return bridge_ext.read_transaction_splits(bridge, row_index=row_index)
+            return _impl.read_transaction_splits(bridge, row_index=row_index)
         except UIAError as exc:
             return {"ok": False, "error": str(exc), "code": exc.code}
         except Exception as exc:  # noqa: BLE001
@@ -336,7 +343,7 @@ def register(
             return auth_err
         try:
             bridge = get_bridge()
-            return bridge_ext.edit_split_line(
+            return _impl.edit_split_line(
                 bridge, index=index, category=category, memo=memo, amount=amount, tag=tag,
             )
         except UIAError as exc:
@@ -363,7 +370,7 @@ def register(
             return auth_err
         try:
             bridge = get_bridge()
-            return bridge_ext.close_split_dialog(bridge, save=save)
+            return _impl.close_split_dialog(bridge, save=save)
         except UIAError as exc:
             return {"ok": False, "error": str(exc), "code": exc.code}
         except Exception as exc:  # noqa: BLE001

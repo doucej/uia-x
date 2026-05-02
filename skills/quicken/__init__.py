@@ -11,6 +11,8 @@ automatically.
 
 from __future__ import annotations
 
+import sys
+import warnings
 from typing import Any, Callable
 
 from mcp.server.fastmcp import FastMCP
@@ -78,6 +80,12 @@ class QuickenSkill:
         get_bridge: Callable[[], Any],
         check_auth: Callable[[str], dict[str, Any] | None],
     ) -> None:
+        if sys.platform != "win32":
+            warnings.warn(
+                f"Quicken skill skipped: Windows-only implementation not supported on {sys.platform}",
+                stacklevel=2,
+            )
+            return
         from skills.quicken.tools import register  # noqa: PLC0415
         register(mcp, get_bridge, check_auth)
 
