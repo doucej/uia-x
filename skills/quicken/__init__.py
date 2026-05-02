@@ -86,8 +86,21 @@ class QuickenSkill:
                 stacklevel=2,
             )
             return
-        from skills.quicken.tools import register  # noqa: PLC0415
-        register(mcp, get_bridge, check_auth)
+        try:
+            from skills.quicken.tools import register  # noqa: PLC0415
+            register(mcp, get_bridge, check_auth)
+        except ImportError as e:
+            warnings.warn(
+                f"Quicken skill failed to load: {e}. "
+                f"This may indicate missing platform-specific dependencies. "
+                f"On macOS, install: pip install -e .[macos]",
+                stacklevel=2,
+            )
+        except NotImplementedError as e:
+            warnings.warn(
+                f"Quicken skill not supported on this platform: {e}",
+                stacklevel=2,
+            )
 
 
 # Module-level SKILL instance for auto-discovery

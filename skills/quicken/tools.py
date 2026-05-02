@@ -22,9 +22,21 @@ def register(
 ) -> None:
     """Register all Quicken-specific MCP tools with *mcp*."""
     if sys.platform == "win32":
-        from skills.quicken import windows_impl as _impl  # noqa: PLC0415
+        try:
+            from skills.quicken import windows_impl as _impl  # noqa: PLC0415
+        except ImportError as e:
+            raise ImportError(
+                f"Failed to load Windows Quicken implementation: {e}. "
+                "On Windows, install: pip install -e .[windows]"
+            ) from e
     elif sys.platform == "darwin":
-        from skills.quicken import macos_impl as _impl  # noqa: PLC0415
+        try:
+            from skills.quicken import macos_impl as _impl  # noqa: PLC0415
+        except ImportError as e:
+            raise ImportError(
+                f"Failed to load macOS Quicken implementation: {e}. "
+                "On macOS, install: pip install -e .[macos]"
+            ) from e
     else:
         raise NotImplementedError(f"Quicken skill not supported on {sys.platform}")
 
