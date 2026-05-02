@@ -70,15 +70,37 @@ def _load_frameworks() -> None:
     if _AX is not None:
         return
 
-    _CF = ctypes.cdll.LoadLibrary(
-        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
-    )
-    _AX = ctypes.cdll.LoadLibrary(
-        "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
-    )
-    _CG = ctypes.cdll.LoadLibrary(
-        "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
-    )
+    try:
+        _CF = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+        )
+    except (OSError, TypeError) as e:
+        raise RuntimeError(
+            f"Failed to load CoreFoundation framework: {e}. "
+            "Ensure macOS 10.13+ and proper accessibility permissions. "
+            "Check: System Settings > Privacy & Security > Accessibility"
+        ) from e
+
+    try:
+        _AX = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+        )
+    except (OSError, TypeError) as e:
+        raise RuntimeError(
+            f"Failed to load ApplicationServices framework: {e}. "
+            "This is required for Accessibility API (AX) access on macOS. "
+            "Ensure: System Settings > Privacy & Security > Accessibility"
+        ) from e
+
+    try:
+        _CG = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+        )
+    except (OSError, TypeError) as e:
+        raise RuntimeError(
+            f"Failed to load CoreGraphics framework: {e}. "
+            "This is required for mouse event generation on macOS."
+        ) from e
 
     # CoreFoundation types
     _CF.CFStringCreateWithCString.argtypes = [c_void_p, ctypes.c_char_p, ctypes.c_uint32]
