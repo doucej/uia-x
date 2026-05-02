@@ -1,45 +1,176 @@
 """
-macOS Quicken skill implementation using AXAPI (Accessibility Framework).
+macOS Quicken skill — pure ctypes AXAPI implementation.
 
-Mirrors the Windows implementation (windows_impl.py) but uses PyObjC and
-AXAPI for accessibility instead of Win32 ctypes.
+No PyObjC required. Loads ApplicationServices.framework directly via ctypes.
+Requires the calling process (Terminal / MCP server) to have Accessibility
+permission:  System Settings > Privacy & Security > Accessibility
 
-This module exposes the same public functions that tools.py expects:
-- list_accounts
-- navigate_to_account
-- read_register_state
-- read_register_rows
-- set_register_filter
-- open_reconcile
-- list_sidebar_accounts
-- read_screen_text
-- select_register_row
-- read_transaction_splits
-- edit_split_line
-- close_split_dialog
+Public API mirrors windows_impl.py signatures exactly so tools.py routes
+darwin calls here without modification.
+
+Discovered AX hierarchy (live Quicken, PID 1160, macOS Sonoma):
+  AXApplication
+    AXWindow
+      AXSplitGroup                              outer_children[0..n]
+        [0] AXSplitGroup  (sidebar panel)
+              AXScrollArea > AXOutline > AXRow[]   ← account list
+        [1..n] main content elements (layout varies by account type)
+
+Banking register (e.g. DCU Checking):
+  [3] AXGroup  ← filter bar, account name/balance
+  [4] AXScrollArea > AXTable  ← transactions (8 cols/row)
+
+Investment register (e.g. Fidelity PAS):
+  [7] AXStaticText desc='Account Name'
+  [2] AXStaticText desc='Balance'
+  [15] AXGroup > AXScrollArea > AXTable  ← transactions (9 cols/row)
 """
 
 from __future__ import annotations
 
+import ctypes
+import re
 import subprocess
 import time
 from typing import Any
 
 from server.uia_bridge import UIAError, TargetNotFoundError
 
+# ---------------------------------------------------------------------------
+# Framework setup (lazy, cached at module level)
+# ---------------------------------------------------------------------------
+
+_AX: ctypes.CDLL | None = None
+_CF: ctypes.CDLL | None = None
+
+kCFStringEncodingUTF8: int = 0x08000100
+kAXErrorSuccess: int = 0
+c_void_p = ctypes.c_void_p
+
+
+def _load_frameworks() -> None:
+    """Load macOS frameworks needed for AX access (idempotent)."""
+    global _AX, _CF
+    if _AX is not None:
+        return
+
+    _CF = ctypes.cdll.LoadLibrary(
+        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    )
+    _AX = ctypes.cdll.LoadLibrary(
+        "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+    )
+
+    # CoreFoundation types
+    _CF.CFStringCreateWithCString.argtypes = [c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+    _CF.CFStringCreateWithCString.restype = c_void_p
+    _CF.CFStringGetCString.argtypes = [c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+    _CF.CFStringGetCString.restype = ctypes.c_bool
+    _CF.CFRelease.argtypes = [c_void_p]
+    _CF.CFRelease.restype = None
+    _CF.CFGetTypeID.argtypes = [c_void_p]
+    _CF.CFGetTypeID.restype = ctypes.c_ulong
+    _CF.CFStringGetTypeID.restype = ctypes.c_ulong
+    _CF.CFArrayGetCount.argtypes = [c_void_p]
+    _CF.CFArrayGetCount.restype = ctypes.c_long
+    _CF.CFArrayGetValueAtIndex.argtypes = [c_void_p, ctypes.c_long]
+    _CF.CFArrayGetValueAtIndex.restype = c_void_p
+    _CF.CFArrayCreate.argtypes = [c_void_p, ctypes.POINTER(c_void_p), ctypes.c_long, c_void_p]
+    _CF.CFArrayCreate.restype = c_void_p
+
+    # AXUIElement
+    _AX.AXUIElementCreateApplication.argtypes = [ctypes.c_int32]
+    _AX.AXUIElementCreateApplication.restype = c_void_p
+    _AX.AXUIElementCopyAttributeValue.argtypes = [c_void_p, c_void_p, ctypes.POINTER(c_void_p)]
+    _AX.AXUIElementCopyAttributeValue.restype = ctypes.c_int
+    _AX.AXUIElementSetAttributeValue.argtypes = [c_void_p, c_void_p, c_void_p]
+    _AX.AXUIElementSetAttributeValue.restype = ctypes.c_int
+    _AX.AXUIElementPerformAction.argtypes = [c_void_p, c_void_p]
+    _AX.AXUIElementPerformAction.restype = ctypes.c_int
+    _AX.AXIsProcessTrusted.restype = ctypes.c_bool
+
 
 # ---------------------------------------------------------------------------
-# macOS Quicken Discovery & Connection
+# Low-level AX helpers
+# ---------------------------------------------------------------------------
+
+def _cfstr(s: str) -> c_void_p:
+    """Create a CFString from Python str. Caller must CFRelease."""
+    return _CF.CFStringCreateWithCString(None, s.encode("utf-8"), kCFStringEncodingUTF8)
+
+
+def _to_str(cfval: c_void_p) -> str | None:
+    """Convert a CFStringRef to Python str, or None if not a CFString."""
+    if not cfval:
+        return None
+    try:
+        if _CF.CFGetTypeID(cfval) != _CF.CFStringGetTypeID():
+            return None
+        buf = ctypes.create_string_buffer(4096)
+        if _CF.CFStringGetCString(cfval, buf, 4096, kCFStringEncodingUTF8):
+            return buf.value.decode("utf-8", errors="replace")
+    except Exception:
+        pass
+    return None
+
+
+def _ax_attr(el: c_void_p, name: str) -> c_void_p | None:
+    """Return raw CFTypeRef for AX attribute, or None on error."""
+    k = _cfstr(name)
+    val = c_void_p(0)
+    err = _AX.AXUIElementCopyAttributeValue(el, k, ctypes.byref(val))
+    _CF.CFRelease(k)
+    return val if err == kAXErrorSuccess and val else None
+
+
+def _ax_str(el: c_void_p, name: str) -> str | None:
+    """Return AX attribute as Python str, or None."""
+    return _to_str(_ax_attr(el, name))
+
+
+def _ax_children(el: c_void_p, attr: str = "AXChildren") -> list[c_void_p]:
+    """Return an AX array attribute (default AXChildren) as a list of c_void_p."""
+    k = _cfstr(attr)
+    val = c_void_p(0)
+    err = _AX.AXUIElementCopyAttributeValue(el, k, ctypes.byref(val))
+    _CF.CFRelease(k)
+    if err != kAXErrorSuccess or not val:
+        return []
+    n = _CF.CFArrayGetCount(val)
+    return [c_void_p(_CF.CFArrayGetValueAtIndex(val, i)) for i in range(n)]
+
+
+def _ax_set_selected_rows(container: c_void_p, row: c_void_p) -> int:
+    """Set AXSelectedRows on container to [row]. Returns AX error code."""
+    row_arr = (c_void_p * 1)(row)
+    cf_arr = _CF.CFArrayCreate(None, row_arr, 1, None)
+    k = _cfstr("AXSelectedRows")
+    err = _AX.AXUIElementSetAttributeValue(container, k, cf_arr)
+    _CF.CFRelease(k)
+    _CF.CFRelease(cf_arr)
+    return err
+
+
+def _ax_set_value(el: c_void_p, text: str) -> int:
+    """Set AXValue on element to given string. Returns AX error code."""
+    cf_val = _cfstr(text)
+    k = _cfstr("AXValue")
+    err = _AX.AXUIElementSetAttributeValue(el, k, cf_val)
+    _CF.CFRelease(k)
+    _CF.CFRelease(cf_val)
+    return err
+
+
+# ---------------------------------------------------------------------------
+# Quicken process / window navigation
 # ---------------------------------------------------------------------------
 
 def _find_quicken_pid() -> int:
-    """Find Quicken for macOS process ID using pgrep."""
+    """Return Quicken PID. Raises TargetNotFoundError if not running."""
     try:
         result = subprocess.run(
             ["pgrep", "-x", "Quicken"],
-            capture_output=True,
-            text=True,
-            timeout=5
+            capture_output=True, text=True, timeout=5,
         )
         pids = result.stdout.strip().split()
         if not pids:
@@ -49,225 +180,357 @@ def _find_quicken_pid() -> int:
         raise TargetNotFoundError(f"Failed to find Quicken process: {e}")
 
 
-def _get_ax_root() -> Any:
-    """Get the root AXUIElement for Quicken application."""
-    try:
-        from ApplicationServices import AXUIElementCreateApplication  # noqa: PLC0415
-    except ImportError:
+def _get_root() -> c_void_p:
+    """Return AXUIElement for the Quicken application."""
+    _load_frameworks()
+    if not _AX.AXIsProcessTrusted():
         raise UIAError(
-            "PyObjC ApplicationServices not available. Install: pip install pyobjc-framework-ApplicationServices",
-            code="DEPENDENCY_MISSING"
+            "Accessibility permission not granted. Enable Terminal in "
+            "System Settings > Privacy & Security > Accessibility.",
+            code="AX_NOT_TRUSTED",
         )
-    
     pid = _find_quicken_pid()
-    return AXUIElementCreateApplication(pid)
+    return _AX.AXUIElementCreateApplication(pid)
 
 
-def _get_ax_attribute(element: Any, attr: str) -> Any:
-    """Get an AX attribute from an element, returning None on error."""
-    try:
-        from ApplicationServices import AXUIElementCopyAttributeValue, kAXErrorSuccess  # noqa: PLC0415
-        err, value = AXUIElementCopyAttributeValue(element, attr, None)
-        if err == kAXErrorSuccess:
-            return value
-    except Exception:
-        pass
+def _get_outer_children(root: c_void_p) -> list[c_void_p]:
+    """
+    Return the children of the top-level AXSplitGroup:
+      [0] = sidebar SplitGroup
+      [1..n] = main content elements (layout varies by account type)
+
+    Uses AXWindows (not AXChildren) to get the actual window element.
+    """
+    wins = _ax_children(root, "AXWindows")
+    if not wins:
+        raise UIAError("Quicken has no windows", code="NO_WINDOW")
+    window = wins[0]
+    win_children = _ax_children(window)
+    if not win_children:
+        raise UIAError("Window has no children", code="EMPTY_WINDOW")
+    return _ax_children(win_children[0])
+
+
+# ---------------------------------------------------------------------------
+# Sidebar helpers
+# ---------------------------------------------------------------------------
+
+def _get_sidebar_outline(outer_children: list[c_void_p]) -> c_void_p | None:
+    """Find the AXOutline inside the sidebar panel (outer_children[0])."""
+    if not outer_children:
+        return None
+    sidebar = outer_children[0]  # AXSplitGroup sidebar
+    for child in _ax_children(sidebar):
+        if _ax_str(child, "AXRole") == "AXScrollArea":
+            for gc in _ax_children(child):
+                if _ax_str(gc, "AXRole") == "AXOutline":
+                    return gc
     return None
 
 
-def _get_children(element: Any) -> list[Any]:
-    """Get children of an AX element."""
-    try:
-        from ApplicationServices import kAXChildrenAttribute  # noqa: PLC0415
-        children = _get_ax_attribute(element, kAXChildrenAttribute)
-        return children if children else []
-    except Exception:
-        return []
+def _classify_row(row: c_void_p) -> str:
+    """
+    Classify a sidebar AXRow.
+    Returns 'account', 'group_header', 'sub_header', or 'other'.
+    """
+    cells = _ax_children(row)
+    if not cells:
+        return "other"
+    cell_children = _ax_children(cells[0])
+    texts = [c for c in cell_children if _ax_str(c, "AXRole") == "AXStaticText"]
+    checkboxes = [c for c in cell_children if _ax_str(c, "AXRole") == "AXCheckBox"]
+    if len(texts) == 2 and not checkboxes:
+        return "account"
+    if len(texts) >= 2 and checkboxes:
+        return "group_header"
+    if len(texts) == 1:
+        return "sub_header"
+    return "other"
+
+
+def _scan_sidebar_accounts(outline: c_void_p) -> list[dict[str, Any]]:
+    """Walk AXOutline rows and return list of {name, balance} dicts."""
+    accounts: list[dict[str, Any]] = []
+    for row in _ax_children(outline):
+        if _classify_row(row) != "account":
+            continue
+        cells = _ax_children(row)
+        texts = [c for c in _ax_children(cells[0]) if _ax_str(c, "AXRole") == "AXStaticText"]
+        name = _ax_str(texts[0], "AXValue") or ""
+        balance = _ax_str(texts[1], "AXValue") or ""
+        if name:
+            accounts.append({"name": name, "balance": balance})
+    return accounts
+
+
+def _find_sidebar_row(outline: c_void_p, account_name: str) -> c_void_p | None:
+    """
+    Find sidebar AXRow whose account name matches account_name.
+    Tries exact match first, then substring match.
+    """
+    needle = account_name.lower().strip()
+    best: c_void_p | None = None
+    best_score = -1
+
+    for row in _ax_children(outline):
+        if _classify_row(row) != "account":
+            continue
+        cells = _ax_children(row)
+        texts = [c for c in _ax_children(cells[0]) if _ax_str(c, "AXRole") == "AXStaticText"]
+        name = (_ax_str(texts[0], "AXValue") or "").lower().strip()
+        if name == needle:
+            return row
+        if needle in name or name in needle:
+            score = len(name) - abs(len(name) - len(needle))
+            if score > best_score:
+                best_score = score
+                best = row
+
+    return best
 
 
 # ---------------------------------------------------------------------------
-# Public API Functions
+# Main content area helpers
+# ---------------------------------------------------------------------------
+
+def _get_register_info(main_children: list[c_void_p]) -> dict[str, str]:
+    """
+    Extract account_name, balance, item_count_text from main content area.
+    Handles both banking (elements in AXGroup) and investment (flat) layouts.
+
+    Banking:    desc='Account Name' + desc='Balance' in AXGroup child
+    Investment: desc='Account Name' flat; balance = first bare $-value AXStaticText
+    """
+    info: dict[str, str] = {
+        "account_name": "",
+        "balance": "",
+        "item_count_text": "",
+    }
+
+    def check_el(el: c_void_p) -> None:
+        if _ax_str(el, "AXRole") != "AXStaticText":
+            return
+        desc = _ax_str(el, "AXDescription") or ""
+        val = _ax_str(el, "AXValue") or ""
+        if desc == "Account Name" and val and not info["account_name"]:
+            info["account_name"] = val
+        elif desc == "Balance" and val and not info["balance"]:
+            info["balance"] = val
+        elif not desc and val and not info["item_count_text"] and re.match(r"^\d+\s+items", val):
+            info["item_count_text"] = val
+
+    for child in main_children:
+        check_el(child)
+        if _ax_str(child, "AXRole") == "AXGroup":
+            for gc in _ax_children(child):
+                check_el(gc)
+
+    # Fallback for investment accounts: no desc='Balance'; use first bare $-value static text
+    if not info["balance"]:
+        for child in main_children:
+            if _ax_str(child, "AXRole") != "AXStaticText":
+                continue
+            val = _ax_str(child, "AXValue") or ""
+            desc = _ax_str(child, "AXDescription") or ""
+            if not desc and val.startswith("$"):
+                info["balance"] = val
+                break
+
+    return info
+
+
+def _find_transaction_table(main_children: list[c_void_p]) -> c_void_p | None:
+    """
+    Locate the AXTable containing register rows in the main content area.
+
+    Banking layout:   AXScrollArea > AXTable  (direct child)
+    Investment layout: AXGroup > AXScrollArea > AXTable
+    """
+    for child in main_children:
+        role = _ax_str(child, "AXRole") or ""
+        if role == "AXScrollArea":
+            for gc in _ax_children(child):
+                if _ax_str(gc, "AXRole") == "AXTable":
+                    return gc
+        elif role == "AXGroup":
+            for gc in _ax_children(child):
+                if _ax_str(gc, "AXRole") == "AXScrollArea":
+                    for ggc in _ax_children(gc):
+                        if _ax_str(ggc, "AXRole") == "AXTable":
+                            return ggc
+    return None
+
+
+def _find_search_field(main_children: list[c_void_p]) -> c_void_p | None:
+    """Find the search/filter AXTextField in the register header."""
+    for child in main_children:
+        if _ax_str(child, "AXRole") == "AXTextField":
+            return child
+        if _ax_str(child, "AXRole") == "AXGroup":
+            for gc in _ax_children(child):
+                if _ax_str(gc, "AXRole") == "AXTextField":
+                    return gc
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Transaction row parsing
+# ---------------------------------------------------------------------------
+
+def _parse_tx_row(ax_row: c_void_p) -> dict[str, Any] | None:
+    """
+    Parse one AXRow into a transaction dict.
+
+    Cell structures observed live:
+    n=8 checking:    [flag_btn, date, cleared, payee, cat_img, split_btn, amount, balance]
+    n=7 credit card: [flag_btn, date, payee, category, split_btn, amount, balance]
+    n=9 investment:  [flag_btn, date, action, security, memo, split_btn, debit, credit, balance]
+    """
+    cells = _ax_children(ax_row)
+    vals = [_ax_str(c, "AXValue") or "" for c in cells]
+
+    if not any(vals):
+        return None
+
+    n = len(vals)
+    if n == 8:
+        # Checking/savings: cleared col at [2], cat icon (AXImage) at [4], split btn at [5]
+        return {
+            "date": vals[1],
+            "payee": vals[3],
+            "amount": vals[6],
+            "balance": vals[7],
+        }
+    elif n == 7:
+        # Credit card: no cleared col; payee at [2], category text at [3], split btn at [4]
+        return {
+            "date": vals[1],
+            "payee": vals[2],
+            "category": vals[3],
+            "amount": vals[5],
+            "balance": vals[6],
+        }
+    elif n >= 9:
+        # Investment: action at [2], security at [3], memo at [4], debit/credit at [6]/[7]
+        return {
+            "date": vals[1],
+            "action": vals[2],
+            "security": vals[3],
+            "memo": vals[4],
+            "debit": vals[6],
+            "credit": vals[7],
+            "balance": vals[8] if n > 8 else "",
+        }
+    elif n >= 5:
+        # Fallback for unknown layouts
+        return {
+            "date": vals[1] if n > 1 else "",
+            "payee": vals[2] if n > 2 else "",
+            "amount": vals[-2] if n > 2 else "",
+            "balance": vals[-1] if n > 1 else "",
+        }
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Public API — must match windows_impl.py signatures
 # ---------------------------------------------------------------------------
 
 def list_accounts(bridge: Any) -> list[dict[str, Any]]:
-    """List all accounts visible in Quicken sidebar or toolbar."""
+    """Return list of {name, balance} dicts for all sidebar accounts."""
+    root = _get_root()
+    outer = _get_outer_children(root)
+    outline = _get_sidebar_outline(outer)
+    if outline is None:
+        raise UIAError("Sidebar outline not found", code="SIDEBAR_NOT_FOUND")
+    return _scan_sidebar_accounts(outline)
+
+
+def list_sidebar_accounts(
+    bridge: Any,
+    resume: bool = False,
+    max_seconds: float = 720.0,
+    force_rescan: bool = False,
+) -> dict[str, Any]:
+    """Enumerate all Quicken sidebar accounts."""
     try:
-        try:
-            from ApplicationServices import (  # noqa: PLC0415
-                kAXRoleAttribute, kAXTitleAttribute, kAXOutlineViewRole,
-                kAXTableRole, kAXChildrenAttribute
-            )
-        except ImportError:
-            return []
-        
-        root = _get_ax_root()
-        accounts = []
-        
-        # Search for sidebar/outline view containing accounts
-        def find_outline_or_table(element: Any, depth: int = 0) -> list[str]:
-            """Recursively search for outline view or table with accounts."""
-            if depth > 5:
-                return []
-            
-            role = _get_ax_attribute(element, kAXRoleAttribute)
-            found = []
-            
-            # Check if this is an outline view or table
-            if role in (kAXOutlineViewRole, kAXTableRole):
-                children = _get_children(element)
-                for child in children:
-                    child_role = _get_ax_attribute(child, kAXRoleAttribute)
-                    # Look for row elements
-                    if "row" in str(child_role).lower():
-                        title = _get_ax_attribute(child, kAXTitleAttribute)
-                        if title:
-                            found.append(title)
-            
-            # Recurse to children
-            children = _get_children(element)
-            for child in children:
-                found.extend(find_outline_or_table(child, depth + 1))
-            
-            return found
-        
-        accounts = find_outline_or_table(root)
-        # Remove duplicates and filter empty strings
-        accounts = list(dict.fromkeys([a for a in accounts if a]))
-        
-        return accounts
-    except TargetNotFoundError as e:
-        raise e
+        accounts = list_accounts(bridge)
+        return {
+            "ok": True,
+            "accounts": accounts,
+            "scanned": len(accounts),
+            "total": len(accounts),
+            "done": True,
+            "cached": False,
+        }
+    except (UIAError, TargetNotFoundError) as e:
+        return {"ok": False, "error": str(e), "code": getattr(e, "code", "ERROR")}
     except Exception as e:
-        raise UIAError(f"Failed to list accounts: {e}", code="LIST_ACCOUNTS_ERROR")
+        return {"ok": False, "error": str(e), "code": "SIDEBAR_ENUM_ERROR"}
 
 
 def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
-    """Navigate to a specific account's register view."""
+    """Navigate to an account by selecting its sidebar row via AXSelectedRows."""
     try:
-        try:
-            from ApplicationServices import (  # noqa: PLC0415
-                kAXRoleAttribute, kAXTitleAttribute, kAXPressAction,
-                kAXChildrenAttribute
-            )
-        except ImportError:
-            return {"ok": False, "error": "ApplicationServices not available", "code": "MISSING_FRAMEWORK"}
-        
-        root = _get_ax_root()
-        
-        # Find account row in sidebar
-        def find_account_row(element: Any, name: str, depth: int = 0) -> Any:
-            """Find account row by name."""
-            if depth > 5:
-                return None
-            
-            title = _get_ax_attribute(element, kAXTitleAttribute)
-            if title and name.lower() in str(title).lower():
-                return element
-            
-            children = _get_children(element)
-            for child in children:
-                result = find_account_row(child, name, depth + 1)
-                if result:
-                    return result
-            
-            return None
-        
-        account_row = find_account_row(root, account_name)
-        if not account_row:
-            return {"ok": False, "error": f"Account '{account_name}' not found", "code": "ACCOUNT_NOT_FOUND"}
-        
-        # Click account (press action)
-        try:
-            account_row.performAction_(kAXPressAction)
-            time.sleep(0.3)  # Wait for navigation
-        except Exception as e:
-            return {"ok": False, "error": f"Failed to click account: {e}", "code": "CLICK_FAILED"}
-        
+        root = _get_root()
+        outer = _get_outer_children(root)
+        outline = _get_sidebar_outline(outer)
+        if outline is None:
+            return {"ok": False, "error": "Sidebar outline not found", "code": "SIDEBAR_NOT_FOUND"}
+
+        row = _find_sidebar_row(outline, account_name)
+        if row is None:
+            return {
+                "ok": False,
+                "error": f"Account '{account_name}' not found in sidebar",
+                "code": "ACCOUNT_NOT_FOUND",
+            }
+
+        err = _ax_set_selected_rows(outline, row)
+        if err != kAXErrorSuccess:
+            return {
+                "ok": False,
+                "error": f"AXSelectedRows failed (err={err})",
+                "code": "NAV_FAILED",
+            }
+
+        time.sleep(0.5)  # let the register view update
         return {"ok": True, "account": account_name}
+
+    except (UIAError, TargetNotFoundError) as e:
+        return {"ok": False, "error": str(e), "code": getattr(e, "code", "ERROR")}
     except Exception as e:
         return {"ok": False, "error": str(e), "code": "NAV_ERROR"}
 
 
 def read_register_state(bridge: Any) -> dict[str, Any]:
-    """Read current state of the visible transaction register."""
+    """Read current account name, balance, item count, and filter state."""
     try:
-        try:
-            from ApplicationServices import (  # noqa: PLC0415
-                kAXRoleAttribute, kAXTitleAttribute, kAXValueAttribute,
-                kAXChildrenAttribute
-            )
-        except ImportError:
-            return {"ok": False, "error": "ApplicationServices not available", "code": "MISSING_FRAMEWORK"}
-        
-        root = _get_ax_root()
-        
-        # Find account name (look for window title or register header)
-        account_name = _get_ax_attribute(root, kAXTitleAttribute)
-        if not account_name:
-            account_name = ""
-        
-        # Count transaction rows (traverse to find table/list)
-        def count_transactions(element: Any, depth: int = 0) -> int:
-            """Count transaction rows in register."""
-            if depth > 6:
-                return 0
-            
-            role = _get_ax_attribute(element, kAXRoleAttribute)
-            count = 0
-            
-            # If this is a table role, count rows
-            if "table" in str(role).lower() or "outline" in str(role).lower():
-                children = _get_children(element)
-                for child in children:
-                    child_role = _get_ax_attribute(child, kAXRoleAttribute)
-                    if "row" in str(child_role).lower():
-                        count += 1
-            
-            # Recurse to children
-            children = _get_children(element)
-            for child in children:
-                count += count_transactions(child, depth + 1)
-            
-            return count
-        
-        tx_count = count_transactions(root)
-        
-        # Try to find balance field
-        balance_total = ""
-        def find_balance(element: Any, depth: int = 0) -> str:
-            """Search for balance value."""
-            if depth > 6:
-                return ""
-            
-            value = _get_ax_attribute(element, kAXValueAttribute)
-            title = _get_ax_attribute(element, kAXTitleAttribute)
-            
-            # Look for values that look like currency amounts
-            if value and isinstance(value, str) and ("$" in value or "." in value):
-                return value
-            if title and isinstance(title, str) and ("balance" in title.lower() or "$" in title):
-                val = _get_ax_attribute(element, kAXValueAttribute)
-                if val:
-                    return str(val)
-            
-            children = _get_children(element)
-            for child in children:
-                result = find_balance(child, depth + 1)
-                if result:
-                    return result
-            
-            return ""
-        
-        balance_total = find_balance(root)
-        
+        root = _get_root()
+        outer = _get_outer_children(root)
+        main = outer[1:]  # skip sidebar[0]
+
+        info = _get_register_info(main)
+
+        tx_count = 0
+        m = re.match(r"^(\d+)\s+items", info.get("item_count_text", ""))
+        if m:
+            tx_count = int(m.group(1))
+
+        sf = _find_search_field(main)
+        filter_text = (_ax_str(sf, "AXValue") or "") if sf else ""
+
         return {
             "ok": True,
-            "account_name": account_name,
-            "balance_total": balance_total,
+            "account_name": info["account_name"],
+            "balance_total": info["balance"],
             "tx_count": tx_count,
+            "item_count_text": info["item_count_text"],
             "reconcile_active": False,
-            "filter_text": "",
+            "filter_text": filter_text,
         }
+    except (UIAError, TargetNotFoundError) as e:
+        return {"ok": False, "error": str(e), "code": getattr(e, "code", "ERROR")}
     except Exception as e:
         return {"ok": False, "error": str(e), "code": "REGISTER_STATE_ERROR"}
 
@@ -276,171 +539,110 @@ def read_register_rows(
     bridge: Any,
     max_rows: int = 50,
 ) -> dict[str, Any]:
-    """Read transaction rows from the current register."""
+    """Read up to max_rows transaction rows from the current register."""
     try:
-        try:
-            from ApplicationServices import (  # noqa: PLC0415
-                kAXRoleAttribute, kAXTitleAttribute, kAXValueAttribute,
-                kAXChildrenAttribute
-            )
-        except ImportError:
-            return {"ok": False, "error": "ApplicationServices not available", "code": "MISSING_FRAMEWORK"}
-        
-        root = _get_ax_root()
-        rows = []
-        
-        # Find table and extract rows
-        def extract_rows(element: Any, depth: int = 0, count: int = 0) -> tuple[list, int]:
-            """Extract transaction rows from table."""
-            if depth > 6 or count >= max_rows:
-                return [], count
-            
-            role = _get_ax_attribute(element, kAXRoleAttribute)
-            found_rows = []
-            
-            # If this is a table role, extract rows
-            if "table" in str(role).lower() or "outline" in str(role).lower():
-                children = _get_children(element)
-                for child in children:
-                    if count >= max_rows:
-                        break
-                    child_role = _get_ax_attribute(child, kAXRoleAttribute)
-                    if "row" in str(child_role).lower():
-                        # Extract row data
-                        title = _get_ax_attribute(child, kAXTitleAttribute)
-                        value = _get_ax_attribute(child, kAXValueAttribute)
-                        row_data = {
-                            "index": count,
-                            "date": "",
-                            "payee": title or "",
-                            "category": "",
-                            "memo": "",
-                            "amount": value or "",
-                        }
-                        found_rows.append(row_data)
-                        count += 1
-            
-            # Recurse to children
-            children = _get_children(element)
-            for child in children:
-                if count >= max_rows:
-                    break
-                more_rows, count = extract_rows(child, depth + 1, count)
-                found_rows.extend(more_rows)
-            
-            return found_rows, count
-        
-        rows, _ = extract_rows(root)
-        
+        root = _get_root()
+        outer = _get_outer_children(root)
+        main = outer[1:]
+
+        table = _find_transaction_table(main)
+        if table is None:
+            return {"ok": False, "error": "Transaction table not found", "code": "TABLE_NOT_FOUND"}
+
+        all_rows = _ax_children(table)
+        parsed: list[dict[str, Any]] = []
+        for i, ax_row in enumerate(all_rows):
+            if len(parsed) >= max_rows:
+                break
+            tx = _parse_tx_row(ax_row)
+            if tx:
+                tx["index"] = i
+                parsed.append(tx)
+
+        info = _get_register_info(main)
         return {
             "ok": True,
-            "account": "",
-            "rows": rows,
+            "account": info.get("account_name", ""),
+            "rows": parsed,
+            "total_in_view": len(all_rows),
         }
+    except (UIAError, TargetNotFoundError) as e:
+        return {"ok": False, "error": str(e), "code": getattr(e, "code", "ERROR")}
     except Exception as e:
         return {"ok": False, "error": str(e), "code": "READ_ROWS_ERROR"}
 
 
 def select_register_row(bridge: Any, row_index: int) -> dict[str, Any]:
-    """Select a transaction row in the register."""
+    """Select a transaction row (0-based) via AXSelectedRows."""
     try:
-        try:
-            from ApplicationServices import (  # noqa: PLC0415
-                kAXRoleAttribute, kAXPressAction, kAXChildrenAttribute
-            )
-        except ImportError:
-            return {"ok": False, "error": "ApplicationServices not available", "code": "MISSING_FRAMEWORK"}
-        
-        root = _get_ax_root()
-        
-        # Find table and select row at index
-        def find_and_select_row(element: Any, target_index: int, depth: int = 0, current_index: int = 0) -> tuple[bool, int]:
-            """Find row at target_index and click it."""
-            if depth > 6:
-                return False, current_index
-            
-            role = _get_ax_attribute(element, kAXRoleAttribute)
-            
-            if "table" in str(role).lower() or "outline" in str(role).lower():
-                children = _get_children(element)
-                for child in children:
-                    child_role = _get_ax_attribute(child, kAXRoleAttribute)
-                    if "row" in str(child_role).lower():
-                        if current_index == target_index:
-                            try:
-                                child.performAction_(kAXPressAction)
-                                time.sleep(0.2)
-                                return True, current_index
-                            except Exception:
-                                return False, current_index
-                        current_index += 1
-            
-            children = _get_children(element)
-            for child in children:
-                found, current_index = find_and_select_row(child, target_index, depth + 1, current_index)
-                if found:
-                    return True, current_index
-            
-            return False, current_index
-        
-        found, _ = find_and_select_row(root, row_index)
-        
-        if not found:
-            return {"ok": False, "error": f"Row {row_index} not found", "code": "ROW_NOT_FOUND"}
-        
-        return {"ok": True}
+        root = _get_root()
+        outer = _get_outer_children(root)
+        main = outer[1:]
+
+        table = _find_transaction_table(main)
+        if table is None:
+            return {"ok": False, "error": "Transaction table not found", "code": "TABLE_NOT_FOUND"}
+
+        rows = _ax_children(table)
+        if row_index >= len(rows):
+            return {
+                "ok": False,
+                "error": f"Row {row_index} out of range ({len(rows)} rows)",
+                "code": "ROW_OUT_OF_RANGE",
+            }
+
+        err = _ax_set_selected_rows(table, rows[row_index])
+        if err != kAXErrorSuccess:
+            return {
+                "ok": False,
+                "error": f"AXSelectedRows on table failed (err={err})",
+                "code": "SELECT_FAILED",
+            }
+
+        time.sleep(0.2)
+        return {"ok": True, "row_index": row_index}
+
+    except (UIAError, TargetNotFoundError) as e:
+        return {"ok": False, "error": str(e), "code": getattr(e, "code", "ERROR")}
     except Exception as e:
         return {"ok": False, "error": str(e), "code": "SELECT_ROW_ERROR"}
 
 
 def set_register_filter(bridge: Any, text: str) -> dict[str, Any]:
-    """Set search filter in register view."""
+    """Set the search filter text field in the register view."""
     try:
-        try:
-            from ApplicationServices import (  # noqa: PLC0415
-                kAXRoleAttribute, kAXValueAttribute, kAXTextFieldRole,
-                kAXChildrenAttribute
-            )
-        except ImportError:
-            return {"ok": False, "error": "ApplicationServices not available", "code": "MISSING_FRAMEWORK"}
-        
-        root = _get_ax_root()
-        
-        # Find search/filter text field
-        def find_search_field(element: Any, depth: int = 0) -> Any:
-            """Find search field in register."""
-            if depth > 6:
-                return None
-            
-            role = _get_ax_attribute(element, kAXRoleAttribute)
-            if role == kAXTextFieldRole:
-                title = _get_ax_attribute(element, kAXTitleAttribute)
-                if title and ("search" in str(title).lower() or "filter" in str(title).lower()):
-                    return element
-            
-            children = _get_children(element)
-            for child in children:
-                result = find_search_field(child, depth + 1)
-                if result:
-                    return result
-            
-            return None
-        
-        search_field = find_search_field(root)
-        if not search_field:
-            return {"ok": False, "error": "Search field not found", "code": "SEARCH_FIELD_NOT_FOUND"}
-        
-        try:
-            search_field.setAttributeValue_forAttribute_(text, kAXValueAttribute)
-            time.sleep(0.2)
-        except Exception as e:
-            return {"ok": False, "error": f"Failed to set filter: {e}", "code": "SET_FILTER_ERROR"}
-        
+        root = _get_root()
+        outer = _get_outer_children(root)
+        main = outer[1:]
+
+        sf = _find_search_field(main)
+        if sf is None:
+            return {
+                "ok": False,
+                "error": "Search field not found",
+                "code": "SEARCH_FIELD_NOT_FOUND",
+            }
+
+        err = _ax_set_value(sf, text)
+        if err != kAXErrorSuccess:
+            return {
+                "ok": False,
+                "error": f"Failed to set filter value (err={err})",
+                "code": "SET_FILTER_FAILED",
+            }
+
+        time.sleep(0.3)
         return {"ok": True, "filter_text": text}
+
+    except (UIAError, TargetNotFoundError) as e:
+        return {"ok": False, "error": str(e), "code": getattr(e, "code", "ERROR")}
     except Exception as e:
         return {"ok": False, "error": str(e), "code": "FILTER_ERROR"}
 
 
+# ---------------------------------------------------------------------------
+# Not yet implemented on macOS
+# ---------------------------------------------------------------------------
 
 def open_reconcile(
     bridge: Any,
@@ -453,72 +655,32 @@ def open_reconcile(
     interest_date: str = "",
     timeout_ms: int = 5000,
 ) -> dict[str, Any]:
-    """Open reconcile dialog and enter statement details."""
+    """Open reconcile dialog. (macOS: not yet implemented.)"""
     return {
         "ok": False,
         "error": "Reconcile workflow not yet implemented for macOS",
-        "code": "NOT_IMPLEMENTED"
+        "code": "NOT_IMPLEMENTED",
     }
 
 
-def list_sidebar_accounts(
-    bridge: Any,
-    resume: bool = False,
-    max_seconds: float = 720.0,
-    force_rescan: bool = False,
-) -> dict[str, Any]:
-    """Enumerate all accounts in Quicken sidebar."""
-    try:
-        # Use list_accounts as fallback
-        try:
-            accounts = list_accounts(bridge)
-            return {
-                "ok": True,
-                "accounts": accounts,
-                "scanned": len(accounts),
-                "total": len(accounts),
-                "done": True,
-                "cached": False,
-            }
-        except Exception:
-            return {
-                "ok": False,
-                "accounts": [],
-                "scanned": 0,
-                "total": 0,
-                "done": False,
-                "cached": False,
-                "error": "Failed to enumerate sidebar accounts",
-            }
-    except Exception as e:
-        return {"ok": False, "error": str(e), "code": "SIDEBAR_ENUM_ERROR"}
-
-
-def read_screen_text(
-    bridge: Any,
-    *,
-    region: str = "",
-) -> dict[str, Any]:
-    """Capture text from screen region using macOS OCR."""
+def read_screen_text(bridge: Any, *, region: str = "") -> dict[str, Any]:
+    """Capture text via macOS OCR. (Not yet implemented.)"""
     return {
         "ok": False,
         "lines": [],
         "text": "",
-        "error": "OCR not yet implemented for macOS",
-        "code": "NOT_IMPLEMENTED"
+        "error": "Screen OCR not yet implemented for macOS",
+        "code": "NOT_IMPLEMENTED",
     }
 
 
-def read_transaction_splits(
-    bridge: Any,
-    row_index: int | None = None,
-) -> dict[str, Any]:
-    """Read split dialog details for a transaction."""
+def read_transaction_splits(bridge: Any, row_index: int | None = None) -> dict[str, Any]:
+    """Read split dialog details. (Not yet implemented.)"""
     return {
         "ok": False,
         "splits": [],
         "error": "Split dialog reading not yet implemented for macOS",
-        "code": "NOT_IMPLEMENTED"
+        "code": "NOT_IMPLEMENTED",
     }
 
 
@@ -530,22 +692,18 @@ def edit_split_line(
     amount: str | None = None,
     tag: str | None = None,
 ) -> dict[str, Any]:
-    """Edit a split line in the split dialog."""
+    """Edit a split line. (Not yet implemented.)"""
     return {
         "ok": False,
         "error": "Split editing not yet implemented for macOS",
-        "code": "NOT_IMPLEMENTED"
+        "code": "NOT_IMPLEMENTED",
     }
 
 
-def close_split_dialog(
-    bridge: Any,
-    save: bool = True,
-) -> dict[str, Any]:
-    """Close split dialog with save or cancel."""
+def close_split_dialog(bridge: Any, save: bool = True) -> dict[str, Any]:
+    """Close split dialog. (Not yet implemented.)"""
     return {
         "ok": False,
         "error": "Split dialog close not yet implemented for macOS",
-        "code": "NOT_IMPLEMENTED"
+        "code": "NOT_IMPLEMENTED",
     }
-
