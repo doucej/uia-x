@@ -553,9 +553,12 @@ def uia_find_all(
             "has_actions": has_actions,
             "named_only": named_only,
             "root": target or None,
-            # Pass a stop-after hint so the Win32 fast path can early-exit via
-            # EnumChildWindows returning False.  limit=0 means "no cap".
-            "limit": (limit + offset) if limit > 0 else 0,
+            # When name_contains is set, we must scan the full window before
+            # filtering — capping early would miss matching elements that appear
+            # after the first `limit` interactive controls in the tree.
+            # Without a text filter, pass limit+offset so the Win32 fast path
+            # can early-exit after collecting enough candidates.
+            "limit": 0 if name_contains else ((limit + offset) if limit > 0 else 0),
         })
         # Server-side name search
         if name_contains:
