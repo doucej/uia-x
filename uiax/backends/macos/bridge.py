@@ -427,6 +427,7 @@ class MacOSBridge(UIABridge):
         y: int,
         double: bool = False,
         button: str = "left",
+        force_sendinput: bool = False,
     ) -> None:
         mouse_click_quartz(x, y, double=double, button=button)
 

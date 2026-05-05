@@ -41,6 +41,12 @@ scripts/test_ocr_tool.py
 
 # Logs (may contain window titles / account names)
 logs/*.log
+logs/*.pid
+
+# Server I/O captures and test output artifacts
+server_out.txt
+server_err.txt
+test_output.txt
 
 # OS
 Thumbs.db

@@ -82,29 +82,37 @@ def _get_bridge_executor() -> concurrent.futures.ThreadPoolExecutor:
 
 # Patch FastMCP so sync tool functions run in the bridge thread pool instead
 # of blocking the asyncio event loop.
-from mcp.server.fastmcp.utilities.func_metadata import FuncMetadata as _FuncMetadata  # noqa: E402
+try:
+    from mcp.server.fastmcp.utilities.func_metadata import FuncMetadata as _FuncMetadata  # noqa: E402
 
+    _original_call_fn = _FuncMetadata.call_fn_with_arg_validation
 
-async def _threaded_call_fn(
-    self,
-    fn,
-    fn_is_async: bool,
-    arguments_to_validate: dict,
-    arguments_to_pass_directly: dict | None,
-):
-    """Run sync MCP tools in the bridge thread pool (avoids event-loop blocking)."""
-    arguments_pre_parsed = self.pre_parse_json(arguments_to_validate)
-    arguments_parsed_model = self.arg_model.model_validate(arguments_pre_parsed)
-    arguments_parsed_dict = arguments_parsed_model.model_dump_one_level()
-    arguments_parsed_dict |= arguments_to_pass_directly or {}
-    if fn_is_async:
-        return await fn(**arguments_parsed_dict)
-    loop = asyncio.get_running_loop()
-    wrapped = functools.partial(fn, **arguments_parsed_dict)
-    return await loop.run_in_executor(_get_bridge_executor(), wrapped)
+    async def _threaded_call_fn(
+        self,
+        fn,
+        fn_is_async: bool,
+        arguments_to_validate: dict,
+        arguments_to_pass_directly: dict | None,
+    ):
+        """Run sync MCP tools in the bridge thread pool (avoids event-loop blocking)."""
+        arguments_pre_parsed = self.pre_parse_json(arguments_to_validate)
+        arguments_parsed_model = self.arg_model.model_validate(arguments_pre_parsed)
+        arguments_parsed_dict = arguments_parsed_model.model_dump_one_level()
+        arguments_parsed_dict |= arguments_to_pass_directly or {}
+        if fn_is_async:
+            return await fn(**arguments_parsed_dict)
+        loop = asyncio.get_running_loop()
+        wrapped = functools.partial(fn, **arguments_parsed_dict)
+        return await loop.run_in_executor(_get_bridge_executor(), wrapped)
 
-
-_FuncMetadata.call_fn_with_arg_validation = _threaded_call_fn
+    _FuncMetadata.call_fn_with_arg_validation = _threaded_call_fn
+except Exception as _patch_err:  # noqa: BLE001
+    import warnings as _w
+    _w.warn(
+        f"uiax: FastMCP thread-pool patch failed ({_patch_err}); "
+        "sync tools will run on the asyncio event loop (may block).",
+        stacklevel=1,
+    )
 
 # ---------------------------------------------------------------------------
 # Server instantiation
@@ -184,12 +192,31 @@ def _get_integrity_level(pid: int) -> int | None:
         if not advapi32.OpenProcessToken(h_proc, 0x20008, ctypes.byref(tok)):
             kernel32.CloseHandle(h_proc)
             return None
-        buf = ctypes.create_string_buffer(64)
-        size = wt.DWORD()
-        advapi32.GetTokenInformation(tok, 25, buf, len(buf), ctypes.byref(size))
-        # TOKEN_MANDATORY_LABEL: first 8 bytes = SID pointer (64-bit)
-        sid_ptr = struct.unpack_from("<Q", buf.raw, 0)[0]
-        if not sid_ptr:
+        # Two-call pattern: first call returns the required buffer size.
+        size = wt.DWORD(0)
+        advapi32.GetTokenInformation(tok, 25, None, 0, ctypes.byref(size))
+        required = size.value
+        if not required:
+            kernel32.CloseHandle(tok)
+            kernel32.CloseHandle(h_proc)
+            return None
+        buf = ctypes.create_string_buffer(required)
+        if not advapi32.GetTokenInformation(tok, 25, buf, required, ctypes.byref(size)):
+            kernel32.CloseHandle(tok)
+            kernel32.CloseHandle(h_proc)
+            return None
+        # TOKEN_MANDATORY_LABEL: first field is SID_AND_ATTRIBUTES.Sid (PSID).
+        # On 64-bit this is an 8-byte pointer; on 32-bit it is 4 bytes.
+        ptr_size = ctypes.sizeof(ctypes.c_void_p)
+        if required < ptr_size + 1:
+            kernel32.CloseHandle(tok)
+            kernel32.CloseHandle(h_proc)
+            return None
+        fmt = "<Q" if ptr_size == 8 else "<I"
+        sid_ptr = struct.unpack_from(fmt, buf.raw, 0)[0]
+        # Verify the pointer lies within the buffer (SID is embedded inline).
+        buf_start = ctypes.addressof(buf)
+        if not sid_ptr or not (buf_start <= sid_ptr < buf_start + required):
             kernel32.CloseHandle(tok)
             kernel32.CloseHandle(h_proc)
             return None

@@ -289,7 +289,7 @@ class RealProcessManager(ProcessManager):
                 (w.rect.get("right", 0) - w.rect.get("left", 0))
                 * (w.rect.get("bottom", 0) - w.rect.get("top", 0))
             )
-            is_shell = w.class_name.lower().rstrip("class") in _SHELL_CLASSES
+            is_shell = w.class_name.lower().removesuffix("class") in _SHELL_CLASSES
             return (-pq, 0 if w.visible else 1, 1 if is_shell else 0, -area)
 
         matches.sort(key=_rank)
@@ -298,7 +298,6 @@ class RealProcessManager(ProcessManager):
 
 
 # ---------------------------------------------------------------------------
-# Mock implementation
 # ---------------------------------------------------------------------------
 
 
@@ -369,7 +368,7 @@ class MockProcessManager(ProcessManager):
                 (w.rect.get("right", 0) - w.rect.get("left", 0))
                 * (w.rect.get("bottom", 0) - w.rect.get("top", 0))
             )
-            is_shell = w.class_name.lower().rstrip("class") in _SHELL_CLASSES
+            is_shell = w.class_name.lower().removesuffix("class") in _SHELL_CLASSES
             return (-pq, 0 if w.visible else 1, 1 if is_shell else 0, -area)
 
         matches.sort(key=_rank)

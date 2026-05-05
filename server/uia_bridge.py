@@ -174,6 +174,17 @@ class UIABridge(ABC):
     # Win32-specific extensions (not abstract – raise on non-Windows backends)
     # -----------------------------------------------------------------------
 
+    def check_state(self) -> dict[str, Any]:
+        """Return current window state (title, etc.) for settle detection.
+
+        Returns
+        -------
+        dict
+            ``{"title": str}`` — at minimum the current window title.
+            Backends that cannot determine the title return ``{}``.
+        """
+        return {}
+
     def send_win32_message(
         self,
         hwnd: int,

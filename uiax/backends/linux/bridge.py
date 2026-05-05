@@ -493,6 +493,7 @@ class LinuxBridge(UIABridge):
         y: int,
         double: bool = False,
         button: str = "left",
+        force_sendinput: bool = False,
     ) -> None:
         mouse_click_atspi(x, y, double=double, button=button)
 

@@ -1377,6 +1377,19 @@ class WinUIABridge(UIABridge):
         else:
             mouse.click(button=button, coords=coords)
 
+    def check_state(self) -> dict[str, Any]:
+        """Return current window state for settle detection."""
+        pm = get_process_manager()
+        if not pm.attached:
+            return {}
+        try:
+            import ctypes  # noqa: PLC0415
+            buf = ctypes.create_unicode_buffer(512)
+            ctypes.windll.user32.GetWindowTextW(pm.attached.hwnd, buf, 512)
+            return {"title": buf.value}
+        except Exception:  # noqa: BLE001
+            return {}
+
     def send_win32_message(
         self,
         hwnd: int,
