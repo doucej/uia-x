@@ -2751,6 +2751,8 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
             f"'{current or 'unknown'}' afterward.  Use existing_tab "
             f"or retry."
         )
+        result["should_retry"] = True
+        result["retry_after_ms"] = 1500
         return result
 
     # ------------------------------------------------------------------
@@ -3443,18 +3445,26 @@ def read_register_state(bridge: Any) -> dict[str, Any]:
 
     # Find the active QWMDI and scope child enumeration to it.
     # Retry briefly — after navigation the MDI may still be loading.
-    # Investment accounts can take 2-8s, so we retry more aggressively.
+    # Cap at 4 retries (4s) so MCP clients with short timeouts don't
+    # get -32001.  If still not found, return a retryable error instead
+    # of blocking the thread for 8 seconds.
     mdi_h = _find_active_mdi(root_hwnd)
     if mdi_h is None:
         import time as _time  # noqa: PLC0415
-        for _retry in range(8):
+        for _retry in range(4):
             _time.sleep(1.0)
             _dismiss_modal_dialogs(root_hwnd)
             mdi_h = _find_active_mdi(root_hwnd)
             if mdi_h is not None:
                 break
     if mdi_h is None:
-        raise UIAError("No active QWMDI found.", code="REGISTER_NOT_FOUND")
+        return {
+            "ok": False,
+            "error": "Quicken view is still loading (no active QWMDI found).",
+            "code": "VIEW_LOADING",
+            "should_retry": True,
+            "retry_after_ms": 2000,
+        }
 
     mdi_children: list[tuple[int, str, str]] = []
     EnumCB = ctypes.WINFUNCTYPE(
@@ -4469,6 +4479,11 @@ def set_register_filter(bridge: Any, text: str) -> dict[str, Any]:
             _buf_pre = ctypes.create_unicode_buffer(prefix)
             _send_msg_timeout(filter_h, WM_SETTEXT, 0,
                               ctypes.addressof(_buf_pre), timeout_ms=2000)
+            # WM_SETTEXT resets the caret to position 0 in standard edit
+            # controls.  Without this EM_SETSEL, WM_CHAR inserts last_ch
+            # *before* the prefix (e.g. "Venmo" → "oVenm").
+            _send_msg_timeout(filter_h, EM_SETSEL, len(prefix), len(prefix),
+                              timeout_ms=500)
         else:
             _send_msg_timeout(filter_h, WM_SETTEXT, 0, 0, timeout_ms=2000)
         _send_msg_timeout(filter_h, WM_CHAR, ord(last_ch), 1, timeout_ms=2000)

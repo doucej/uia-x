@@ -96,7 +96,11 @@ def register(
             "Read the current state of the visible transaction register: account "
             "name, balance total, transaction count, whether a reconcile is active, "
             "and the current search/filter text.  Does not require access to "
-            "individual transaction rows.  Windows-only.  [Quicken skill]"
+            "individual transaction rows.  "
+            "If the view is still loading after navigation (e.g. investment accounts "
+            "take longer), returns {ok:false, code:'VIEW_LOADING', should_retry:true, "
+            "retry_after_ms:2000} — wait retry_after_ms then call again.  "
+            "Windows-only.  [Quicken skill]"
         ),
     )
     def read_register_state_tool(
