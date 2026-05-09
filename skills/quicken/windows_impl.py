@@ -4207,14 +4207,19 @@ def read_register_rows(
         # doesn't always match the number of tabbable rows).
         effective_max = max_rows
 
-        # Ctrl+Home → first row (typically the new-transaction entry row)
-        _nav_key = 0x28  # default: Down navigation (banking + loan-top)
-        _ctrl(0x24)
+        # Start from the BOTTOM of the register (Ctrl+End) so that we always
+        # read the MOST RECENT transactions first, regardless of any active date
+        # filter.  Ctrl+Home would jump to the absolute beginning (oldest data)
+        # even when the register is filtered to show only recent transactions.
+        # Default navigation is Up (newest→older).
+        _nav_key = 0x26  # default: Up navigation (newest → older)
+        _ctrl(0x23)      # Ctrl+End
         _time.sleep(0.5)
 
-        # Attempt to read the first row.  If it's the blank new-transaction
-        # row we use it to learn the full column layout (all money columns
-        # visible), then skip to the first real data row.
+        # Attempt to read the first row.  After Ctrl+End we expect to land on
+        # the blank new-transaction entry row (at the bottom of the register).
+        # If we DO land on a blank, detect it, skip Down (which stays on blank),
+        # then press Up to find the newest real transaction.
         first_row = _read_one_row()
         if first_row is None:
             # Blank row — learn column layout if not already populated
@@ -4224,21 +4229,22 @@ def read_register_rows(
                 _press(0x1B, 0.2)
                 _learn_columns_from_row()
             _press(0x1B, 0.2)
-            _press(0x28, 0.3)  # Down → first data row attempt
+            _press(0x28, 0.3)  # Down — expected to stay on blank (we're at bottom)
             _time.sleep(0.3)
-            # Loan/amortization registers place the new-transaction form at the
-            # bottom of the list; Down stays on the blank form instead of
-            # advancing.  Detect this by peeking at the row after Down.
             _nav_peek = _read_one_row()
             if _nav_peek is None:
-                # Down kept us on the blank form → switch to Up (newest→oldest)
+                # Down kept us on the blank form (as expected for bottom-blank
+                # registers) → go Up to reach the newest real transaction.
                 _press(0x1B, 0.2)
-                _press(0x26, 0.3)  # Up → first real row (most recent)
+                _press(0x26, 0.3)  # Up → newest real row
                 _time.sleep(0.3)
-                _nav_key = 0x26  # use Up for all subsequent row advances
+                _nav_key = 0x26  # Up navigation confirmed
             else:
-                # Down successfully advanced to a real row; treat it as first_row
+                # Down found a real row (unusual — some register types have
+                # blank at the top, with real rows below).  Treat it as first_row
+                # and continue reading Down.
                 first_row = _nav_peek
+                _nav_key = 0x28  # switch to Down for this register type
 
         prev_row_sig: tuple[str, ...] | None = None
         dup_count = 0
@@ -4259,12 +4265,11 @@ def read_register_rows(
             # mode.  For non-split rows the second Escape is a no-op.
             _press(0x1B, 0.2)
             _press(0x1B, 0.1)
-            _press(_nav_key, 0.3)  # Down or Up depending on register type
+            _press(_nav_key, 0.3)  # Up (or Down for bottom-blank registers)
             _time.sleep(0.3)
 
         # Track whether we've already attempted to flip navigation direction.
-        # Handles the case where Ctrl+Home lands on the newest (last) real row
-        # and Down immediately hits the blank new-transaction row.
+        # Kept for safety but should not trigger with Ctrl+End + Up nav.
         _direction_flipped = False
 
         for _loop_i in range(effective_max - start_offset):
@@ -4276,9 +4281,10 @@ def read_register_rows(
                 break  # hard timeout
             row = _read_one_row()
             if row is None:
-                # First hit on a blank row while using Down → this means
-                # Ctrl+Home landed on the newest real row and Down falls into the
-                # blank new-transaction form at the bottom.  Flip to Up mode.
+                # Blank row encountered.  With Up navigation this normally means
+                # we've reached the blank new-transaction row at the top (done).
+                # The Down-direction flip below is retained for unusual register
+                # layouts where blank is at bottom and Down was chosen above.
                 if _loop_i == 0 and _nav_key == 0x28 and not _direction_flipped:
                     _direction_flipped = True
                     _nav_key = 0x26
@@ -5180,8 +5186,18 @@ def _parse_split_qwindlg(
     result: list[dict[str, Any]] = []
     for i in range(item_count):
         row_rc = ctypes.wintypes.RECT()
-        res = _send_msg_timeout(lb_hwnd, LB_GETITEMRECT, i, ctypes.addressof(row_rc))
-        if res is None or res < 0:
+        # Retry LB_GETITEMRECT — after a previous write, Quicken's UI thread may
+        # be busy with QuickFill for up to a few seconds, causing SMTO_ABORTIFHUNG
+        # to abort early.  Retry up to 5 × with 3 s timeout each (15 s total budget).
+        res = None
+        for _attempt in range(5):
+            res = _send_msg_timeout(lb_hwnd, LB_GETITEMRECT, i, ctypes.addressof(row_rc),
+                                    timeout_ms=3000)
+            if res is not None:
+                break
+            time.sleep(0.3)
+        # LB_GETITEMRECT returns LB_ERR (-1) as unsigned DWORD → 0xFFFFFFFF
+        if res is None or res > 0x7FFFFFFF:
             break
         row_mid_y = (row_rc.top + row_rc.bottom) // 2
 
@@ -5222,6 +5238,10 @@ def _parse_split_qwindlg(
             "tag": tag,
             "memo": memo,
             "amount": amount,
+            # Cache the ListBox client-y so edit_split_line can click this row
+            # without calling LB_GETITEMRECT again (which can timeout when
+            # Quicken's UI thread is busy processing a previous write).
+            "client_y": row_mid_y,
         })
 
     return result
@@ -5603,17 +5623,34 @@ def edit_split_line(
     container = _split_state["container"]
     kind = _split_state.get("kind", "qwindlg")
 
-    # Re-parse to get fresh HWNDs and current row positions
-    if kind == "qwindlg":
-        rows = _parse_split_qwindlg(container)
-    else:
-        rows = _parse_split_qredits(
-            container,
-            exclude_hwnds=_split_state.get("exclude") if kind == "inline" else None,
-        )
+    # Validate container is still alive
+    if not ctypes.windll.user32.IsWindow(container):
+        _split_state.clear()
+        return {"ok": False, "error": "Split dialog was closed.", "code": "SPLIT_NOT_OPEN"}
 
-    if rows:
-        _split_state["rows"] = rows
+    # Use cached rows if HWNDs are still valid; re-parse only when stale.
+    # Re-parsing clicks through every row (slow + UI churn) so we avoid it
+    # for qwindlg dialogs when the cached HWNDs are still live windows.
+    cached_rows = _split_state.get("rows", [])
+    need_reparse = True
+    if kind == "qwindlg" and cached_rows and index < len(cached_rows):
+        r = cached_rows[index]
+        # Check that at least the category HWND is still a live window
+        if r.get("hwnd_category") and ctypes.windll.user32.IsWindow(r["hwnd_category"]):
+            need_reparse = False
+
+    if need_reparse:
+        if kind == "qwindlg":
+            rows = _parse_split_qwindlg(container)
+        else:
+            rows = _parse_split_qredits(
+                container,
+                exclude_hwnds=_split_state.get("exclude") if kind == "inline" else None,
+            )
+        if rows:
+            _split_state["rows"] = rows
+    else:
+        rows = cached_rows
 
     if index < 0 or index >= len(rows):
         return {
@@ -5652,15 +5689,27 @@ def edit_split_line(
         memo_x = max(1, int(lb_w * 0.70))
         amt_x  = max(1, int(lb_w * 0.88))
 
-        LB_GETITEMRECT = 0x0198
         WM_LBUTTONDOWN = 0x0201
         WM_LBUTTONUP   = 0x0202
 
-        row_rc = ctypes.wintypes.RECT()
-        res = _send_msg_timeout(lb_hwnd, LB_GETITEMRECT, index, ctypes.addressof(row_rc))
-        if res is None or res < 0:
-            return {"ok": False, "error": "Could not get row rect", "code": "ROW_RECT_FAIL"}
-        row_mid_y = (row_rc.top + row_rc.bottom) // 2
+        # Use the client_y cached during the parse — avoids calling LB_GETITEMRECT
+        # again on a potentially-busy UI thread (which returns None/timeout after a
+        # previous write, producing ROW_RECT_FAIL on rows 1+).
+        # Fall back to LB_GETITEMRECT only if the cache is missing (old state).
+        cached_y = row.get("client_y")
+        if cached_y is not None:
+            row_mid_y = cached_y
+        else:
+            LB_GETITEMRECT = 0x0198
+            row_rc = ctypes.wintypes.RECT()
+            res = _send_msg_timeout(lb_hwnd, LB_GETITEMRECT, index, ctypes.addressof(row_rc))
+            if res is None:
+                return {"ok": False, "error": "Could not get row rect (timeout)", "code": "ROW_RECT_FAIL"}
+            # LB_GETITEMRECT returns LB_ERR (-1) as an unsigned DWORD (0xFFFFFFFF);
+            # treat anything > 0x7FFFFFFF as an error.
+            if res > 0x7FFFFFFF:
+                return {"ok": False, "error": "Could not get row rect (out of range)", "code": "ROW_RECT_FAIL"}
+            row_mid_y = (row_rc.top + row_rc.bottom) // 2
 
         def _click_col(col_x: int) -> None:
             lp = (row_mid_y << 16) | (col_x & 0xFFFF)
@@ -5761,6 +5810,30 @@ def edit_split_line(
         )
         if updated_rows:
             _split_state["rows"] = updated_rows
+    else:
+        # For qwindlg: update the cached row with what we just wrote so subsequent
+        # calls with different indices don't need a re-parse.
+        if index < len(_split_state.get("rows", [])):
+            r = _split_state["rows"][index]
+            if category is not None:
+                r["category"] = category
+            if amount is not None:
+                r["amount"] = amount
+            if memo is not None:
+                r["memo"] = memo
+            if tag is not None:
+                r["tag"] = tag
+
+        # Drain: wait for Quicken's UI thread to finish QuickFill / autocomplete
+        # processing so the ListBox is responsive for the next edit call.
+        # Poll LB_GETCOUNT (ultra-cheap read-only message) until it returns promptly.
+        LB_GETCOUNT = 0x018B
+        if lb_hwnd:
+            _deadline = time.time() + 4.0
+            while time.time() < _deadline:
+                if _send_msg_timeout(lb_hwnd, LB_GETCOUNT, 0, 0, timeout_ms=200) is not None:
+                    break
+                time.sleep(0.1)
 
     return {"ok": True, "index": index, "written": written, "verified": verified}
 
