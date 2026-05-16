@@ -4492,6 +4492,10 @@ def set_register_filter(bridge: Any, text: str) -> dict[str, Any]:
                               timeout_ms=500)
         else:
             _send_msg_timeout(filter_h, WM_SETTEXT, 0, 0, timeout_ms=2000)
+        # Keep caret at the end of the prefix; otherwise WM_CHAR can insert at
+        # position 0 and produce transposed text (e.g. "INTEL" -> "LINTE").
+        _send_msg_timeout(filter_h, EM_SETSEL, len(prefix), len(prefix),
+                          timeout_ms=500)
         _send_msg_timeout(filter_h, WM_CHAR, ord(last_ch), 1, timeout_ms=2000)
     else:
         # Clear: select all then Backspace fires EN_CHANGE with empty text
