@@ -4061,6 +4061,15 @@ def read_register_rows(
         """
         date_h, date_cls, date_txt, _dx, _dy, _dw = _get_focused()
         if date_cls.lower() != "qredit":
+            # Some Quicken builds keep focus on the TxList container after
+            # navigation. Enter/F2 typically switches into row-edit mode so the
+            # first editable QREdit (date/payee) becomes focused.
+            _press(0x0D, 0.15)  # Enter
+            date_h, date_cls, date_txt, _dx, _dy, _dw = _get_focused()
+            if date_cls.lower() != "qredit":
+                _press(0x71, 0.15)  # F2
+                date_h, date_cls, date_txt, _dx, _dy, _dw = _get_focused()
+        if date_cls.lower() != "qredit":
             return None
 
         # In loan/amortization registers, pressing Down can land on the balance
@@ -4246,6 +4255,20 @@ def read_register_rows(
                 first_row = _nav_peek
                 _nav_key = 0x28  # switch to Down for this register type
 
+        # Fallback: some files/registers keep focus in a non-row area after
+        # Ctrl+End navigation. Retry with legacy Ctrl+Home + Down path.
+        if first_row is None:
+            _press(0x1B, 0.2)
+            _nav_key = 0x28  # Down
+            _ctrl(0x24)      # Ctrl+Home
+            _time.sleep(0.5)
+            first_row = _read_one_row()
+            if first_row is None:
+                _press(0x1B, 0.2)
+                _press(0x28, 0.3)  # Down → first data row attempt
+                _time.sleep(0.3)
+                first_row = _read_one_row()
+
         prev_row_sig: tuple[str, ...] | None = None
         dup_count = 0
         rows: list[dict[str, str]] = []
@@ -4370,10 +4393,11 @@ def set_register_filter(bridge: Any, text: str) -> dict[str, Any]:
     # Dismiss any modal dialogs before interacting
     _dismiss_modal_dialogs(root_hwnd)
 
-    # Consume any pending navigate hint so we can use the exact QWMDI hwnd
-    # that navigate_to_account stored — more reliable than title-matching.
+    # Copy any pending navigate hint so we can use the exact QWMDI hwnd that
+    # navigate_to_account stored — more reliable than title-matching.
+    # Keep _last_nav intact so immediate follow-up calls (read rows, select row,
+    # split tools) stay synchronized to the same account.
     _nav_hint = _last_nav.copy()
-    _last_nav.clear()
 
     # Determine expected account for post-filter verification.
     # Prefer _nav_hint["name"] (set by navigate_to_account just before this
@@ -5150,6 +5174,7 @@ def _parse_split_qwindlg(
     WM_LBUTTONDOWN = 0x0201
     WM_LBUTTONUP   = 0x0202
     LB_GETITEMRECT = 0x0198
+    LB_SETTOPINDEX = 0x0197
 
     def _click_lb_at(client_x: int, client_y: int) -> None:
         lp = (client_y << 16) | (client_x & 0xFFFF)
@@ -5189,6 +5214,12 @@ def _parse_split_qwindlg(
 
     result: list[dict[str, Any]] = []
     for i in range(item_count):
+        # Scroll each target row into view before reading its rect. Without this,
+        # off-screen rows can return stale/out-of-bounds coordinates and parse as
+        # duplicated lines from the previously visible row.
+        _send_msg_timeout(lb_hwnd, LB_SETTOPINDEX, i, 0, timeout_ms=3000)
+        time.sleep(0.05)
+
         row_rc = ctypes.wintypes.RECT()
         # Retry LB_GETITEMRECT — after a previous write, Quicken's UI thread may
         # be busy with QuickFill for up to a few seconds, causing SMTO_ABORTIFHUNG
@@ -5348,6 +5379,7 @@ def select_register_row(
         ``{"ok": True, "row_index": int, "lb_index": int}``
     """
     import ctypes  # noqa: PLC0415
+    import ctypes.wintypes  # noqa: PLC0415
     import time  # noqa: PLC0415
 
     from server.process_manager import get_process_manager  # noqa: PLC0415
@@ -5367,17 +5399,74 @@ def select_register_row(
             "code": "REGISTER_NOT_FOUND",
         }
 
-    # Real transactions start at LB item 1 (item 0 = blank new-entry row)
-    lb_index = row_index + 1
-    if not _click_txlist_row(txlist_h, lb_index):
+    if row_index < 0:
         return {
             "ok": False,
-            "error": f"Row index {row_index} out of range (lb_index={lb_index}).",
-            "code": "ROW_NOT_FOUND",
+            "error": f"Row index must be >= 0 (got {row_index}).",
+            "code": "ROW_INDEX_INVALID",
         }
 
-    time.sleep(0.3)
-    return {"ok": True, "row_index": row_index, "lb_index": lb_index}
+    # QWClass_TransactionList is owner-drawn and LB_GETITEMRECT is unreliable
+    # for this control in many Quicken views. Prefer deterministic keyboard
+    # positioning that matches read_register_rows traversal:
+    #   Ctrl+End -> blank row at bottom -> Up to newest real transaction.
+    user32 = ctypes.windll.user32
+    WM_KEYDOWN = 0x0100
+    WM_KEYUP = 0x0101
+    VK_ESCAPE = 0x1B
+    VK_UP = 0x26
+    VK_END = 0x23
+    VK_CONTROL = 0x11
+
+    tx_rc = ctypes.wintypes.RECT()
+    user32.GetWindowRect(txlist_h, ctypes.byref(tx_rc))
+    cx = (tx_rc.left + tx_rc.right) // 2
+    cy = (tx_rc.top + tx_rc.bottom) // 2
+    user32.SetForegroundWindow(root_hwnd)
+    time.sleep(0.05)
+    user32.SetCursorPos(cx, cy)
+    time.sleep(0.05)
+    user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
+    user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
+    time.sleep(0.2)
+
+    def _focused() -> int:
+        h = user32.GetFocus()
+        return h if h else txlist_h
+
+    def _press(vk: int, delay: float = 0.08) -> None:
+        h = _focused()
+        user32.PostMessageW(h, WM_KEYDOWN, vk, 0)
+        time.sleep(0.02)
+        user32.PostMessageW(h, WM_KEYUP, vk, 0)
+        time.sleep(delay)
+
+    def _ctrl(vk: int) -> None:
+        h = _focused()
+        user32.PostMessageW(h, WM_KEYDOWN, VK_CONTROL, 0)
+        time.sleep(0.02)
+        user32.PostMessageW(h, WM_KEYDOWN, vk, 0)
+        time.sleep(0.02)
+        user32.PostMessageW(h, WM_KEYUP, vk, 0)
+        time.sleep(0.02)
+        user32.PostMessageW(h, WM_KEYUP, VK_CONTROL, 0)
+        time.sleep(0.25)
+
+    # Stabilize edit state first, then position by index from newest row.
+    _press(VK_ESCAPE, 0.1)
+    _press(VK_ESCAPE, 0.1)
+    _ctrl(VK_END)
+    time.sleep(0.2)
+    for _ in range(row_index + 1):
+        _press(VK_UP, 0.08)
+    time.sleep(0.2)
+
+    return {
+        "ok": True,
+        "row_index": row_index,
+        "lb_index": row_index + 1,
+        "method": "keyboard",
+    }
 
 
 def read_transaction_splits(
