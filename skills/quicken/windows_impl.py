@@ -5845,9 +5845,15 @@ def edit_split_line(
                 time.sleep(0.01)
             time.sleep(0.1)
 
-            # Commit by clicking the amount column — numeric field means no
-            # autocomplete / "New Tag" dialog will appear.
-            _click_col(amt_x)
+            # Commit by transitioning to a *different* column so Quicken's
+            # ListBox handler deactivates the current edit (saving the typed
+            # value to the internal model) before activating the new column.
+            # • Non-amount fields: click amount (numeric → no autocomplete).
+            # • Amount field: click category (different column → triggers the
+            #   same save-on-transition; category click doesn't type text so
+            #   no QuickFill / "New Tag" dialog will appear).
+            commit_x = cat_x if col_x == amt_x else amt_x
+            _click_col(commit_x)
             time.sleep(0.25)
             # Dismiss any modal dialogs that snuck in (safety net)
             _dismiss_modal_dialogs(container, preserve_titles={"split transaction"})
