@@ -6064,6 +6064,76 @@ def close_split_dialog(
             _post_msg(target, 0x0101, vk, 0)
             time.sleep(0.4)
 
+    # After saving: handle any secondary "Adjust Transaction Total vs Split
+    # Total" dialog that Quicken shows when the split sum differs from the
+    # stored transaction amount.  We always prefer the button whose text
+    # contains "transaction" (i.e. "Adjust Transaction Total") so the
+    # register deposit/payment is updated to match the corrected split sum.
+    if save:
+        import ctypes.wintypes as _cwt  # noqa: PLC0415
+        _root_for_adj = _split_state.get("root", 0)
+        if _root_for_adj:
+            _ADJDLG_CLASSES = {"QWinDlg", "QWinPopup", "#32770"}
+            _WNDENUMPROC = ctypes.WINFUNCTYPE(
+                ctypes.c_bool, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int))
+            _adj_deadline = time.time() + 2.5
+            while time.time() < _adj_deadline:
+                time.sleep(0.12)
+                _adj_dlgs: list[int] = []
+
+                def _adj_dlg_cb(h: int, _: Any) -> bool:
+                    if (u32.IsWindowVisible(h)
+                            and u32.GetWindow(h, 4) == _root_for_adj):
+                        _cc = ctypes.create_unicode_buffer(32)
+                        u32.GetClassNameW(h, _cc, 32)
+                        if _cc.value in _ADJDLG_CLASSES:
+                            _adj_dlgs.append(h)
+                    return True
+
+                u32.EnumWindows(_WNDENUMPROC(_adj_dlg_cb), None)
+                if not _adj_dlgs:
+                    continue
+
+                for _adj_dlg in _adj_dlgs:
+                    _pref_btn: int = 0
+                    _any_btn: int = 0
+
+                    def _adj_btn_cb(h: int, _: Any) -> bool:
+                        nonlocal _pref_btn, _any_btn
+                        if not u32.IsWindowVisible(h):
+                            return True
+                        _bc = ctypes.create_unicode_buffer(32)
+                        u32.GetClassNameW(h, _bc, 32)
+                        if _bc.value.lower() not in {"button", "qc_button"}:
+                            return True
+                        _bt = ctypes.create_unicode_buffer(128)
+                        u32.GetWindowTextW(h, _bt, 128)
+                        _btxt = _bt.value.strip().lower()
+                        if "transaction" in _btxt and not _pref_btn:
+                            _pref_btn = h
+                        if _btxt and not _any_btn:
+                            _any_btn = h
+                        return True
+
+                    u32.EnumChildWindows(
+                        _adj_dlg, _WNDENUMPROC(_adj_btn_cb), None)
+                    _click_btn = _pref_btn or _any_btn
+                    if _click_btn:
+                        _cr = _cwt.RECT()
+                        u32.GetWindowRect(_click_btn, ctypes.byref(_cr))
+                        _bx = (_cr.left + _cr.right) // 2
+                        _by = (_cr.top + _cr.bottom) // 2
+                        u32.SetCursorPos(_bx, _by)
+                        time.sleep(0.06)
+                        u32.mouse_event(0x0002, 0, 0, 0, 0)   # MOUSEEVENTF_LEFTDOWN
+                        time.sleep(0.06)
+                        u32.mouse_event(0x0004, 0, 0, 0, 0)   # MOUSEEVENTF_LEFTUP
+                        time.sleep(0.35)
+                    else:
+                        u32.SendMessageW(_adj_dlg, 0x0010, 0, 0)  # WM_CLOSE
+                        time.sleep(0.2)
+                break  # handled at least one adjust dialog; stop polling
+
     import ctypes as _ctypes_check  # noqa: PLC0415
     _dialog_closed = not _ctypes_check.windll.user32.IsWindow(container)
     _split_state.clear()
