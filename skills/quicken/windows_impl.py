@@ -5822,6 +5822,21 @@ def edit_split_line(
             """
             if not hwnd or not lb_hwnd:
                 return
+
+            nonlocal row_mid_y  # noqa: PLW0640
+
+            # Scroll the target row to the top of the visible area so the
+            # client-y we click is predictable regardless of any scroll drift
+            # caused by QuickFill, autocomplete popups, or prior edits.
+            LB_SETTOPINDEX  = 0x0197
+            LB_GETTOPINDEX  = 0x018E
+            LB_GETITEMHEIGHT = 0x01A1
+            user32.PostMessageW(lb_hwnd, LB_SETTOPINDEX, index, 0)
+            time.sleep(0.08)
+            actual_top = _send_msg_timeout(lb_hwnd, LB_GETTOPINDEX, 0, 0) or 0
+            item_h = _send_msg_timeout(lb_hwnd, LB_GETITEMHEIGHT, 0, 0) or 13
+            row_mid_y = (index - actual_top) * item_h + item_h // 2
+
             _click_col(col_x)  # expose the Edit
             time.sleep(0.15)
 
