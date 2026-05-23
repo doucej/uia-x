@@ -5361,22 +5361,33 @@ def select_register_row(
 ) -> dict[str, Any]:
     """Select a specific transaction row in the visible register.
 
-    Uses ``LB_GETITEMRECT`` + a direct mouse click on the row's screen
-    rectangle — no keyboard input, no focus hijacking.
+    Uses keyboard navigation: detects whether the register is in ascending
+    layout (blank new-entry row at bottom) or descending layout (blank at
+    top, oldest at bottom), then navigates to the correct row.
 
-    The blank new-transaction row is always at ListBox item 0; *row_index*
-    0 maps to the **first real transaction** (ListBox item 1).
+    row_index 0 = most recent real transaction, 1 = second most recent, etc.
+
+    Layout detection
+    ----------------
+    After ``Ctrl+End``, the focused QREdit is probed for text:
+    - **Empty text** → ascending layout (blank row at bottom): navigate
+      with ``Up × (row_index + 1)`` from the blank row to count newest→older.
+    - **Non-empty text** → descending layout (blank at top, oldest at
+      bottom, as seen in Quicken's filtered register): navigate from the
+      **top** with ``Ctrl+Home → Down × (row_index + 1)`` to count
+      newest→older.
 
     Parameters
     ----------
     row_index : int
         0-based index into the visible transaction list, where 0 is the
-        first (most recent) real transaction.
+        most recent real transaction.
 
     Returns
     -------
     dict
-        ``{"ok": True, "row_index": int, "lb_index": int}``
+        ``{"ok": True, "row_index": int, "lb_index": int, "layout": str,
+           "method": str}``
     """
     import ctypes  # noqa: PLC0415
     import ctypes.wintypes  # noqa: PLC0415
@@ -5406,65 +5417,108 @@ def select_register_row(
             "code": "ROW_INDEX_INVALID",
         }
 
-    # QWClass_TransactionList is owner-drawn and LB_GETITEMRECT is unreliable
-    # for this control in many Quicken views. Prefer deterministic keyboard
-    # positioning that matches read_register_rows traversal:
-    #   Ctrl+End -> blank row at bottom -> Up to newest real transaction.
     user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
     WM_KEYDOWN = 0x0100
-    WM_KEYUP = 0x0101
-    VK_ESCAPE = 0x1B
-    VK_UP = 0x26
-    VK_END = 0x23
+    WM_KEYUP   = 0x0101
+    WM_GETTEXTLENGTH = 0x000E
+    VK_ESCAPE  = 0x1B
+    VK_UP      = 0x26
+    VK_DOWN    = 0x28
+    VK_HOME    = 0x24
+    VK_END     = 0x23
     VK_CONTROL = 0x11
 
-    tx_rc = ctypes.wintypes.RECT()
-    user32.GetWindowRect(txlist_h, ctypes.byref(tx_rc))
-    cx = (tx_rc.left + tx_rc.right) // 2
-    cy = (tx_rc.top + tx_rc.bottom) // 2
-    user32.SetForegroundWindow(root_hwnd)
-    time.sleep(0.05)
-    user32.SetCursorPos(cx, cy)
-    time.sleep(0.05)
-    user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
-    user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
-    time.sleep(0.2)
+    # Attach our thread to Quicken's so GetFocus() returns Quicken's focus.
+    our_tid = kernel32.GetCurrentThreadId()
+    qw_tid  = user32.GetWindowThreadProcessId(root_hwnd, None)
+    user32.AttachThreadInput(our_tid, qw_tid, True)
 
-    def _focused() -> int:
-        h = user32.GetFocus()
-        return h if h else txlist_h
-
-    def _press(vk: int, delay: float = 0.08) -> None:
-        h = _focused()
-        user32.PostMessageW(h, WM_KEYDOWN, vk, 0)
-        time.sleep(0.02)
-        user32.PostMessageW(h, WM_KEYUP, vk, 0)
-        time.sleep(delay)
-
-    def _ctrl(vk: int) -> None:
-        h = _focused()
-        user32.PostMessageW(h, WM_KEYDOWN, VK_CONTROL, 0)
-        time.sleep(0.02)
-        user32.PostMessageW(h, WM_KEYDOWN, vk, 0)
-        time.sleep(0.02)
-        user32.PostMessageW(h, WM_KEYUP, vk, 0)
-        time.sleep(0.02)
-        user32.PostMessageW(h, WM_KEYUP, VK_CONTROL, 0)
+    try:
+        # Click TxList center to ensure keyboard focus is inside the register.
+        tx_rc = ctypes.wintypes.RECT()
+        user32.GetWindowRect(txlist_h, ctypes.byref(tx_rc))
+        cx = (tx_rc.left + tx_rc.right) // 2
+        cy = (tx_rc.top + tx_rc.bottom) // 2
+        user32.SetForegroundWindow(root_hwnd)
+        time.sleep(0.05)
+        user32.SetCursorPos(cx, cy)
+        time.sleep(0.05)
+        user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
+        user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
         time.sleep(0.25)
 
-    # Stabilize edit state first, then position by index from newest row.
-    _press(VK_ESCAPE, 0.1)
-    _press(VK_ESCAPE, 0.1)
-    _ctrl(VK_END)
-    time.sleep(0.2)
-    for _ in range(row_index + 1):
-        _press(VK_UP, 0.08)
-    time.sleep(0.2)
+        def _focused() -> int:
+            h = user32.GetFocus()
+            return h if h else txlist_h
+
+        def _press(vk: int, delay: float = 0.08) -> None:
+            h = _focused()
+            user32.PostMessageW(h, WM_KEYDOWN, vk, 0)
+            time.sleep(0.02)
+            user32.PostMessageW(h, WM_KEYUP, vk, 0)
+            time.sleep(delay)
+
+        def _ctrl(vk: int) -> None:
+            h = _focused()
+            user32.PostMessageW(h, WM_KEYDOWN, VK_CONTROL, 0)
+            time.sleep(0.02)
+            user32.PostMessageW(h, WM_KEYDOWN, vk, 0)
+            time.sleep(0.02)
+            user32.PostMessageW(h, WM_KEYUP, vk, 0)
+            time.sleep(0.02)
+            user32.PostMessageW(h, WM_KEYUP, VK_CONTROL, 0)
+            time.sleep(0.25)
+
+        # Exit any active row-edit mode.
+        _press(VK_ESCAPE, 0.1)
+        _press(VK_ESCAPE, 0.1)
+
+        # ── Layout detection ─────────────────────────────────────────
+        # Send Ctrl+End and probe the now-focused QREdit for text length.
+        # An empty control = blank new-entry row (ascending layout, blank
+        # at bottom).  A non-empty control = oldest real transaction
+        # (descending layout, blank at top).
+        _ctrl(VK_END)
+        time.sleep(0.3)
+        probe_h = user32.GetFocus()
+        probe_tlen = (
+            user32.SendMessageW(probe_h, WM_GETTEXTLENGTH, 0, 0)
+            if probe_h else 0
+        )
+        descending_layout = (probe_tlen > 0)
+
+        if descending_layout:
+            # Descending layout: blank new-entry is at the TOP, oldest real
+            # row is at the bottom (where Ctrl+End landed).
+            # Navigate: Ctrl+Home → blank → Down×(row_index+1) → target row.
+            # Use 0.15s between Down presses — Quicken's TxList needs more
+            # time to commit each row navigation than the Up-based path.
+            _press(VK_ESCAPE, 0.12)
+            _press(VK_ESCAPE, 0.12)
+            _ctrl(VK_HOME)
+            time.sleep(0.35)  # let TxList settle after navigating to top
+            for _ in range(row_index + 1):
+                _press(VK_DOWN, 0.15)
+            layout = "descending"
+        else:
+            # Ascending layout: blank new-entry is at the BOTTOM (where
+            # Ctrl+End landed).  Navigate: Up×(row_index+1) to reach the
+            # (row_index)th real row counting from the newest.
+            for _ in range(row_index + 1):
+                _press(VK_UP, 0.10)
+            layout = "ascending"
+
+        time.sleep(0.2)
+
+    finally:
+        user32.AttachThreadInput(our_tid, qw_tid, False)
 
     return {
         "ok": True,
         "row_index": row_index,
         "lb_index": row_index + 1,
+        "layout": layout,
         "method": "keyboard",
     }
 
