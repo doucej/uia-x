@@ -55,7 +55,30 @@ from server.process_manager import (
 # single-threaded ThreadPoolExecutor.  max_workers=1 satisfies COM's
 # Single-Threaded Apartment requirement: all pywinauto objects are created and
 # used inside the same thread.
+#
+# Self-healing on hung calls
+# --------------------------
+# When a Win32/UIA call hangs (e.g. Quicken in a modal state), run_in_executor
+# cannot be interrupted — the thread stays blocked.  With max_workers=1 every
+# subsequent tool call queues behind the stuck thread, making the server appear
+# frozen.  We fix this with a two-layer defence:
+#
+#   1. asyncio.wait_for timeout (UIAX_TOOL_TIMEOUT, default 60 s): the asyncio
+#      side gives up waiting and returns a timeout error to the MCP client.
+#
+#   2. Executor + bridge reset: once we give up, we abandon the stuck executor
+#      and null out _bridge so the next call gets a fresh COM thread and fresh
+#      bridge state.  The old thread eventually completes or the process dies;
+#      its result is silently discarded.
+#
+# The client will receive ok=false / code=TOOL_TIMEOUT and should retry after
+# calling select_window again (bridge was reset).
 # ---------------------------------------------------------------------------
+
+# Timeout in seconds for a single synchronous tool call.  Override with the
+# UIAX_TOOL_TIMEOUT environment variable.
+_BRIDGE_TOOL_TIMEOUT: float = float(os.environ.get("UIAX_TOOL_TIMEOUT", "60"))
+
 
 def _init_bridge_thread() -> None:
     """Initialise COM for the bridge worker thread (Windows only, no-op elsewhere)."""
@@ -80,6 +103,42 @@ def _get_bridge_executor() -> concurrent.futures.ThreadPoolExecutor:
     return _bridge_executor
 
 
+def _reset_bridge_executor() -> None:
+    """Abandon the current bridge executor and bridge state.
+
+    Called after a tool call times out or when the MCP client cancels a
+    request while the bridge thread is still blocked.  The old thread
+    continues running in the background (we cannot forcibly kill it), but
+    subsequent calls get a fresh executor with a new COM-initialised thread
+    and a freshly-constructed bridge.
+
+    After this call the next tool invocation will behave as if the server
+    just started: ``select_window`` must be called again before any UIA
+    operations.
+    """
+    global _bridge_executor, _bridge
+    import sys as _sys  # noqa: PLC0415
+    old_exec = _bridge_executor
+    _bridge_executor = None
+    _bridge = None
+    if old_exec is not None:
+        try:
+            # cancel_futures=True (Python 3.9+) cancels queued-but-not-started
+            # futures; the *running* future (the stuck thread) cannot be
+            # cancelled but shutdown(wait=False) returns immediately.
+            old_exec.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            # Python < 3.9 does not support cancel_futures
+            old_exec.shutdown(wait=False)
+        except Exception:  # noqa: BLE001
+            pass
+    print(
+        "[uiax] bridge executor reset — stuck thread abandoned; "
+        "call select_window to reattach",
+        file=_sys.stderr,
+    )
+
+
 # Patch FastMCP so sync tool functions run in the bridge thread pool instead
 # of blocking the asyncio event loop.
 try:
@@ -94,7 +153,13 @@ try:
         arguments_to_validate: dict,
         arguments_to_pass_directly: dict | None,
     ):
-        """Run sync MCP tools in the bridge thread pool (avoids event-loop blocking)."""
+        """Run sync MCP tools in the bridge thread pool (avoids event-loop blocking).
+
+        Wraps run_in_executor with asyncio.wait_for(_BRIDGE_TOOL_TIMEOUT).  On
+        timeout (or MCP-client cancellation while the thread is still running)
+        the executor and bridge are reset so subsequent requests are not stuck
+        waiting for the hung thread.
+        """
         arguments_pre_parsed = self.pre_parse_json(arguments_to_validate)
         arguments_parsed_model = self.arg_model.model_validate(arguments_pre_parsed)
         arguments_parsed_dict = arguments_parsed_model.model_dump_one_level()
@@ -103,7 +168,29 @@ try:
             return await fn(**arguments_parsed_dict)
         loop = asyncio.get_running_loop()
         wrapped = functools.partial(fn, **arguments_parsed_dict)
-        return await loop.run_in_executor(_get_bridge_executor(), wrapped)
+        fut = loop.run_in_executor(_get_bridge_executor(), wrapped)
+        try:
+            return await asyncio.wait_for(asyncio.shield(fut), timeout=_BRIDGE_TOOL_TIMEOUT)
+        except asyncio.TimeoutError:
+            # Bridge thread is still running but we've given up waiting.
+            # Reset so subsequent calls don't queue behind the stuck thread.
+            _reset_bridge_executor()
+            return {
+                "ok": False,
+                "error": (
+                    f"Tool call timed out after {_BRIDGE_TOOL_TIMEOUT:.0f}s — "
+                    "the bridge thread was hung and has been abandoned. "
+                    "Call select_window to reattach, then retry."
+                ),
+                "code": "TOOL_TIMEOUT",
+            }
+        except asyncio.CancelledError:
+            # MCP client sent CancelledNotification; the thread may still be
+            # running.  Reset the executor so the next request doesn't queue
+            # behind the stuck thread, then re-raise so the MCP framework can
+            # send its own cancellation response.
+            _reset_bridge_executor()
+            raise
 
     _FuncMetadata.call_fn_with_arg_validation = _threaded_call_fn
 except Exception as _patch_err:  # noqa: BLE001
