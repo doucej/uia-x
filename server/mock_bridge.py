@@ -185,11 +185,14 @@ class MockUIABridge(UIABridge):
             raise PatternNotSupportedError("Invoke", element.name)
         element.invoke()
 
-    def set_value(self, target: dict[str, Any], value: str) -> None:
+    def set_value(self, target: dict[str, Any], value: str) -> dict[str, Any]:
         element = self._find(target)
         if not element.value_settable:
             raise PatternNotSupportedError("Value", element.name)
         element.set_value(value)
+        rb = element.value or ""
+        return {"ok": True, "method": "mock", "written": value,
+                "readback": rb, "validated": rb == value}
 
     def send_keys(self, keys: str, target: dict[str, Any] | None = None) -> None:
         self.keys_log.append(keys)
@@ -212,11 +215,61 @@ class MockUIABridge(UIABridge):
         y: int,
         double: bool = False,
         button: str = "left",
+        force_sendinput: bool = False,
     ) -> None:
         """Record the click in mouse_log (no real UI interaction in mock)."""
         self.mouse_log.append(
             {"x": x, "y": y, "double": double, "button": button}
         )
+
+    def send_win32_message(
+        self,
+        hwnd: int,
+        message: int,
+        wparam: int = 0,
+        lparam: int = 0,
+        sync: bool = True,
+    ) -> int:
+        """Record the message in mock log and return 1."""
+        self.keys_log.append(f"WIN32_MSG hwnd={hwnd} msg={message} wp={wparam} lp={lparam} sync={sync}")
+        return 1
+
+    def get_window_enabled_state(self, hwnd: int) -> dict[str, Any]:
+        """Mock: always returns enabled=True."""
+        return {"hwnd": hwnd, "enabled": True}
+
+    def dismiss_modal_overlay(self, target_hwnd: int) -> dict[str, Any]:
+        """Mock: no-op, target is always enabled in tests."""
+        return {
+            "ok": True,
+            "target_hwnd": target_hwnd,
+            "enabled": True,
+            "dismissed": [],
+            "re_enabled": False,
+        }
+
+    def capture_screenshot(
+        self,
+        hwnd: int | None = None,
+        region: dict[str, int] | None = None,
+    ) -> dict[str, Any]:
+        """Mock: return a 1×1 transparent PNG for unit tests."""
+        import base64  # noqa: PLC0415
+        import io  # noqa: PLC0415
+
+        try:
+            from PIL import Image  # noqa: PLC0415
+            img = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            image_b64 = base64.b64encode(buf.getvalue()).decode()
+        except ImportError:
+            # Pillow not installed: return a known minimal 1×1 transparent PNG.
+            image_b64 = (
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+                "YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+            )
+        return {"ok": True, "image_b64": image_b64, "width": 1, "height": 1, "format": "PNG"}
 
     def get_text(self, target: dict[str, Any] | None = None) -> tuple[str, str]:
         """

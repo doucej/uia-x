@@ -39,6 +39,8 @@ dependencies = [
 windows = [
     "pywinauto>=0.6.8",
     "comtypes>=1.4.0",
+    "Pillow>=10.0.0",
+    "winsdk>=1.0.0b10",
 ]
 linux = [
     # python3-pyatspi and python3-dbus are typically system packages
