@@ -272,6 +272,15 @@ def _dismiss_modal_dialogs(
                         break
 
             if dismiss_btn:
+                # Try BM_CLICK first (fast, reliable for standard buttons)
+                BM_CLICK = 0x00F5
+                user32.SendMessageW(dismiss_btn, BM_CLICK, 0, 0)
+                _time.sleep(0.15)
+                if not user32.IsWindow(dlg):
+                    dismissed_this_round = True
+                    any_dismissed = True
+                    continue
+                # BM_CLICK didn't close the dialog — fall back to physical mouse
                 _click_control(dismiss_btn, dlg)
                 _time.sleep(0.4)
                 dismissed_this_round = True
@@ -5145,9 +5154,9 @@ def _parse_split_qwindlg(
         user32.GetClassNameW(h, cls_buf, 64)
         cls = cls_buf.value
         if cls == "ListBox" and not lb_hwnd:
-            lb_hwnd = h
+            lb_hwnd = int(h)
         elif cls == "Edit":
-            all_edits.append(h)
+            all_edits.append(int(h))
         return True
 
     user32.EnumChildWindows(container_hwnd, WNDENUMPROC(_find_cb), 0)
@@ -5544,10 +5553,12 @@ def read_transaction_splits(
     Returns
     -------
     dict
-        ``{"ok": True, "splits": [...], "count": int, "kind": str}``
-        where each split is ``{"index", "category", "memo", "amount"}``.
+        ``{"ok": True, "splits": [...], "count": int, "kind": str, "parent_info": dict | None}``
+        where each split is ``{"index", "category", "memo", "amount", "tag"}``.
         *kind* is ``"popup"`` or ``"inline"`` (the split editor style
-        Quicken used).
+        Quicken used).  *parent_info* is ``{"payee": str, "deposit": str} | None``
+        capturing the parent row's payee and deposit before the split editor opened
+        (``None`` when reusing an already-open dialog).
     """
     import ctypes  # noqa: PLC0415
     import ctypes.wintypes  # noqa: PLC0415
@@ -5564,7 +5575,10 @@ def read_transaction_splits(
 
     root_hwnd = pm.attached.hwnd
     # Don't dismiss the split dialog itself — only other blocking modals
-    _dismiss_modal_dialogs(root_hwnd, preserve_titles={"split transaction"})
+    _dismiss_modal_dialogs(root_hwnd, max_rounds=8, preserve_titles={"split transaction"})
+
+    # Parent transaction info (filled when row_index is specified, empty dict otherwise)
+    _parent_info: dict[str, str] = {}
 
     # If a split dialog is already open (and row_index not specified to force re-select), use it
     if row_index is None:
@@ -5639,6 +5653,18 @@ def read_transaction_splits(
             return sel
         time.sleep(0.3)
 
+        # Capture parent transaction info (payee + deposit) before opening split dialog
+        _parent_info: dict[str, str] | None = None
+        _read_rows = read_register_rows(bridge, max_rows=max(10, row_index + 1))
+        if _read_rows.get("ok") and _read_rows.get("rows"):
+            _rows = _read_rows["rows"]
+            if row_index < len(_rows):
+                _r = _rows[row_index]
+                _parent_info = {
+                    "payee": _r.get("payee", ""),
+                    "deposit": _r.get("deposit", ""),
+                }
+
     mdi_h = _find_active_mdi(root_hwnd)
     if mdi_h is None:
         return {
@@ -5706,6 +5732,7 @@ def read_transaction_splits(
         "root": root_hwnd,
         "qwmdi": mdi_h,
         "exclude": qredits_before_hwnds,
+        "parent_info": _parent_info,
     }
 
     # Return splits without internal hwnd details
@@ -5719,6 +5746,7 @@ def read_transaction_splits(
         "splits": public_splits,
         "count": len(public_splits),
         "kind": kind,
+        "parent_info": _parent_info,
     }
 
 
@@ -5866,13 +5894,14 @@ def edit_split_line(
             time.sleep(0.15)
 
         def _do_write_qwindlg(hwnd: int, field: str, value: str, col_x: int) -> None:
-            """Write *value* to *hwnd* using WM_CHAR injection.
+            """Write *value* to *hwnd* using WM_SETTEXT.
 
-            Clicks the target column to expose the Edit, clears it via
-            EM_SETSEL + WM_CHAR(Delete), then injects each character via
-            WM_CHAR.  After typing, clicks the amount column to trigger the
-            column-transition commit handler (numeric field → no autocomplete,
-            no "New Tag" dialog).  Any residual modal dialogs are dismissed.
+            Clicks the target column to expose the Edit, sets the full text
+            atomically via WM_SETTEXT (avoids per-character QuickFill), then
+            sends EN_CHANGE to the parent ListBox.  After writing, clicks a
+            different column to trigger the column-transition commit handler
+            (numeric field → no autocomplete, no "New Tag" dialog).
+            Any residual modal dialogs are dismissed.
             """
             if not hwnd or not lb_hwnd:
                 return
@@ -5894,25 +5923,20 @@ def edit_split_line(
             _click_col(col_x)  # expose the Edit
             time.sleep(0.15)
 
-            WM_GETTEXT   = 0x000D
-            WM_CHAR      = 0x0102
-            WM_KEYDOWN   = 0x0100
-            WM_KEYUP     = 0x0101
-            EM_SETSEL    = 0x00B1
-            VK_DELETE    = 0x2E
+            WM_GETTEXT = 0x000D
+            WM_SETTEXT = 0x000C
+            WM_COMMAND = 0x0111
+            EN_CHANGE  = 0x0300
 
-            # Select-all then Delete to clear any existing text
-            user32.PostMessageW(hwnd, EM_SETSEL, 0, -1)
-            time.sleep(0.04)
-            user32.PostMessageW(hwnd, WM_KEYDOWN, VK_DELETE, 0)
-            time.sleep(0.02)
-            user32.PostMessageW(hwnd, WM_KEYUP, VK_DELETE, 0)
-            time.sleep(0.04)
+            # Set the full text atomically (no per-character QuickFill firing)
+            user32.SendMessageW(hwnd, WM_SETTEXT, 0, value)
+            time.sleep(0.06)
 
-            for ch in value:
-                user32.PostMessageW(hwnd, WM_CHAR, ord(ch), 0)
-                time.sleep(0.01)
-            time.sleep(0.1)
+            # Notify the parent ListBox that the Edit content changed
+            if lb_hwnd:
+                ctrl_id = 0  # WM_COMMAND with EN_CHANGE via parent ListBox
+                user32.PostMessageW(lb_hwnd, WM_COMMAND, (EN_CHANGE << 16) | ctrl_id, hwnd)
+            time.sleep(0.08)
 
             # Commit by transitioning to a *different* column so Quicken's
             # ListBox handler deactivates the current edit (saving the typed
@@ -5925,7 +5949,7 @@ def edit_split_line(
             _click_col(commit_x)
             time.sleep(0.25)
             # Dismiss any modal dialogs that snuck in (safety net)
-            _dismiss_modal_dialogs(container, preserve_titles={"split transaction"})
+            _dismiss_modal_dialogs(container, max_rounds=8, preserve_titles={"split transaction"})
 
             # Verify via readback (click back to this column first to re-expose)
             _click_col(col_x)
@@ -5936,8 +5960,13 @@ def edit_split_line(
                             ctypes.c_size_t, ctypes.c_wchar_p]
             fn2.restype  = ctypes.c_ssize_t
             fn2(hwnd, WM_GETTEXT, 511, rbuf)
-            ok = rbuf.value.strip() == value.strip()
+            actual = rbuf.value
+            # Normalized comparison: case-insensitive, strip brackets/whitespace/commas
+            # (Quicken reformats amounts with commas, e.g. "9782.26" → "9,782.26")
+            norm = lambda s: s.strip().lower().strip("[]").strip().replace(",", "").strip('\'"')
+            ok = norm(actual) == norm(value)
             written[field] = value
+            written[field + "_readback"] = actual
             verified[field] = ok
 
         if category is not None:
@@ -6055,9 +6084,9 @@ def close_split_dialog(
         import ctypes.wintypes  # noqa: PLC0415
         u32 = ctypes.windll.user32
 
-        # Dismiss any modal dialogs blocking the split dialog (e.g. "New Tag",
+         # Dismiss any modal dialogs blocking the split dialog (e.g. "New Tag",
         # category autocomplete dropdowns) before trying to click OK/Cancel.
-        _dismiss_modal_dialogs(container, preserve_titles={"split transaction"})
+        _dismiss_modal_dialogs(container, max_rounds=8, preserve_titles={"split transaction"})
         time.sleep(0.1)
 
         # Get button screen coordinates for physical click
