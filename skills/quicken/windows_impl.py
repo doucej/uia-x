@@ -5894,25 +5894,21 @@ def edit_split_line(
             _click_col(col_x)  # expose the Edit
             time.sleep(0.15)
 
-            WM_GETTEXT   = 0x000D
-            WM_CHAR      = 0x0102
-            WM_KEYDOWN   = 0x0100
-            WM_KEYUP     = 0x0101
-            EM_SETSEL    = 0x00B1
-            VK_DELETE    = 0x2E
+            WM_GETTEXT = 0x000D
+            WM_SETTEXT = 0x000C
+            WM_COMMAND = 0x0111
+            EN_CHANGE  = 0x0300
 
-            # Select-all then Delete to clear any existing text
-            user32.PostMessageW(hwnd, EM_SETSEL, 0, -1)
-            time.sleep(0.04)
-            user32.PostMessageW(hwnd, WM_KEYDOWN, VK_DELETE, 0)
-            time.sleep(0.02)
-            user32.PostMessageW(hwnd, WM_KEYUP, VK_DELETE, 0)
-            time.sleep(0.04)
-
-            for ch in value:
-                user32.PostMessageW(hwnd, WM_CHAR, ord(ch), 0)
-                time.sleep(0.01)
-            time.sleep(0.1)
+            # WM_SETTEXT + EN_CHANGE: set value directly and notify Quicken's
+            # internal model (replaces WM_CHAR injection which did not trigger
+            # EN_CHANGE and therefore left Quicken's model stale).
+            _vbuf = ctypes.create_unicode_buffer(value)
+            _send_msg_timeout(hwnd, WM_SETTEXT, 0, ctypes.addressof(_vbuf),
+                              timeout_ms=2000)
+            _ctrl_id = user32.GetDlgCtrlID(hwnd)
+            _wp = (EN_CHANGE << 16) | (_ctrl_id & 0xFFFF)
+            _send_msg_timeout(container, WM_COMMAND, _wp, hwnd, timeout_ms=2000)
+            time.sleep(0.08)
 
             # Commit by transitioning to a *different* column so Quicken's
             # ListBox handler deactivates the current edit (saving the typed
