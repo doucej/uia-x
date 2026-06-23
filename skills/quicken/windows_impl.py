@@ -2593,7 +2593,12 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
     Returns
     -------
     dict
-        ``{"ok": True, "account": str, "method": str}``
+        ``{"ok": True, "account": str, "method": str, "verified": bool}``
+
+        ``verified`` is ``True`` when the Quicken title bar confirms the
+        correct account is active.  If ``False``, ``actual_account`` and
+        ``warning`` are also present — call ``navigate_to_account`` again
+        to retry.
     """
     import ctypes  # noqa: PLC0415
     import ctypes.wintypes  # noqa: PLC0415
@@ -2721,6 +2726,7 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
             if _bracket_ok():
                 mdi_h = _find_target_mdi()
                 _lock_in(mdi_h)
+                result["verified"] = True
                 return result
 
         # Retry loop: find target QWMDI, re-activate, verify.
@@ -2738,6 +2744,7 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
                 time.sleep(0.5)
                 if _bracket_ok():
                     _lock_in(mdi_h)
+                    result["verified"] = True
                     return result
             if mdi_h:
                 # Extra force — SetForegroundWindow + re-activate
@@ -2748,6 +2755,7 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
                     time.sleep(0.5)
                     if _bracket_ok():
                         _lock_in(mdi_h)
+                        result["verified"] = True
                         return result
 
         # All retries exhausted — lock in via WM_MDIGETACTIVE so read_register_state
@@ -2755,10 +2763,12 @@ def navigate_to_account(bridge: Any, account_name: str) -> dict[str, Any]:
         _lock_in(0)
         user32.GetWindowTextW(root_hwnd, _vbuf, 256)
         current = _bracket_name(_vbuf.value)
+        result["verified"] = False
+        result["actual_account"] = current or "unknown"
         result["warning"] = (
-            f"Navigate succeeded but Quicken switched to "
-            f"'{current or 'unknown'}' afterward.  Use existing_tab "
-            f"or retry."
+            f"Navigation did not land on '{expected}' — "
+            f"Quicken is showing '{current or 'unknown'}' instead.  "
+            f"Call navigate_to_account again to retry."
         )
         result["should_retry"] = True
         result["retry_after_ms"] = 1500
@@ -5928,14 +5938,15 @@ def edit_split_line(
             WM_COMMAND = 0x0111
             EN_CHANGE  = 0x0300
 
-            # Set the full text atomically (no per-character QuickFill firing)
-            user32.SendMessageW(hwnd, WM_SETTEXT, 0, value)
-            time.sleep(0.06)
-
-            # Notify the parent ListBox that the Edit content changed
-            if lb_hwnd:
-                ctrl_id = 0  # WM_COMMAND with EN_CHANGE via parent ListBox
-                user32.PostMessageW(lb_hwnd, WM_COMMAND, (EN_CHANGE << 16) | ctrl_id, hwnd)
+            # WM_SETTEXT + EN_CHANGE: set value directly and notify Quicken's
+            # internal model (replaces WM_CHAR injection which did not trigger
+            # EN_CHANGE and therefore left Quicken's model stale).
+            _vbuf = ctypes.create_unicode_buffer(value)
+            _send_msg_timeout(hwnd, WM_SETTEXT, 0, ctypes.addressof(_vbuf),
+                              timeout_ms=2000)
+            _ctrl_id = user32.GetDlgCtrlID(hwnd)
+            _wp = (EN_CHANGE << 16) | (_ctrl_id & 0xFFFF)
+            _send_msg_timeout(container, WM_COMMAND, _wp, hwnd, timeout_ms=2000)
             time.sleep(0.08)
 
             # Commit by transitioning to a *different* column so Quicken's
