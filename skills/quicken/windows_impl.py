@@ -3944,16 +3944,32 @@ def read_register_rows(
         }
     txlist_rect = ctypes.wintypes.RECT()
     user32.GetWindowRect(txlist_h, ctypes.byref(txlist_rect))
-    # Click near the vertical center of the TxList body.  The top
-    # ~40-60 px is column headers that don't accept keyboard focus,
-    # so using the center avoids that dead zone reliably.
+
+    # Scroll the viewport to the top of the register (toward newest transactions)
+    # using WM_MOUSEWHEEL upward.  Without this, Ctrl+Home navigates to the first
+    # row of the *current viewport*, not the absolute first row of the register.
+    WM_MOUSEWHEEL = 0x020A
+    _cx_mid = (txlist_rect.left + txlist_rect.right) // 2
+    _cy_mid = (txlist_rect.top + txlist_rect.bottom) // 2
+    for _ in range(80):
+        _wp = (120 & 0xFFFF) << 16  # positive delta = scroll up (toward top = newest)
+        _lp = (_cy_mid & 0xFFFF) << 16 | (_cx_mid & 0xFFFF)
+        user32.PostMessageW(txlist_h, WM_MOUSEWHEEL, _wp, _lp)
+        _time.sleep(0.01)
+    _time.sleep(0.4)
+
+    # Physical click 80px below the top of TxList (below column headers).
+    # Clicking near the TOP (not center) ensures focus lands on the date column
+    # (leftmost) rather than the payment column (which is near center-right).
     click_x = (txlist_rect.left + txlist_rect.right) // 2
-    click_y = (txlist_rect.top + txlist_rect.bottom) // 2
-    user32.SetCursorPos(click_x, click_y)
+    click_y = txlist_rect.top + 80
+    user32.SetForegroundWindow(root_hwnd)
     _time.sleep(0.1)
+    user32.SetCursorPos(click_x, click_y)
+    _time.sleep(0.05)
     user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
     user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
-    _time.sleep(0.4)
+    _time.sleep(0.35)
 
     tid = kernel32.GetCurrentThreadId()
     qtid = user32.GetWindowThreadProcessId(root_hwnd, None)
@@ -4032,15 +4048,13 @@ def read_register_rows(
             if cls_name.lower() != "qredit":
                 break
             if h == date_hwnd:
-                # Loan/amortization registers share one HWND for ALL fields.
-                # Detect money columns by x-position relative to the date column:
-                #   payment sits just LEFT of date (e.g. x≈271 vs date_x≈293)
-                #   balance sits far RIGHT (> date_x + 300, e.g. x≈650 vs date_x≈293)
-                # Using 300px threshold avoids misclassifying check# (~175px) and
-                # category (~266px) columns as money fields.
+                # Standard banking registers: text fields (Num, Payee, Memo,
+                # Category, Tag) share date_hwnd; money fields are on a separate
+                # HWND caught by the else branch.  For loan/amortization registers
+                # ALL fields share date_hwnd; the payment column sits to the LEFT
+                # of the date column (_is_left).
                 _is_left = x < date_x - 5
-                _is_right = x > date_x + 300
-                if _is_left or _is_right:
+                if _is_left:
                     money_fields.append((x, txt))
                 elif money_fields:
                     # Wrapped back to a text column after money → row end
@@ -4118,20 +4132,19 @@ def read_register_rows(
             if cls_name.lower() != "qredit":
                 break
             if h == date_hwnd:
-                # Loan/amortization registers share one HWND for ALL fields.
-                # Detect money columns by x-position relative to the date column:
-                #   payment sits just LEFT of date (e.g. x≈271 vs date_x≈293)
-                #   balance sits far RIGHT (> date_x + 300, e.g. x≈650 vs date_x≈293)
-                # Using 300px threshold avoids misclassifying check# (~175px) and
-                # category (~266px) columns as money fields.
+                # All text fields (Num, Payee, Memo, Category, Tag) share
+                # date_hwnd in standard banking registers.  Money fields
+                # (Payment, Deposit) are on a separate HWND and are caught
+                # by the else branch below.
+                #
+                # For loan/amortization registers ALL fields share date_hwnd.
+                # In that layout, the payment column sits to the LEFT of the
+                # date column (x < date_x), so we use _is_left to detect it.
                 _is_left = x < date_x - 5
-                _is_right = x > date_x + 300
-                if _is_left or _is_right:
+                if _is_left:
                     money_fields.append((x, txt))
                 elif money_fields:
                     # Wrapped back to a text column after money → row end.
-                    # (Focus is at the current field; outer read_register_rows
-                    # will send a single Escape to return to the date field.)
                     break
                 else:
                     text_fields.append((x, txt))
@@ -4150,20 +4163,27 @@ def read_register_rows(
         text_fields.sort(key=lambda t: t[0])
 
         # --- Text field identification (x-sorted) ---
-        # Visual column order left-to-right is always:
-        #   Payee/Description | Check# | Category | Memo
+        # Standard checking register tab order (left→right):
+        #   Num/Check# | Payee | Memo | Category | [Tag]
+        # With 4+ text fields the first is Num, second is Payee.
+        # With fewer fields the first field is Payee (no check# column).
         payee = text_fields[0][1] if text_fields else ""
         category = ""
         check_num = ""
         memo = ""
         if len(text_fields) >= 4:
-            check_num = text_fields[1][1]
-            category = text_fields[2][1]
-            memo = text_fields[3][1]
+            # Num | Payee | Memo | Category | [Tag ...]
+            check_num = text_fields[0][1]
+            payee     = text_fields[1][1]
+            memo      = text_fields[2][1]
+            category  = text_fields[3][1]
         elif len(text_fields) == 3:
-            check_num = text_fields[1][1]
-            category = text_fields[2][1]
+            # Payee | Category | Memo  (no check# column)
+            payee    = text_fields[0][1]
+            category = text_fields[1][1]
+            memo     = text_fields[2][1]
         elif len(text_fields) == 2:
+            payee    = text_fields[0][1]
             category = text_fields[1][1]
 
         # --- Money field identification ---
@@ -4235,13 +4255,13 @@ def read_register_rows(
         # doesn't always match the number of tabbable rows).
         effective_max = max_rows
 
-        # Start from the BOTTOM of the register (Ctrl+End) so that we always
-        # read the MOST RECENT transactions first, regardless of any active date
-        # filter.  Ctrl+Home would jump to the absolute beginning (oldest data)
-        # even when the register is filtered to show only recent transactions.
-        # Default navigation is Up (newest→older).
-        _nav_key = 0x26  # default: Up navigation (newest → older)
-        _ctrl(0x23)      # Ctrl+End
+        # Start from the TOP of the register (Ctrl+Home) so that we always
+        # read the MOST RECENT transactions first.  Quicken Classic shows
+        # newest transactions at the top; Down navigates toward older rows.
+        # The WM_MOUSEWHEEL scroll above has already brought the viewport to
+        # the top, so Ctrl+Home lands on the first real transaction row.
+        _nav_key = 0x28  # Down: newest → older
+        _ctrl(0x24)      # Ctrl+Home → first row (newest)
         _time.sleep(0.5)
 
         # Attempt to read the first row.  After Ctrl+End we expect to land on
