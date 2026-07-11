@@ -79,6 +79,59 @@ from server.process_manager import (
 # UIAX_TOOL_TIMEOUT environment variable.
 _BRIDGE_TOOL_TIMEOUT: float = float(os.environ.get("UIAX_TOOL_TIMEOUT", "60"))
 
+# Per-tool timeout overrides (in seconds), for tools whose legitimate internal
+# operation time is known to exceed the default watchdog.  Keyed by the
+# Python function name (fn.__name__ of the @mcp.tool-decorated function —
+# e.g. "navigate_to_account_tool"), NOT the MCP-exposed tool name.
+#
+# Rationale (found 2026-07-10, see Z:\mcp_stability_handoff.md):
+# navigate_to_account's sidebar-scan fallback path (skills/quicken/windows_impl.py,
+# _navigate_via_sidebar) has a hardcoded internal deadline of 180s for
+# investment-heavy account files with many entries.  With the old blanket 60s
+# watchdog, the outer asyncio.wait_for gave up and reset the bridge executor
+# WHILE the operation was still legitimately running (not actually hung) —
+# orphaning the thread, which then kept clicking through Quicken's sidebar in
+# the background and could race with a subsequent retry's freshly-created
+# thread, both manipulating the same live window concurrently.
+_TOOL_TIMEOUT_OVERRIDES: dict[str, float] = {
+    # navigate_to_account: sidebar-scan fallback has an internal 180s deadline.
+    "navigate_to_account_tool": 210.0,
+}
+
+# Argument names that indicate a caller-supplied duration budget.  When an
+# incoming tool call includes one of these, the effective watchdog timeout is
+# extended to accommodate it (plus a safety margin) instead of the tool's own
+# requested/documented duration racing against a shorter fixed watchdog.
+# Covers e.g. list_sidebar_accounts(max_seconds=720) and any tool exposing a
+# timeout_ms parameter.
+_TIMEOUT_ARG_NAMES_SECONDS: tuple[str, ...] = ("max_seconds",)
+_TIMEOUT_ARG_NAMES_MS: tuple[str, ...] = ("timeout_ms",)
+_TIMEOUT_MARGIN_SECONDS: float = 30.0
+
+
+def _effective_tool_timeout(fn, arguments_parsed_dict: dict) -> float:
+    """Compute the watchdog timeout for a single tool call.
+
+    Takes the maximum of the global default, any per-tool override (see
+    ``_TOOL_TIMEOUT_OVERRIDES``), and any caller-supplied duration argument
+    (``max_seconds`` / ``timeout_ms``, plus a safety margin) — so a tool is
+    never killed before its own documented or explicitly-requested budget has
+    had a chance to elapse.
+    """
+    timeout = _BRIDGE_TOOL_TIMEOUT
+    override = _TOOL_TIMEOUT_OVERRIDES.get(getattr(fn, "__name__", ""))
+    if override is not None:
+        timeout = max(timeout, override)
+    for _name in _TIMEOUT_ARG_NAMES_SECONDS:
+        _val = arguments_parsed_dict.get(_name)
+        if isinstance(_val, (int, float)) and _val > 0:
+            timeout = max(timeout, float(_val) + _TIMEOUT_MARGIN_SECONDS)
+    for _name in _TIMEOUT_ARG_NAMES_MS:
+        _val = arguments_parsed_dict.get(_name)
+        if isinstance(_val, (int, float)) and _val > 0:
+            timeout = max(timeout, float(_val) / 1000.0 + _TIMEOUT_MARGIN_SECONDS)
+    return timeout
+
 
 def _init_bridge_thread() -> None:
     """Initialise COM for the bridge worker thread (Windows only, no-op elsewhere)."""
@@ -90,6 +143,30 @@ def _init_bridge_thread() -> None:
 
 
 _bridge_executor: concurrent.futures.ThreadPoolExecutor | None = None
+
+# Serializes the "submit to executor + await" critical section across
+# concurrent MCP requests.  Because a stuck Win32/COM thread cannot be
+# forcibly killed (see _reset_bridge_executor), an orphaned thread from a
+# just-timed-out call may still be running when a new request comes in.  This
+# lock does NOT stop that orphaned OS thread from continuing to run — Python
+# cannot do that — but it DOES prevent two *requests* from racing to reset
+# the executor or from both observing a half-reset state, and it ensures a
+# new request only submits to a freshly-reset executor after any prior
+# request's reset bookkeeping has fully completed.  A complete fix for
+# orphaned-thread/new-thread Win32 collisions would require running the
+# bridge in a separate killable process rather than a thread — out of scope
+# for this change; the timeout-accuracy fix above (_effective_tool_timeout)
+# is what actually prevents *premature* resets from happening in the first
+# place, which is the primary driver of this race in practice.
+_tool_call_lock: asyncio.Lock | None = None
+
+
+def _get_tool_call_lock() -> asyncio.Lock:
+    """Lazily create the tool-call serialization lock on the running loop."""
+    global _tool_call_lock
+    if _tool_call_lock is None:
+        _tool_call_lock = asyncio.Lock()
+    return _tool_call_lock
 
 
 def _get_bridge_executor() -> concurrent.futures.ThreadPoolExecutor:
@@ -155,10 +232,16 @@ try:
     ):
         """Run sync MCP tools in the bridge thread pool (avoids event-loop blocking).
 
-        Wraps run_in_executor with asyncio.wait_for(_BRIDGE_TOOL_TIMEOUT).  On
-        timeout (or MCP-client cancellation while the thread is still running)
-        the executor and bridge are reset so subsequent requests are not stuck
-        waiting for the hung thread.
+        Wraps run_in_executor with asyncio.wait_for using a per-call effective
+        timeout (see _effective_tool_timeout: global default, unless a
+        per-tool override or a caller-supplied duration argument like
+        max_seconds/timeout_ms calls for more).  On timeout (or MCP-client
+        cancellation while the thread is still running) the executor and
+        bridge are reset so subsequent requests are not stuck waiting for the
+        hung thread.  The submit+await step is serialized via
+        _get_tool_call_lock() so concurrent requests can't race on a
+        reset/fresh-executor transition (see that lock's docstring for what
+        this does and does not protect against).
         """
         arguments_pre_parsed = self.pre_parse_json(arguments_to_validate)
         arguments_parsed_model = self.arg_model.model_validate(arguments_pre_parsed)
@@ -166,31 +249,33 @@ try:
         arguments_parsed_dict |= arguments_to_pass_directly or {}
         if fn_is_async:
             return await fn(**arguments_parsed_dict)
-        loop = asyncio.get_running_loop()
-        wrapped = functools.partial(fn, **arguments_parsed_dict)
-        fut = loop.run_in_executor(_get_bridge_executor(), wrapped)
-        try:
-            return await asyncio.wait_for(asyncio.shield(fut), timeout=_BRIDGE_TOOL_TIMEOUT)
-        except asyncio.TimeoutError:
-            # Bridge thread is still running but we've given up waiting.
-            # Reset so subsequent calls don't queue behind the stuck thread.
-            _reset_bridge_executor()
-            return {
-                "ok": False,
-                "error": (
-                    f"Tool call timed out after {_BRIDGE_TOOL_TIMEOUT:.0f}s — "
-                    "the bridge thread was hung and has been abandoned. "
-                    "Call select_window to reattach, then retry."
-                ),
-                "code": "TOOL_TIMEOUT",
-            }
-        except asyncio.CancelledError:
-            # MCP client sent CancelledNotification; the thread may still be
-            # running.  Reset the executor so the next request doesn't queue
-            # behind the stuck thread, then re-raise so the MCP framework can
-            # send its own cancellation response.
-            _reset_bridge_executor()
-            raise
+        _timeout = _effective_tool_timeout(fn, arguments_parsed_dict)
+        async with _get_tool_call_lock():
+            loop = asyncio.get_running_loop()
+            wrapped = functools.partial(fn, **arguments_parsed_dict)
+            fut = loop.run_in_executor(_get_bridge_executor(), wrapped)
+            try:
+                return await asyncio.wait_for(asyncio.shield(fut), timeout=_timeout)
+            except asyncio.TimeoutError:
+                # Bridge thread is still running but we've given up waiting.
+                # Reset so subsequent calls don't queue behind the stuck thread.
+                _reset_bridge_executor()
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Tool call timed out after {_timeout:.0f}s — "
+                        "the bridge thread was hung and has been abandoned. "
+                        "Call select_window to reattach, then retry."
+                    ),
+                    "code": "TOOL_TIMEOUT",
+                }
+            except asyncio.CancelledError:
+                # MCP client sent CancelledNotification; the thread may still be
+                # running.  Reset the executor so the next request doesn't queue
+                # behind the stuck thread, then re-raise so the MCP framework can
+                # send its own cancellation response.
+                _reset_bridge_executor()
+                raise
 
     _FuncMetadata.call_fn_with_arg_validation = _threaded_call_fn
 except Exception as _patch_err:  # noqa: BLE001
