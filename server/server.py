@@ -96,6 +96,14 @@ _BRIDGE_TOOL_TIMEOUT: float = float(os.environ.get("UIAX_TOOL_TIMEOUT", "60"))
 _TOOL_TIMEOUT_OVERRIDES: dict[str, float] = {
     # navigate_to_account: sidebar-scan fallback has an internal 180s deadline.
     "navigate_to_account_tool": 210.0,
+    # uia_find_all: complex investment accounts (Stock Purchase Plan with 474+ holdings)
+    # can take 90-180+ seconds to scan the full UIA tree. 240s gives a safe margin.
+    "uia_find_all": 240.0,
+    # uia_inspect: similarly slow on deep/complex windows like investment portfolios.
+    "uia_inspect": 180.0,
+    # read_screen_text: OCR + large window regions on investment views can be slow.
+    # (Note: this is a Quicken skill tool, may also need override in skills/quicken/tools.py)
+    "read_screen_text_tool": 120.0,
 }
 
 # Argument names that indicate a caller-supplied duration budget.  When an
@@ -752,14 +760,20 @@ def uia_find_all(
             "has_actions": has_actions,
             "named_only": named_only,
             "root": target or None,
-            # When name_contains is set, we must scan the full window before
-            # filtering — capping early would miss matching elements that appear
-            # after the first `limit` interactive controls in the tree.
-            # Without a text filter, pass limit+offset so the Win32 fast path
-            # can early-exit after collecting enough candidates.
-            "limit": 0 if name_contains else ((limit + offset) if limit > 0 else 0),
+            # Always pass the real limit so the Win32 fast path can early-exit
+            # once enough elements are found.  Previously, limit was forced to 0
+            # when name_contains was set, disabling early-exit and causing full
+            # tree scans on complex windows (e.g. Quicken investment accounts
+            # with 2000+ child HWNDs each requiring a SendMessageTimeoutW call).
+            "limit": (limit + offset) if limit > 0 else 0,
+            # Push name filter into the bridge so it can skip non-matching
+            # elements BEFORE the expensive rect/actions lookups, and so the
+            # limit counts matching elements — enabling early-exit.
+            "name_filter": name_contains,
         })
-        # Server-side name search
+        # Server-side name search as a safety net for the UIA/MSAA fallback path
+        # (which may not support name_filter).  No-op when the Win32 fast path
+        # already filtered correctly.
         if name_contains:
             _q = name_contains.lower()
             items = [e for e in items if _q in e.get("name", "").lower()]
