@@ -3855,6 +3855,21 @@ def read_register_rows(
     3. Using HWND-based field classification (text vs. numeric QREdit)
     4. Adaptive payee/category identification by field count
 
+    .. warning:: Sort-order assumption
+        This implementation navigates with Ctrl+Home + Down arrow, which
+        assumes the register is sorted **newest-first (descending)** — the
+        Quicken Classic default for standard banking registers.  If the register
+        is sorted ascending (oldest first), rows will be returned in reverse
+        order (oldest first instead of newest first) with no error indication.
+        Investment account registers and some loan/CD registers may use
+        ascending order; verify with ``read_screen_text`` before relying on
+        row order.
+
+    .. warning:: Investment accounts not supported
+        ``read_register_rows`` requires a ``QWClass_TransactionList`` ListBox
+        control that does not exist in investment account views.  For investment
+        accounts use ``read_screen_text`` (OCR) to read the register contents.
+
     Parameters
     ----------
     bridge
@@ -4894,6 +4909,11 @@ def _write_qredit_background(
     EN_CHANGE = 0x0300
 
     buf = ctypes.create_unicode_buffer(text)
+    # WM_SETTEXT (0x000C) is a system message (< WM_USER = 0x0400).
+    # Windows automatically marshals the string pointer across process
+    # boundaries when SendMessageTimeoutW targets a window in another process,
+    # so passing ctypes.addressof(buf) here is safe even though `buf` lives
+    # in the MCP server's address space.
     _send_msg_timeout(hwnd, WM_SETTEXT, 0, ctypes.addressof(buf), timeout_ms=2000)
 
     if parent_hwnd:
@@ -5536,6 +5556,17 @@ def read_transaction_splits(
     :func:`edit_split_line` can write to it.  Call
     :func:`close_split_dialog` to save or cancel.
 
+    .. warning:: Internal scroll side-effect when ``row_index`` is provided
+        When ``row_index`` is not ``None``, this function internally calls
+        :func:`read_register_rows` to capture the parent row's payee/deposit
+        for ``parent_info``.  That call scrolls the register (80 × WM_MOUSEWHEEL
+        + Ctrl+Home + keyboard navigation) before opening the split dialog.
+        If the register is mid-edit or in any non-idle state when
+        ``row_index`` is supplied, the scroll sequence can corrupt the edit
+        state or dismiss an in-progress transaction.  Only supply ``row_index``
+        when the register is fully idle; omit it (``None``) when reusing an
+        already-open dialog or when the row is already selected.
+
     Parameters
     ----------
     row_index : int | None
@@ -5902,6 +5933,9 @@ def edit_split_line(
             # WM_SETTEXT + EN_CHANGE: set value directly and notify Quicken's
             # internal model (replaces WM_CHAR injection which did not trigger
             # EN_CHANGE and therefore left Quicken's model stale).
+            # WM_SETTEXT is a system message (< WM_USER); Windows marshals the
+            # string pointer across process boundaries automatically, so passing
+            # ctypes.addressof(_vbuf) is safe for a cross-process target window.
             _vbuf = ctypes.create_unicode_buffer(value)
             _send_msg_timeout(hwnd, WM_SETTEXT, 0, ctypes.addressof(_vbuf),
                               timeout_ms=2000)
@@ -6356,3 +6390,4 @@ def read_screen_text(
         "lines": lines_out,
         "text": full_text,
     }
+

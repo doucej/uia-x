@@ -100,6 +100,14 @@ def register(
             "If the view is still loading after navigation (e.g. investment accounts "
             "take longer), returns {ok:false, code:'VIEW_LOADING', should_retry:true, "
             "retry_after_ms:2000} — wait retry_after_ms then call again.  "
+            "When view_type='investment' is returned, the account is an investment "
+            "portfolio (stocks/funds). On investment accounts: "
+            "(1) read_register_rows will not work — use read_screen_text for OCR instead; "
+            "(2) uia_find_all with no filters is SLOW (2000+ child windows) — always "
+            "use name_contains= with a specific label you expect to find, and keep "
+            "limit small (e.g. limit=5); "
+            "(3) prefer uia_invoke(name='ButtonName') directly if you know the button "
+            "name rather than doing a discovery scan.  "
             "Windows-only.  [Quicken skill]"
         ),
     )
@@ -263,7 +271,12 @@ def register(
             "capabilities — all OCR is performed server-side and only text is "
             "returned.  Optionally pass a region as 'left,top,right,bottom' "
             "in screen coordinates to scope the capture; if omitted, the "
-            "active MDI child window is used.  Windows-only.  [Quicken skill]"
+            "active MDI child window is used.  "
+            "INVESTMENT ACCOUNTS: This is the PRIMARY discovery tool when "
+            "view_type='investment'. Use it to find button/tab positions, then "
+            "click by coordinates with uia_mouse_click.  Read in narrow horizontal "
+            "bands (e.g. region='250,140,1262,200') to locate specific rows "
+            "without scanning the full screen.  Windows-only.  [Quicken skill]"
         ),
     )
     def read_screen_text_tool(
@@ -391,3 +404,31 @@ def register(
             return {"ok": False, "error": str(exc), "code": exc.code}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc), "code": "UNEXPECTED_ERROR"}
+
+    # ── Investment transaction entry ──────────────────────────────────────────
+    # NOTE: A dedicated enter_investment_transaction MCP tool was prototyped but
+    # removed because Quicken's investment register inline editor is not reliably
+    # automatable via Win32/SendInput:
+    #
+    #   • The Action field is an owner-drawn custom dropdown — SendInput keystrokes
+    #     are routed by foreground focus, which is stolen between MCP round-trips,
+    #     so typed characters frequently miss the target control.
+    #   • Every field-validation error pops a blocking modal dialog (e.g. "Security
+    #     name is required") that must be dismissed before automation can continue.
+    #     Without vision confirmation after each step there is no reliable way to
+    #     detect or recover from these dialogs.
+    #   • The new-row activation click relies on OCR-derived screen coordinates
+    #     that shift whenever Quicken's window moves or the register scrolls.
+    #
+    # RECOMMENDED PATTERN for LLM-driven investment transaction entry:
+    #   1. Use capture_screenshot to see the current register state.
+    #   2. Use uia_mouse_click to click the empty new-row's Date cell.
+    #   3. Use send_keys to type the date, Tab to Action, type the action code, etc.
+    #   4. After each Tab/Enter, call capture_screenshot to confirm focus moved
+    #      to the expected field and no modal dialog appeared.
+    #   5. If a modal appears, dismiss it with send_keys("{ENTER}") or by clicking
+    #      the OK button via uia_mouse_click before retrying the field.
+    #   6. To save, click the "Enter" button visible in the row toolbar.
+    #
+    # For bulk entry (multiple transactions), QIF file import is more reliable:
+    # generate a !Type:Invst QIF file and use File > Import > QIF in Quicken.
