@@ -707,6 +707,21 @@ class TestMacOSBridge:
     def test_mouse_click_right(self):
         self.bridge.mouse_click(100, 200, button="right")
 
+    def test_capture_attached_window(self):
+        expected = {"ok": True, "image_b64": "png", "width": 10, "height": 20, "format": "PNG"}
+        with patch(
+            "uiax.backends.macos.bridge.capture_screenshot_quartz",
+            return_value=expected,
+        ) as capture:
+            assert self.bridge.capture_screenshot() == expected
+            capture.assert_called_once_with({"left": 10, "top": 20, "right": 310, "bottom": 220})
+
+    def test_capture_region(self):
+        region = {"left": 1, "top": 2, "right": 3, "bottom": 4}
+        with patch("uiax.backends.macos.bridge.capture_screenshot_quartz", return_value={"ok": True}) as capture:
+            assert self.bridge.capture_screenshot(region=region) == {"ok": True}
+            capture.assert_called_once_with(region)
+
     def test_element_not_found_raises(self):
         from server.uia_bridge import ElementNotFoundError
 
@@ -817,6 +832,54 @@ class TestMacOSProcessManager:
             pm = MacOSProcessManager()
             result = pm.attach(bundle_id="com.apple.calculator")
             assert result["bundle_id"] == "com.apple.calculator"
+
+    def test_attach_core_graphics_only_window_explains_limit(self):
+        from server.uia_bridge import ProcessNotFoundError
+        from uiax.backends.macos.bridge import MacOSProcessManager
+
+        window_list = [{
+            "hwnd": 77,
+            "title": "Legacy Dialog",
+            "class_name": "core graphics window",
+            "pid": 100,
+            "process_name": "LegacyApp",
+            "bundle_id": "",
+            "visible": True,
+            "rect": {"left": 0, "top": 0, "right": 320, "bottom": 300},
+            "_ax_element": None,
+            "_app_pid": 100,
+            "_discovery_source": "core_graphics",
+        }]
+        with patch("uiax.backends.macos.bridge.require_axapi"), \
+             patch("uiax.backends.macos.bridge.list_all_windows", return_value=window_list):
+            with pytest.raises(ProcessNotFoundError, match="CoreGraphics"):
+                MacOSProcessManager().attach(window_title="Legacy Dialog")
+
+    def test_refresh_promotes_active_modal_window(self):
+        from uiax.backends.macos.bridge import MacOSProcessManager
+
+        wizard = MockAXUIElement(role="AXWindow", title="Welcome to Qustodio")
+        modal = MockAXUIElement(role="AXWindow", title="", focused=True)
+        window_list = [
+            {
+                "hwnd": 1, "title": "Welcome to Qustodio", "class_name": "window",
+                "pid": 100, "process_name": "WelcomeWizard", "bundle_id": "",
+                "visible": True, "rect": {}, "_ax_element": wizard, "_app_pid": 100,
+            },
+            {
+                "hwnd": 2, "title": "", "class_name": "window", "pid": 100,
+                "process_name": "WelcomeWizard", "bundle_id": "", "visible": True,
+                "rect": {}, "_ax_element": modal, "_app_pid": 100,
+            },
+        ]
+        with patch("uiax.backends.macos.bridge.require_axapi"), \
+             patch("uiax.backends.macos.bridge.list_all_windows", return_value=window_list), \
+             patch("uiax.backends.macos.bridge.state_names", side_effect=lambda el: ["active"] if el is modal else []):
+            pm = MacOSProcessManager()
+            pm._attached_window = wizard
+            pm._attached_app_pid = 100
+            assert pm.refresh_attached_window() is True
+            assert pm.attached is modal
 
 
 # ---------------------------------------------------------------------------
