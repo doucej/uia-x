@@ -6390,4 +6390,3 @@ def read_screen_text(
         "lines": lines_out,
         "text": full_text,
     }
-
