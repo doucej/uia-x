@@ -64,7 +64,8 @@ source .venv/bin/activate
 pip install -e .
 
 # 2. Grant Accessibility access to Terminal (System Settings → Privacy & Security
-#    → Accessibility) so AXAPI can inspect other apps.
+#    → Accessibility) so AXAPI can inspect and control other apps. To use
+#    capture_screenshot, also grant Terminal Screen Recording access.
 
 # 3. Start the server
 export MCP_TRANSPORT=streamable-http

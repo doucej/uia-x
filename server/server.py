@@ -212,7 +212,7 @@ _port = int(os.environ.get("MCP_PORT", "8000"))
 mcp = FastMCP(
     "uiax-automation",
     instructions=(
-        "UI Automation MCP server (Linux AT-SPI2 / Windows UIA). "
+        "UI Automation MCP server (macOS AXAPI / Linux AT-SPI2 / Windows UIA). "
         "Standard workflow:\n"
         "1. process_list — find the target application window\n"
         "2. select_window — attach to it by hwnd or window_title\n"
@@ -1471,14 +1471,15 @@ def dismiss_modal_overlay_tool(
     description=(
         "Capture a screenshot of a window or screen region and return it as "
         "a base64-encoded PNG.  "
-        "When hwnd is provided, uses PrintWindow to capture the window even if "
-        "partially occluded.  "
+        "When hwnd is provided, captures the window bounds. On Windows this uses "
+        "PrintWindow even if partially occluded; macOS captures visible pixels and "
+        "requires Screen Recording permission. "
         "When region {left,top,right,bottom} is provided, captures that screen "
         "rectangle via BitBlt.  "
         "Omit both to capture the currently-attached window.  "
         "Use this to inspect owner-drawn controls (e.g. Quicken transaction "
         "register rows) that have no UIA element tree.  "
-        "Only available on Windows; requires Pillow (pip install pillow).  "
+        "Available on Windows and macOS; Windows requires Pillow (pip install pillow). "
         "Returns: {ok, image_b64, width, height, format='PNG'}."
     ),
 )

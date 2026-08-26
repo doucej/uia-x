@@ -1,4 +1,4 @@
-mcp[cli]>=1.0.0
+mcp[cli]>=1.0.0,<2.0.0
 pydantic>=2.0.0
 
 # Windows-only (PEP 508 markers keep these from installing on Linux/macOS)

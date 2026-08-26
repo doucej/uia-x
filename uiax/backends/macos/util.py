@@ -13,6 +13,7 @@ Provides low-level wrappers around ApplicationServices / AXAPI via PyObjC to:
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import re
 import time
@@ -486,13 +487,14 @@ def get_running_apps() -> list[dict[str, Any]]:
     ws = NSWorkspace.sharedWorkspace()
     result: list[dict[str, Any]] = []
     for app in ws.runningApplications():
-        # Filter to regular GUI apps (activationPolicy == 0 means NSApplicationActivationPolicyRegular)
-        if app.activationPolicy() == 0:
-            result.append({
-                "pid": app.processIdentifier(),
-                "name": app.localizedName() or "",
-                "bundle_id": app.bundleIdentifier() or "",
-            })
+        # Do not filter on activation policy.  System tools such as Installer
+        # can expose AX windows while using an accessory activation policy.
+        # ``list_all_windows`` below still excludes processes without AX windows.
+        result.append({
+            "pid": app.processIdentifier(),
+            "name": app.localizedName() or "",
+            "bundle_id": app.bundleIdentifier() or "",
+        })
     return result
 
 
@@ -519,6 +521,7 @@ def list_all_windows() -> list[dict[str, Any]]:
     ``list_windows`` MCP tool.
     """
     results: list[dict[str, Any]] = []
+    ax_windows: set[tuple[int, str, int, int, int, int]] = set()
     for app_info in get_running_apps():
         pid = app_info["pid"]
         try:
@@ -545,9 +548,119 @@ def list_all_windows() -> list[dict[str, Any]]:
                     "_ax_element": win,
                     "_app_pid": pid,
                 })
+                ax_windows.add((
+                    pid, title, rect["left"], rect["top"], rect["right"], rect["bottom"],
+                ))
         except Exception:
             continue
+    results.extend(_list_core_graphics_windows(ax_windows))
     return results
+
+
+def _list_core_graphics_windows(
+    ax_windows: set[tuple[int, str, int, int, int, int]],
+) -> list[dict[str, Any]]:
+    """List visible windows omitted by AXAPI, using CoreGraphics metadata.
+
+    The fallback is intentionally discovery-only: CoreGraphics supplies title,
+    PID, and bounds, but not an AX element, so callers get an explicit error on
+    ``select_window`` rather than a misleading successful attachment. This is
+    still valuable for screenshots and for diagnosing Accessibility gaps in
+    legacy, system, and custom-drawn applications.
+    """
+    require_axapi()
+    import Quartz as Q  # type: ignore[import-untyped]
+
+    app_info = {app["pid"]: app for app in get_running_apps()}
+    windows = Q.CGWindowListCopyWindowInfo(
+        Q.kCGWindowListOptionOnScreenOnly | Q.kCGWindowListExcludeDesktopElements,
+        Q.kCGNullWindowID,
+    ) or []
+    results: list[dict[str, Any]] = []
+    for window in windows:
+        pid = int(window.get(Q.kCGWindowOwnerPID, 0))
+        if not pid:
+            continue
+        layer = int(window.get(Q.kCGWindowLayer, 0))
+        bounds = window.get(Q.kCGWindowBounds) or {}
+        width = int(bounds.get("Width", 0))
+        height = int(bounds.get("Height", 0))
+        # Ignore menu-bar and tiny helper windows, but retain untitled dialogs.
+        if layer != 0 or width < 2 or height < 2:
+            continue
+        left = int(bounds.get("X", 0))
+        top = int(bounds.get("Y", 0))
+        title = str(window.get(Q.kCGWindowName, "") or "")
+        if (pid, title, left, top, left + width, top + height) in ax_windows:
+            continue
+        app = app_info.get(pid, {})
+        results.append({
+            "hwnd": int(window.get(Q.kCGWindowNumber, 0)),
+            "hwnd_hex": hex(int(window.get(Q.kCGWindowNumber, 0))),
+            "title": title,
+            "class_name": "core graphics window",
+            "pid": pid,
+            "process_name": str(window.get(Q.kCGWindowOwnerName, "") or app.get("name", "")),
+            "bundle_id": app.get("bundle_id", ""),
+            "visible": True,
+            "rect": {"left": left, "top": top, "right": left + width, "bottom": top + height},
+            "_ax_element": None,
+            "_app_pid": pid,
+            "_discovery_source": "core_graphics",
+        })
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Screen capture via Quartz
+# ---------------------------------------------------------------------------
+
+
+def capture_screenshot_quartz(region: dict[str, int]) -> dict[str, Any]:
+    """Capture an on-screen region as a base64-encoded PNG.
+
+    macOS requires Screen Recording permission for the hosting application
+    (Terminal, Python, or the packaged server).  Accessibility permission alone
+    is not enough to read pixels from other applications.
+    """
+    require_axapi()
+    left = int(region["left"])
+    top = int(region["top"])
+    right = int(region["right"])
+    bottom = int(region["bottom"])
+    width = right - left
+    height = bottom - top
+    if width <= 0 or height <= 0:
+        raise ValueError("Screenshot region must have positive width and height.")
+
+    import AppKit  # type: ignore[import-untyped]
+    import Quartz as Q  # type: ignore[import-untyped]
+
+    image = Q.CGWindowListCreateImage(
+        Q.CGRectMake(left, top, width, height),
+        Q.kCGWindowListOptionOnScreenOnly,
+        Q.kCGNullWindowID,
+        Q.kCGWindowImageDefault,
+    )
+    if image is None:
+        raise PermissionError(
+            "macOS did not return screen pixels. Grant Screen Recording permission "
+            "to the app hosting UIA-X in System Settings > Privacy & Security > "
+            "Screen Recording, then restart it."
+        )
+
+    bitmap = AppKit.NSBitmapImageRep.alloc().initWithCGImage_(image)
+    png = bitmap.representationUsingType_properties_(AppKit.NSBitmapImageFileTypePNG, {})
+    if png is None:
+        raise RuntimeError("macOS could not encode the screenshot as PNG.")
+    data = bytes(png)
+    return {
+        "ok": True,
+        "image_b64": base64.b64encode(data).decode("ascii"),
+        "width": int(Q.CGImageGetWidth(image)),
+        "height": int(Q.CGImageGetHeight(image)),
+        "format": "PNG",
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -31,6 +31,7 @@ from uiax.backends.macos.util import (
     ax_perform_action,
     ax_set_attribute,
     axapi_available,
+    capture_screenshot_quartz,
     get_app_element,
     get_children,
     get_description,
@@ -140,6 +141,14 @@ class MacOSProcessManager:
             if bundle_id is not None and win.get("bundle_id", "").lower() != bundle_id.lower():
                 continue
 
+            if win.get("_ax_element") is None:
+                raise ProcessNotFoundError(
+                    f"Window {win['title']!r} is visible through CoreGraphics but does not "
+                    "expose an Accessibility window. Grant Accessibility permission to the "
+                    "server host, foreground the target, then retry. Screenshots remain available "
+                    "with capture_screenshot(hwnd=...)."
+                )
+
             self._attached_window = win["_ax_element"]
             self._attached_app_pid = win.get("_app_pid")
             return win
@@ -152,6 +161,35 @@ class MacOSProcessManager:
             }.items() if v is not None
         }
         raise ProcessNotFoundError(f"No window matched: {criteria}")
+
+    def refresh_attached_window(self) -> bool:
+        """Promote a newly-frontmost window from the attached application.
+
+        Apps commonly expose alerts as sibling AX windows rather than children
+        of the original window.  Keeping the old root makes modal text and
+        controls invisible after a successful action.
+        """
+        if self._attached_app_pid is None:
+            return False
+        candidates = [
+            window for window in self.list_windows(visible_only=False)
+            if window.get("_app_pid") == self._attached_app_pid
+            and window.get("_ax_element") is not None
+        ]
+        if not candidates:
+            return False
+        frontmost = [
+            window for window in candidates
+            if "active" in state_names(window["_ax_element"])
+            or "main" in state_names(window["_ax_element"])
+        ]
+        if not frontmost:
+            return False
+        window = frontmost[0]
+        if window["_ax_element"] == self._attached_window:
+            return False
+        self._attached_window = window["_ax_element"]
+        return True
 
     def detach(self) -> None:
         """Detach from the current target."""
@@ -201,6 +239,7 @@ class MacOSBridge(UIABridge):
     def _get_root(self) -> Any:
         """Return the AXUIElement for the attached window."""
         pm = get_macos_process_manager()
+        pm.refresh_attached_window()
         root = pm.attached
         if root is None:
             raise TargetNotFoundError(
@@ -460,3 +499,25 @@ class MacOSBridge(UIABridge):
             return desc, "description"
 
         return "", "none"
+
+    def capture_screenshot(
+        self,
+        hwnd: int | None = None,
+        region: dict[str, int] | None = None,
+    ) -> dict[str, Any]:
+        """Capture an on-screen region or window bounds using Quartz."""
+        if region is None:
+            if hwnd is not None:
+                windows = get_macos_process_manager().list_windows(visible_only=False)
+                match = next((window for window in windows if window["hwnd"] == hwnd), None)
+                if match is None:
+                    raise TargetNotFoundError(f"No window found for hwnd {hwnd}.")
+                region = match["rect"]
+            else:
+                region = get_frame(self._get_root())
+        try:
+            return capture_screenshot_quartz(region)
+        except PermissionError as exc:
+            raise UIAError(str(exc), code="SCREEN_RECORDING_PERMISSION_REQUIRED") from exc
+        except ValueError as exc:
+            raise UIAError(str(exc), code="INVALID_ARGS") from exc
