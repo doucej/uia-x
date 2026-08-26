@@ -209,6 +209,8 @@ def _win32_fast_find_all(
     must_have_actions: bool = True,
     roles_filter: list[str] | None = None,
     limit: int = 0,
+    name_filter: str = "",
+    scan_budget: int = 3000,
 ) -> list[dict[str, Any]]:
     """Enumerate all child windows using Win32 EnumChildWindows.
 
@@ -219,15 +221,32 @@ def _win32_fast_find_all(
     Returns dicts compatible with the ``find_all`` response schema, including
     ``hwnd`` / ``hwnd_hex`` fields so callers can later invoke elements by
     handle rather than re-scanning the tree.
+
+    Parameters
+    ----------
+    name_filter : str
+        Case-insensitive substring filter applied inline during enumeration.
+        When set, only windows whose text contains this string are appended
+        to results, and ``limit`` counts matching elements (not total visited).
+        This is the key early-exit mechanism: once ``limit`` matching elements
+        are found, EnumChildWindows is stopped immediately — avoiding full-tree
+        scans on complex windows like Quicken investment accounts.
+    scan_budget : int
+        Hard cap on total child windows visited (default 3000).  Prevents
+        runaway scans on windows with thousands of child controls.  Set to 0
+        to disable.  When the budget is hit, enumeration stops and whatever
+        results were found so far are returned.
     """
     import ctypes  # noqa: PLC0415
     import ctypes.wintypes  # noqa: PLC0415
 
     user32 = ctypes.windll.user32
     _roles_set = set(roles_filter) if roles_filter else None
+    _name_filter = name_filter.lower() if name_filter else ""
 
     results: list[dict[str, Any]] = []
     name_counts: dict[str, int] = {}
+    scanned = 0
 
     # WM_GETTEXT with abort-if-hung timeout avoids blocking on slow/unresponsive
     # child windows (e.g. Quicken custom controls with busy message pumps).
@@ -245,7 +264,13 @@ def _win32_fast_find_all(
     )
 
     def _enum_cb(child_hwnd: int, _: int) -> bool:  # noqa: ANN001
+        nonlocal scanned
         try:
+            # --- scan budget: hard cap on total windows visited ---
+            scanned += 1
+            if scan_budget > 0 and scanned > scan_budget:
+                return False  # stop enumeration
+
             if not user32.IsWindowVisible(child_hwnd):
                 return True
 
@@ -277,6 +302,13 @@ def _win32_fast_find_all(
             text = tbuf.value if (ret and msg_result.value > 0) else ""
 
             if named_only and not text:
+                return True
+
+            # --- name_filter: skip non-matching BEFORE expensive rect/actions ---
+            # Limit counts matching elements only, so we stop as soon as we have
+            # enough matches — this is the key early-exit for complex windows like
+            # Quicken investment accounts with thousands of child HWNDs.
+            if _name_filter and _name_filter not in text.lower():
                 return True
 
             # --- bounding rect (kernel data, no message sent) ---
@@ -332,7 +364,10 @@ def _win32_fast_find_all(
             if text:
                 d["text"] = text
             results.append(d)
-            # Honour limit: returning False stops EnumChildWindows early
+            # Honour limit: returning False stops EnumChildWindows early.
+            # When name_filter is active, limit counts only matching elements
+            # (non-matching were skipped above), so this fires as soon as we
+            # have enough of the right results — avoiding a full tree scan.
             if limit > 0 and len(results) >= limit:
                 return False
         except Exception:  # noqa: BLE001
@@ -864,6 +899,7 @@ class WinUIABridge(UIABridge):
         roles_filter = [r.lower() for r in (filter.get("roles") or [])]
         root_target = filter.get("root") or {}
         limit = int(filter.get("limit") or 0)
+        name_filter = str(filter.get("name_filter") or "").lower()
 
         # ------------------------------------------------------------------
         # Win32-native fast path — works for both full-window and scoped-HWND
@@ -892,6 +928,7 @@ class WinUIABridge(UIABridge):
                         must_have_actions=must_have_actions,
                         roles_filter=roles_filter or None,
                         limit=limit,
+                        name_filter=name_filter,
                     )
                     if win32_results:
                         return win32_results
